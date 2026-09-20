@@ -68,6 +68,19 @@ pub const DEFAULT_PARALLEL_TOOLS: usize = 4;
 /// describing a fork bomb.
 pub const MAX_PARALLEL_TOOLS: usize = 16;
 
+/// `turn.max_tool_rounds`: how many times one turn may come back asking to
+/// run tools before the harness stops it.
+///
+/// The default covers a real development task — reading, editing, building,
+/// and testing — rather than a single-shot reply. The number is the schema's,
+/// in `docs/35-configuration.md`; this is where it is enforced.
+pub const DEFAULT_TOOL_ROUNDS: usize = 100;
+
+/// The most any layer may ask for. A ceiling rather than a preference: a turn
+/// that loops a thousand times without finishing is a bug to be diagnosed, not
+/// work to be funded.
+pub const MAX_TOOL_ROUNDS: usize = 200;
+
 /// Top-level keys this loader accepts and applies nothing from. `schema_version`
 /// is here because `check_schema_version` has already read it.
 const INERT_SECTIONS: &[&str] = &[
@@ -716,11 +729,14 @@ pub struct Config {
     /// an empty one permits nothing.
     provider_allowed: Option<BTreeSet<String>>,
     model_allowed: Option<BTreeSet<String>>,
-    theme: Theme,
+    /// `turn.max_tool_rounds`. `None` is the built-in default.
+    max_tool_rounds: Option<usize>,
     /// Policy rules keyed by their stable `id`, so a later layer amends a rule
     /// rather than appending a second one with the same meaning.
     policy_rules: BTreeMap<String, PolicyRule>,
     policy_default_effect: Option<RuleEffect>,
+    /// `[theme]`, empty when no layer set one.
+    theme: Theme,
     /// `[mcp.server.<name>]` keyed by name, so a higher layer replaces a
     /// definition rather than adding a second connection with the same name.
     mcp_servers: BTreeMap<String, McpServer>,
@@ -909,8 +925,9 @@ impl Config {
         &self.theme
     }
 
-    pub fn endpoints(&self) -> impl Iterator<Item = &Endpoint> {
-        self.endpoints.values()
+    /// How many rounds of tool calls one turn may take.
+    pub fn max_tool_rounds(&self) -> usize {
+        self.max_tool_rounds.unwrap_or(DEFAULT_TOOL_ROUNDS)
     }
 
     pub fn diagnostics(&self) -> &[Diagnostic] {
@@ -1195,9 +1212,9 @@ impl Config {
         Ok(())
     }
 
-    /// `execution.max_parallel`. The rest of the section is still inert, so an
-    /// unknown key here is accepted as it always was; only the one this build
-    /// reads is validated.
+    /// `execution.max_parallel` and `execution.max_tool_rounds`. The rest of
+    /// the section is still inert, so an unknown key here is accepted as it
+    /// always was; only the ones this build reads are validated.
     fn apply_execution(
         &mut self,
         layer: Layer,
@@ -1205,30 +1222,43 @@ impl Config {
         value: &toml::Value,
     ) -> Result<(), ConfigError> {
         let table = as_table(value, "execution", path)?;
-        let Some(value) = table.get("max_parallel") else {
-            return Ok(());
-        };
         let key = "execution.max_parallel";
-        let limit = value
-            .as_integer()
-            .and_then(|limit| usize::try_from(limit).ok())
-            .filter(|limit| (1..=MAX_PARALLEL_TOOLS).contains(limit))
-            .ok_or_else(|| ConfigError {
-                path: path.to_path_buf(),
-                message: format!("`{key}` must be between 1 and {MAX_PARALLEL_TOOLS}"),
-            })?;
-        self.record(layer, path, key, limit.to_string());
-        // Narrowest wins, like every other ceiling: a layer may ask for less
-        // concurrency than the one above it and never for more.
-        self.max_parallel_tools = Some(
-            self.max_parallel_tools
-                .map_or(limit, |held| held.min(limit)),
-        );
+        if let Some(value) = table.get("max_parallel") {
+            let limit = value
+                .as_integer()
+                .and_then(|limit| usize::try_from(limit).ok())
+                .filter(|limit| (1..=MAX_PARALLEL_TOOLS).contains(limit))
+                .ok_or_else(|| ConfigError {
+                    path: path.to_path_buf(),
+                    message: format!("`{key}` must be between 1 and {MAX_PARALLEL_TOOLS}"),
+                })?;
+            self.record(layer, path, key, limit.to_string());
+            // Narrowest wins, like every other ceiling: a layer may ask for
+            // less concurrency than the one above it and never for more.
+            self.max_parallel_tools = Some(
+                self.max_parallel_tools
+                    .map_or(limit, |held| held.min(limit)),
+            );
+        }
+        let key = "execution.max_tool_rounds";
+        if let Some(value) = table.get("max_tool_rounds") {
+            let rounds = value
+                .as_integer()
+                .and_then(|rounds| usize::try_from(rounds).ok())
+                .filter(|rounds| (1..=MAX_TOOL_ROUNDS).contains(rounds))
+                .ok_or_else(|| ConfigError {
+                    path: path.to_path_buf(),
+                    message: format!("`{key}` must be between 1 and {MAX_TOOL_ROUNDS}"),
+                })?;
+            self.record(layer, path, key, rounds.to_string());
+            // The narrowest budget wins, for the same reason the parallel
+            // ceiling does: no layer may spend rounds another declined.
+            self.max_tool_rounds =
+                Some(self.max_tool_rounds.map_or(rounds, |held| held.min(rounds)));
+        }
         Ok(())
     }
 
-    /// `[mcp.server.<name>]`: one external MCP connection each.
-    ///
     /// A definition names a program to run or a host to send workspace content
     /// to, so the layer that wrote it becomes the connection's trust label. A
     /// workspace file may still declare one — that is how a repository ships
@@ -3262,6 +3292,55 @@ default_effect = \"allow\"\n",
             assert!(
                 Config::load(&[(Layer::User, path)]).is_err(),
                 "max_parallel = {bad} was accepted"
+            );
+        }
+    }
+
+    /// `execution.max_tool_rounds` follows the same shape as its sibling: the
+    /// documented key, the schema's default when unset, and a range that
+    /// refuses rather than clamps.
+    #[test]
+    fn the_tool_round_budget_uses_the_documented_key_and_only_ever_narrows() {
+        let directory = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            load(&[]).max_tool_rounds(),
+            DEFAULT_TOOL_ROUNDS,
+            "an unset key is the schema's default, not zero"
+        );
+
+        let enterprise = write(
+            directory.path(),
+            "enterprise.json",
+            "schema_version = 1\n\n[execution]\nmax_tool_rounds = 150\n",
+        );
+        let user = write(
+            directory.path(),
+            "user.json",
+            "schema_version = 1\n\n[execution]\nmax_tool_rounds = 30\n",
+        );
+
+        assert_eq!(
+            load(&[(Layer::Enterprise, enterprise.clone())]).max_tool_rounds(),
+            150
+        );
+        assert_eq!(
+            load(&[(Layer::Enterprise, enterprise), (Layer::User, user)]).max_tool_rounds(),
+            30,
+            "a lower layer may ask for less"
+        );
+
+        // Outside the range is refused rather than clamped, like every other
+        // numeric ceiling here.
+        for bad in ["0", "1000", "\"many\""] {
+            let path = write(
+                directory.path(),
+                "bad.json",
+                &format!("schema_version = 1\n\n[execution]\nmax_tool_rounds = {bad}\n"),
+            );
+            assert!(
+                Config::load(&[(Layer::User, path)]).is_err(),
+                "max_tool_rounds = {bad} was accepted"
             );
         }
     }

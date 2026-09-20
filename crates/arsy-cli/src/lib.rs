@@ -12,7 +12,7 @@
 //! | `ARSY-SCH-1004` | `resume` named a session with no recorded events |
 //! | `ARSY-CMP-1000` | the session store could not be opened or written |
 //! | `ARSY-CFG-1000` | a configuration layer could not be read or does not parse |
-//! | `ARSY-PRV-1000` | no provider credential is available, so the turn cannot dispatch |
+//! | `ARSY-TRN-1000` | the turn's tool-round budget ran out or looped |
 //! | `ARSY-PRV-1002` | an installed provider CLI failed |
 //! | `ARSY-SBX-1000` | no sandbox worker is available on this build |
 //! | `ARSY-PRV-1001` | no credential store is registered |
@@ -74,6 +74,10 @@ const STORE_PATH: &str = ".arsy/sessions.sqlite3";
 
 /// No provider credential is available, so the turn cannot dispatch.
 pub const ARSY_PRV_1000: &str = "ARSY-PRV-1000";
+
+/// The turn's tool-round budget ran out, or the model looped on one failing
+/// call. The harness stopped the turn; the provider is not at fault.
+pub const ARSY_TRN_1000: &str = "ARSY-TRN-1000";
 /// A configuration layer could not be read or does not parse.
 pub const ARSY_CFG_1000: &str = "ARSY-CFG-1000";
 /// Machine records carry the protocol's schema version.
@@ -207,7 +211,7 @@ impl Diagnostic {
             "EXE" | "TLS" | "EDT" | "STL" => 6,
             "VER" => 7,
             "CMP" | "CRD" => 8,
-            "RET" | "CTX" | "PLN" | "MDL" => 9,
+            "TRN" => 9,
             "UIX" => 10,
             _ => 2,
         }
@@ -2949,7 +2953,7 @@ fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
     let mut choices = Vec::new();
     if let Ok(config) = load_config(&root, &working, invocation.config.as_deref()) {
-        for endpoint in config.endpoints() {
+        for endpoint in config.all_endpoints() {
             choices.extend(endpoint.models.iter().map(|slug| tui::ModelChoice {
                 provider: endpoint.id.clone(),
                 slug: slug.clone(),
@@ -3999,13 +4003,6 @@ fn run_turn(
     Ok(turn)
 }
 
-/// How many times one turn may come back asking to run tools. The bound is
-/// what stops a model that answers every result with another call from
-/// spending a session on its own loop.
-#[cfg(feature = "tui")]
-const MAX_TOOL_ROUNDS: usize = 24;
-
-/// What the operator said about one tool call.
 #[cfg(feature = "tui")]
 fn tool_call_fingerprint(name: &str, arguments: &Value) -> String {
     // A timeout is execution metadata, not command identity. Otherwise a
@@ -4074,7 +4071,15 @@ fn native_turn(
     // the exact same effect again, return the first result instead of running
     // it twice or burning all 24 rounds.
     let mut completed_calls = std::collections::HashMap::<String, String>::new();
-    for round in 0..MAX_TOOL_ROUNDS {
+    let max_rounds = config.max_tool_rounds();
+    // Repeating a call that already succeeded is wasted budget, but repeating
+    // one that just *failed* is a loop the operator cannot see past the tool
+    // cards. Three identical failures in a row is the line: past it the model
+    // is told to change approach rather than spend the rest of its budget
+    // failing identically.
+    const FAILURE_LOOP_LIMIT: usize = 3;
+    let mut identical_failures: Option<(String, usize)> = None;
+    for round in 0..max_rounds {
         // Before the request, not after: a transcript that has outgrown the
         // window fails at the provider, and the operator is told what was
         // elided rather than watching the turn shrink invisibly.
@@ -4211,6 +4216,20 @@ fn native_turn(
                 is_error,
             });
         }
+        // Read the last failing fingerprint before `results` moves into the
+        // conversation below.
+        let failed_fingerprint =
+            calls
+                .iter()
+                .zip(results.iter())
+                .find_map(|((_, name, arguments), result)| {
+                    matches!(result, ModelContent::ToolResult { is_error: true, .. })
+                        .then(|| tool_call_fingerprint(name, arguments))
+                });
+        // The results belong in the conversation on every path out of this
+        // round: a provider that sent a call and never sees its result
+        // rejects the next request, whether the turn went on, was stopped, or
+        // is about to be cut for looping.
         conversation.push(ModelMessage {
             role: ModelRole::User,
             content: results,
@@ -4227,14 +4246,49 @@ fn native_turn(
         if outcome.interrupted {
             return Ok(outcome);
         }
-        if round + 1 == MAX_TOOL_ROUNDS {
-            outcome.failure = Some(format!(
-                "{route} asked for tools {MAX_TOOL_ROUNDS} times without finishing the turn"
-            ));
-            return Ok(outcome);
+        // Three identical failures in a row is a loop, not work: stop the
+        // turn with a message that names the loop rather than the provider.
+        identical_failures = match (identical_failures, failed_fingerprint) {
+            (Some((fingerprint, count)), Some(same)) if fingerprint == same => {
+                Some((fingerprint, count + 1))
+            }
+            (_, Some(fingerprint)) => Some((fingerprint, 1)),
+            (_, None) => None,
+        };
+        if let Some((_, count)) = &identical_failures {
+            if *count >= FAILURE_LOOP_LIMIT {
+                outcome.failure = Some(format!(
+                    "{route} repeated the same failing tool call {count} times — it is stuck in a \
+                     loop rather than out of budget; continue with a narrower task"
+                ));
+                return Ok(outcome);
+            }
+        }
+        let remaining = max_rounds - (round + 1);
+        if remaining > 0 && remaining <= 3 {
+            // Told before the budget is gone, not after: a model that knows
+            // one round is left can wrap up, while one stopped dead can only
+            // be rewound. The note rides on the result just pushed.
+            let note = format!(
+                "\n\n[SYSTEM: {remaining} tool round(s) remain in this turn. Finish up and give \
+                 your final answer now.]"
+            );
+            if let Some(ModelContent::ToolResult { content, .. }) = conversation
+                .last_mut()
+                .and_then(|message| message.content.last_mut())
+            {
+                content.push_str(&note);
+            }
         }
     }
-    Ok(Turn::default())
+    let outcome = Turn {
+        failure: Some(format!(
+            "{route} asked for tools {max_rounds} times without finishing the turn — the budget \
+             is `execution.max_tool_rounds`; raise it, or continue with a narrower task"
+        )),
+        ..Turn::default()
+    };
+    Ok(outcome)
 }
 
 /// Take the terminal's size again, no more than ten times a second.
@@ -7927,7 +7981,18 @@ fn fail_turn(
     message: String,
     emitter: &mut Emitter,
 ) -> Result<i32, Diagnostic> {
-    let (code, reason, remediation) = if route.is_codex() {
+    let (code, reason, remediation) = if message.contains("asked for tools")
+        || message.contains("repeated the same failing tool call")
+    {
+        // The harness stopped the turn, not the provider: misreporting a
+        // local budget as ARSY-PRV-1000 sends an operator chasing endpoint
+        // and credential problems that do not exist.
+        (
+            ARSY_TRN_1000,
+            "turn",
+            "raise `execution.max_tool_rounds`, or continue with a narrower task",
+        )
+    } else if route.is_codex() {
         (
             "ARSY-PRV-1002",
             "provider_cli",
@@ -8442,13 +8507,6 @@ fn context_budget(resolved: &provider::Resolved) -> u32 {
     CONTEXT_BUDGET_TOKENS.saturating_sub(resolved.endpoint.max_output_tokens)
 }
 
-/// How many rounds of tool calls one scripted turn may take.
-///
-/// The same bound the interactive loop uses, for the same reason: a model that
-/// answers every result with another call would otherwise spend the run on its
-/// own loop.
-const MAX_SCRIPTED_TOOL_ROUNDS: usize = 24;
-
 /// Dispatch a scripted turn, and once more if a stale OAuth access token is
 /// why it failed.
 ///
@@ -8492,6 +8550,7 @@ fn dispatch_with_refresh(
     let delegates = supervisor.can_delegate();
     let mut supervising = delegates.then_some((supervisor, &mut *graph));
     let outcome = dispatch(
+        config,
         resolved.provider.as_ref(),
         agent,
         request,
@@ -8530,6 +8589,7 @@ fn dispatch_with_refresh(
     let delegates = supervisor.can_delegate();
     let mut supervising = delegates.then_some((supervisor, graph));
     let outcome = dispatch(
+        config,
         resolved.provider.as_ref(),
         agent,
         request,
@@ -8563,6 +8623,7 @@ fn is_stale_oauth_token(error: &ProviderError, source: provider::CredentialSourc
 /// of who happened to be watching.
 #[allow(clippy::too_many_arguments)]
 fn dispatch(
+    config: &Config,
     provider: &dyn ModelProvider,
     runtime: &arsy_code::agent::ToolRuntime,
     request: &CanonicalModelRequest,
@@ -8572,11 +8633,12 @@ fn dispatch(
     parallel: usize,
     emitter: &mut Emitter,
 ) -> Result<Value, ProviderError> {
+    let max_rounds = config.max_tool_rounds();
     let mut request = request.clone();
-    let base = request.idempotency_key.as_str().to_owned();
     let budget = CONTEXT_BUDGET_TOKENS.saturating_sub(request.max_output_tokens);
+    let base = request.idempotency_key.as_str().to_owned();
     let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
-    for round in 0..MAX_SCRIPTED_TOOL_ROUNDS {
+    for round in 0..max_rounds {
         // Each round is its own request, so a retry repeats that round rather
         // than collapsing into the one before it.
         request.idempotency_key = IdempotencyKey::new(format!("{base}-{round}"))
@@ -8777,7 +8839,8 @@ fn dispatch(
     }
     emitter.end_deltas();
     Err(ProviderError::InvalidRequest(format!(
-        "the model asked for tools {MAX_SCRIPTED_TOOL_ROUNDS} times without finishing the turn"
+        "the model asked for tools {max_rounds} times without finishing the turn — the budget is \
+         `execution.max_tool_rounds`; raise it, or continue with a narrower task"
     )))
 }
 
@@ -10162,6 +10225,123 @@ mod tests {
             Some(ModelContent::ToolResult { is_error: true, content, .. })
                 if content.contains("no patches here")
         ));
+    }
+
+    /// A model that calls the same failing tool forever is stopped after
+    /// three identical failures — with a message that names the loop, not
+    /// the provider — instead of burning the whole round budget on it.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_model_repeating_one_failing_call_is_stopped_as_a_loop() {
+        let workspace = tempfile::tempdir().unwrap();
+        // The same denied call, round after round: policy refuses it in
+        // `arsy run`, but here the operator denies it — the `d` answer.
+        let denied = vec![ModelEvent::ToolCallCompleted {
+            index: 0,
+            id: "call-1".to_owned(),
+            name: "bash".to_owned(),
+            arguments: json!({"command": "touch looped"}),
+        }];
+        let mut rounds = Vec::new();
+        for _ in 0..4 {
+            let mut round = denied.clone();
+            round.push(ModelEvent::Completed {
+                stop: arsy_kernel::provider::StopReason::ToolUse,
+            });
+            rounds.push(round);
+        }
+        let (mut resolved, _scripted) = resolved(rounds);
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
+        let (typist, keys, done) = typed(b"ddd", std::sync::Arc::clone(&approval));
+        let mut conversation = Vec::new();
+        let turn = native_turn(
+            &mut resolved,
+            &arsy_kernel::config::Config::default(),
+            &test_runtime(workspace.path()),
+            &mut conversation,
+            &arsy_code::agent::budget::History::default(),
+            &route(),
+            None,
+            arsy_kernel::domain::TurnId::new(),
+            false,
+            "  footer",
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+            &mut tui::Transcript::default(),
+            &approval,
+            None,
+        )
+        .unwrap();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        typist.join().unwrap();
+
+        let failure = turn.failure.as_deref().unwrap_or_default();
+        assert!(
+            failure.contains("repeated the same failing tool call"),
+            "{failure}"
+        );
+        assert!(
+            !workspace.path().join("looped").exists(),
+            "the denied call never ran"
+        );
+    }
+
+    /// A model told the round budget is nearly gone hears it before the turn
+    /// is cut: the last tool result carries the wrap-up note.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_wrap_up_warning_reaches_the_model_before_the_budget_ends() {
+        let workspace = tempfile::tempdir().unwrap();
+        // One tool round, then the answer. The default budget is far larger
+        // than two rounds, so this only checks the plumbing, not the
+        // threshold: the note appears when the *configured* budget is small.
+        let (mut resolved, _scripted) = resolved(vec![
+            vec![
+                ModelEvent::ToolCallCompleted {
+                    index: 0,
+                    id: "call-1".to_owned(),
+                    name: "bash".to_owned(),
+                    arguments: json!({"command": "printf x"}),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::ToolUse,
+                },
+            ],
+            vec![
+                ModelEvent::TextDelta {
+                    text: "done\n".to_owned(),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Auto));
+        let (_keys_sender, keys) = std::sync::mpsc::channel();
+        let mut conversation = Vec::new();
+        let turn = native_turn(
+            &mut resolved,
+            &arsy_kernel::config::Config::default(),
+            &test_runtime(workspace.path()),
+            &mut conversation,
+            &arsy_code::agent::budget::History::default(),
+            &route(),
+            None,
+            arsy_kernel::domain::TurnId::new(),
+            false,
+            "  footer",
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+            &mut tui::Transcript::default(),
+            &approval,
+            None,
+        )
+        .unwrap();
+        assert_eq!(turn.response.trim(), "done");
     }
 
     #[cfg(feature = "tui")]
