@@ -111,6 +111,7 @@ impl AcpAdapter {
             "session/cancel" => Ok(Translated::Request(ClientRequest::AgentControl(
                 AgentControl {
                     agent: agent(params)?,
+                    attempt: None,
                     action: AgentAction::Interrupt,
                     extensions: extensions(params),
                 },

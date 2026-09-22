@@ -116,7 +116,7 @@ claims must pin new revisions independently.
 | `task.spawn` | **PARTIAL** | A child gets a graph node, lease, budget field, and attenuated read/process authority. The budget is not fully enforced or settled. `Supervisor::spawn` calls the child loop inline and returns its answer, so the parent blocks. Child execution has no durable transcript/result contract and does not use an immutable workspace snapshot. |
 | Restart recovery | **PARTIAL** | Expired/running task leases can be reclaimed, and the attempt that held one is retired rather than left able to commit. A rebuilt graph restores attempt state, authority snapshot, reservation, usage, and terminal reason, and `TaskGraph::narrow_authority` re-derives a recovered task's grants against current policy, narrowing only. Resume still rebuilds the runtime from current workspace policy/model rather than from the attempt descriptor. |
 | Workspace isolation | **PRIMITIVE** | `WorkspaceRequirement::{ReadOnlySnapshot, IsolatedWriter}` and `WorkspaceCoordinator` exist. The coordinator creates detached Git worktrees or copied snapshots, tracks in-memory leases, and can merge a writer revision. CLI agents do not use it; its ownership is not durable. |
-| Agent messaging and supervision | **PLANNED** | No durable mailbox, steering, task result, wait API, or Agent Hub exists. Observer primitives consume redacted projections, but no complete product supervision path is wired. |
+| Agent messaging and supervision | **PARTIAL** | Durable task mailboxes, result/wait APIs, and a replayable Agent Hub projection exist. `/agents` and `session show` expose the projection; typed control messages exist, but the complete interactive control surface and race/accessibility gate remain open. |
 
 ### Intelligence, extensions, models, and quality
 
@@ -128,7 +128,7 @@ claims must pin new revisions independently.
 | MCP, hooks, and WASM plugins | **PARTIAL** | Native MCP operations, hook execution, and capability-limited WASM plugin operations exist. Hook execution is not consistent across scripted, interactive, and child turns. Imported declarations are not automatically loaded. |
 | Memory model | **PARTIAL** | Event-backed records model scope, provenance, confidence, authority origin, expiry, supersession, revocation, and artifact-backed claims; bounded repository recall is wired. Automatic candidate extraction and trust-aware curation are absent. |
 | Provider abstraction and model profiles | **SHIPPED/PARTIAL** | Provider transport is separated from versioned model capability profiles. Declared/probed/override states exist; probe caching is in memory. |
-| Model routing | **PRIMITIVE** | Routing filters provider/model/residency/capability constraints and can rank measured cost, latency, and failures. The CLI supplies fresh empty observations and a generic task preference, so historical and role-aware routing is not operational. |
+| Model routing | **PRIMITIVE** | Routing filters provider/model/residency/capability/context/modality/provider-feature constraints and records attributable observations. The CLI still supplies fresh empty observations and a generic task preference, so historical role-aware routing and its held-out gate are not operational. |
 | Token/cost telemetry | **PARTIAL** | Provider usage, turn telemetry, and cost fields exist. Child usage is not consistently attributed or charged through `TaskGraph`. |
 | Evaluation | **PARTIAL** | `arsy eval` supports arms, repeated trials, revision checks, token/safety parsing, Wilson intervals, and conservative baseline comparison. Trials run sequential commands in the same workspace; repository reset/isolation, competitor adapters, agent metrics, and full success rubrics remain. |
 
@@ -139,7 +139,7 @@ claims must pin new revisions independently.
 | TUI | **SHIPPED/PARTIAL** | Interactive turns, plan flow, approvals, provider/model controls, progress, and inspections exist. There is no durable multi-agent supervision view. |
 | CI | **SHIPPED** | `.github/workflows/` is active: `ci.yml`, `fuzz.yml`, `performance.yml`, `cla.yml`, and the guardener pair run on GitHub Actions. Local checks are the same commands. |
 | Release pipeline | **SHIPPED** | `release-please.yml` prepares the release; the tag push runs `release.yml`, which builds six Tier 1 archives, per-archive SHA-256, a Sigstore-signed `SHA256SUMS`, one CycloneDX SBOM per crate, and the installers, then pushes the Homebrew formula and Scoop manifest. `npm-publish.yml` follows it. |
-| Installers and npm launcher | **SHIPPED/PARTIAL** | The installers are attached to each release and verify the archive digest, but not the Sigstore signature. The npm launcher downloads and verifies the matching archive at postinstall. |
+| Installers and npm launcher | **SHIPPED/PARTIAL** | The installers are attached to each release and verify the archive digest, but not the Sigstore signature. Platform npm packages and exact-version launcher dependencies are configured; they become an operational claim only after a release publishes and clean-install smoke tests them. |
 | Update | **PRIMITIVE** | The CLI surface exists, but the current implementation reports the installed version as current without contacting a release source or installing anything. ARSY has no working self-update mechanism. |
 
 ## Competitive position

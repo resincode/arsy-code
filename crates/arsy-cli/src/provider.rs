@@ -175,6 +175,9 @@ fn route(config: &Config) -> routing::Decision {
                 ))),
                 residency: None,
                 cost_micros_per_1k: None,
+                context_window: None,
+                modalities: std::collections::BTreeSet::new(),
+                provider_features: std::collections::BTreeSet::new(),
             })
         })
         .collect();

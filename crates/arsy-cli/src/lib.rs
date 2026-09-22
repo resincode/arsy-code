@@ -4349,8 +4349,9 @@ mod tests {
                 },
             ],
         ]);
-        let approval =
-            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Auto));
+        let approval = std::sync::Arc::new(approval::ApprovalCell::new(
+            approval::ApprovalMode::BypassPermissions,
+        ));
         let (_keys_sender, keys) = std::sync::mpsc::channel();
         let mut conversation = vec![ModelMessage {
             role: ModelRole::User,
@@ -4486,8 +4487,9 @@ mod tests {
                 },
             ],
         ]);
-        let approval =
-            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Auto));
+        let approval = std::sync::Arc::new(approval::ApprovalCell::new(
+            approval::ApprovalMode::BypassPermissions,
+        ));
         let (_keys_sender, keys) = std::sync::mpsc::channel();
         let mut conversation = Vec::new();
         let turn = native_turn(
@@ -5443,6 +5445,7 @@ mod tests {
                     | "/approval"
                     | "/plan"
                     | "/todo"
+                    | "/agents"
                     | "/skill"
             ) || INSPECTIONS.iter().any(|(slash, _, _)| slash == name);
             assert!(handled, "{name} is offered but never dispatched");

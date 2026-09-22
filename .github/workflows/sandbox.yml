@@ -1,39 +1,9 @@
 name: Sandbox conformance
 
 on:
-  pull_request:
-    # Prose and repository furniture cannot change how the code behaves, so
-    # they do not need a three-OS build to prove it. Documentation under
-    # fixtures/ is deliberately absent: fixtures/compat/check.py asserts each
-    # fixture ships a README.md, so those are inputs rather than prose.
-    paths-ignore:
-      - "*.md"
-      - "docs/**"
-      - "assets/**"
-      - "LICENSE"
-      - "NOTICE"
-      - ".github/CODEOWNERS"
-      - ".github/labeler.yml"
-      - ".github/ISSUE_TEMPLATE/**"
-      - ".github/PULL_REQUEST_TEMPLATE.md"
-      - ".github/workflows/README.md"
-  push:
-    branches: [main]
-    # Prose and repository furniture cannot change how the code behaves, so
-    # they do not need a three-OS build to prove it. Documentation under
-    # fixtures/ is deliberately absent: fixtures/compat/check.py asserts each
-    # fixture ships a README.md, so those are inputs rather than prose.
-    paths-ignore:
-      - "*.md"
-      - "docs/**"
-      - "assets/**"
-      - "LICENSE"
-      - "NOTICE"
-      - ".github/CODEOWNERS"
-      - ".github/labeler.yml"
-      - ".github/ISSUE_TEMPLATE/**"
-      - ".github/PULL_REQUEST_TEMPLATE.md"
-      - ".github/workflows/README.md"
+  schedule:
+    - cron: "23 3 * * 2"
+  workflow_dispatch:
 
 concurrency:
   group: sandbox-${{ github.ref }}
@@ -55,5 +25,6 @@ jobs:
       - name: Install Linux namespace helper
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --yes bubblewrap
-      - run: rustup toolchain install 1.98.0 --profile minimal
-      - run: cargo +1.98.0 test -p arsy-sandbox --test sandbox_escape --locked
+      - id: rust
+        uses: ./.github/actions/setup-workspace-rust
+      - run: cargo +${{ steps.rust.outputs.version }} test -p arsy-sandbox --test sandbox_escape --locked

@@ -17,11 +17,12 @@ use super::todoops::Journal;
 use arsy_kernel::{
     artifact::ArtifactStore,
     capability::{CapabilityAction, CapabilityGrant},
-    domain::{Principal, ResourceRef},
+    domain::{Principal, ResourceRef, TaskId},
     operation::{
         ConcurrencyRule, Effect, Idempotency, InputSchema, JsonType, OperationContract,
         OperationError, OperationExecutor, OperationKind, OperationOutcome, OperationRequest,
     },
+    orchestration::{Budget, TaskGraph, TaskNode, TaskRuntime, TaskState, WorkspaceRequirement},
     todo::{TodoAuthor, TodoList},
 };
 use serde::{Deserialize, Serialize};
@@ -45,11 +46,17 @@ pub struct PlanStep {
     pub id: String,
     pub description: String,
     pub status: PlanStepStatus,
+    /// Other plan steps that must finish first. These stay scratch until
+    /// commit, when they become TODO and TaskGraph edges.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
     /// The durable TODO this step became, once it was committed. A plan is
     /// revised freely and kept in the process; this is the one transition that
     /// puts part of it on the record, and it happens once per step.
     #[serde(default)]
     pub committed_as: Option<String>,
+    #[serde(default)]
+    pub committed_task: Option<TaskId>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -206,7 +213,10 @@ impl PlanOperation {
         let string = |name: &str| (name.to_owned(), JsonType::String);
         let array = |name: &str| (name.to_owned(), JsonType::Array);
         let (required, optional) = match self {
-            Self::Add => (vec![string("description")], vec![string("after")]),
+            Self::Add => (
+                vec![string("description")],
+                vec![string("after"), array("depends_on")],
+            ),
             Self::Update => (
                 vec![string("id")],
                 vec![string("status"), string("description")],
@@ -296,26 +306,117 @@ impl PlanExecutor {
             journal.actor.clone(),
         )
         .map_err(|error| OperationError::Execution(error.to_string()))?;
-        let uncommitted: Vec<usize> = state
-            .steps
-            .iter()
-            .enumerate()
-            .filter_map(|(index, step)| step.committed_as.is_none().then_some(index))
-            .collect();
-        if uncommitted.is_empty() {
+        let graph_required = state.steps.iter().any(|step| !step.depends_on.is_empty());
+        if state.steps.iter().all(|step| step.committed_as.is_some())
+            && (!graph_required || state.steps.iter().all(|step| step.committed_task.is_some()))
+        {
             return Err(OperationError::Execution(
                 "every step of this plan is already a commitment".into(),
             ));
         }
-        for index in uncommitted {
+        let by_id: HashMap<_, _> = state
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| (step.id.clone(), index))
+            .collect();
+        let mut order = Vec::with_capacity(state.steps.len());
+        while order.len() < state.steps.len() {
+            let before = order.len();
+            for (index, step) in state.steps.iter().enumerate() {
+                if order.contains(&index) {
+                    continue;
+                }
+                if step.depends_on.iter().all(|dependency| {
+                    by_id
+                        .get(dependency)
+                        .is_some_and(|dependency| order.contains(dependency))
+                }) {
+                    order.push(index);
+                }
+            }
+            if order.len() == before {
+                return Err(OperationError::Execution(
+                    "plan dependencies are missing or cyclic".into(),
+                ));
+            }
+        }
+        for &index in &order {
+            if state.steps[index].committed_as.is_some() {
+                continue;
+            }
+            let dependencies = state.steps[index]
+                .depends_on
+                .iter()
+                .map(|dependency| {
+                    by_id
+                        .get(dependency)
+                        .and_then(|index| state.steps[*index].committed_as.clone())
+                        .ok_or_else(|| {
+                            OperationError::Execution(format!(
+                                "step {} depends on uncommitted {dependency}",
+                                state.steps[index].id
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let item = list
                 .add(
                     &state.steps[index].description,
-                    Vec::new(),
+                    dependencies,
                     TodoAuthor::Model,
                 )
                 .map_err(|error| OperationError::Execution(error.to_string()))?;
             state.steps[index].committed_as = Some(item.id);
+        }
+
+        if graph_required {
+            let mut graph = TaskGraph::new(
+                Arc::clone(&journal.store),
+                journal.session,
+                journal.actor.clone(),
+            )
+            .map_err(|error| OperationError::Execution(error.to_string()))?;
+            for &index in &order {
+                if state.steps[index].committed_task.is_some() {
+                    continue;
+                }
+                let dependencies = state.steps[index]
+                    .depends_on
+                    .iter()
+                    .map(|dependency| {
+                        by_id
+                            .get(dependency)
+                            .and_then(|index| state.steps[*index].committed_task)
+                            .ok_or_else(|| {
+                                OperationError::Execution(format!(
+                                    "step {} depends on uncompiled {dependency}",
+                                    state.steps[index].id
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let id = TaskId::new();
+                graph
+                    .add(TaskNode {
+                        id,
+                        goal: state.steps[index].description.clone(),
+                        dependencies,
+                        assignee: None,
+                        required_output: "text".into(),
+                        workspace: WorkspaceRequirement::ReadOnlySnapshot,
+                        budget: Budget::default(),
+                        authority: Vec::new(),
+                        state: TaskState::Pending,
+                        lease_expires_at_ms: None,
+                        runtime: TaskRuntime {
+                            parent: journal.task,
+                            ..TaskRuntime::default()
+                        },
+                    })
+                    .map_err(|error| OperationError::Execution(error.to_string()))?;
+                state.steps[index].committed_task = Some(id);
+            }
         }
         Ok(())
     }
@@ -369,8 +470,29 @@ impl OperationExecutor for PlanExecutor {
                     id,
                     description,
                     status: PlanStepStatus::Pending,
+                    depends_on: input
+                        .get("depends_on")
+                        .and_then(Value::as_array)
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                     committed_as: None,
+                    committed_task: None,
                 };
+                if let Some(missing) = step
+                    .depends_on
+                    .iter()
+                    .find(|dependency| state.position(dependency).is_none())
+                {
+                    return Err(OperationError::Execution(format!(
+                        "no dependency step {missing}"
+                    )));
+                }
                 match input.get("after").and_then(Value::as_str) {
                     Some(after) if !after.is_empty() => {
                         let position = state
@@ -519,6 +641,7 @@ mod tests {
         use arsy_kernel::{
             domain::SessionId,
             event::{EventStore, MemoryEventStore},
+            orchestration::TaskGraph,
             todo::TodoList,
         };
 
@@ -546,7 +669,7 @@ mod tests {
             &executors,
             &artifacts,
             "plan.add",
-            serde_json::json!({"description": "run the suite"}),
+            serde_json::json!({"description": "run the suite", "depends_on": ["step-1"]}),
         );
         let committed = call(&executors, &artifacts, "plan.commit", serde_json::json!({}));
         assert_eq!(
@@ -562,6 +685,18 @@ mod tests {
         let items = list.snapshot().items;
         assert_eq!(items.len(), 2, "the commitment outlives the plan");
         assert_eq!(items[0].text, "write the fix");
+        assert_eq!(items[1].depends_on, vec!["todo-1"]);
+
+        let graph = TaskGraph::new(Arc::clone(&store), session, Principal::System).unwrap();
+        let tasks: Vec<_> = graph.tasks().collect();
+        assert_eq!(tasks.len(), 2, "dependency-bearing commitments compile");
+        let dependent = tasks
+            .iter()
+            .find(|task| !task.dependencies.is_empty())
+            .expect("one task has the plan dependency");
+        assert!(tasks
+            .iter()
+            .any(|task| dependent.dependencies == vec![task.id]));
 
         assert!(
             try_call(&executors, &artifacts, "plan.commit", serde_json::json!({})).is_err(),

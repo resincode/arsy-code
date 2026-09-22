@@ -21,6 +21,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "plan a task; show | approve | revise [NOTE] | cancel",
     ),
     ("/todo", "show this session's durable checklist"),
+    (
+        "/agents",
+        "show durable agent, budget, workspace, and proof state",
+    ),
     ("/provider", "choose, add, or remove a provider endpoint"),
     ("/model", "choose the provider model"),
     ("/effort", "set reasoning effort; low | medium | high | off"),

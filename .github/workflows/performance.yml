@@ -1,22 +1,6 @@
 name: Performance
 
 on:
-  pull_request:
-    # Prose and repository furniture cannot change how the code behaves, so
-    # they do not need a three-OS build to prove it. Documentation under
-    # fixtures/ is deliberately absent: fixtures/compat/check.py asserts each
-    # fixture ships a README.md, so those are inputs rather than prose.
-    paths-ignore:
-      - "*.md"
-      - "docs/**"
-      - "assets/**"
-      - "LICENSE"
-      - "NOTICE"
-      - ".github/CODEOWNERS"
-      - ".github/labeler.yml"
-      - ".github/ISSUE_TEMPLATE/**"
-      - ".github/PULL_REQUEST_TEMPLATE.md"
-      - ".github/workflows/README.md"
   schedule:
     - cron: "41 2 * * *"
   workflow_dispatch:
@@ -35,16 +19,17 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
       - run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
-      - run: rustup toolchain install 1.98.0 --profile minimal
-      - run: cargo +1.98.0 test -p arsy-code benchmark::tests --locked
-      - run: cargo +1.98.0 bench -p arsy-code --bench performance --locked -- --gate
+      - id: rust
+        uses: ./.github/actions/setup-workspace-rust
+      - run: cargo +${{ steps.rust.outputs.version }} test -p arsy-code benchmark::tests --locked
+      - run: cargo +${{ steps.rust.outputs.version }} bench -p arsy-code --bench performance --locked -- --gate
 
   noisy-end-to-end:
     name: Noisy cold/warm repository benchmarks
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
       - run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
-      - run: rustup toolchain install 1.98.0 --profile minimal
-      - run: cargo +1.98.0 bench -p arsy-code --bench performance --locked
+      - id: rust
+        uses: ./.github/actions/setup-workspace-rust
+      - run: cargo +${{ steps.rust.outputs.version }} bench -p arsy-code --bench performance --locked

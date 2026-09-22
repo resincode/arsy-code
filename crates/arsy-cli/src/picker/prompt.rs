@@ -1580,7 +1580,7 @@ pub(crate) fn open_route(invocation: &Invocation, workspace: &Path) -> Result<Op
 pub(crate) fn steers_turn(line: &str) -> bool {
     matches!(
         line.split_whitespace().next(),
-        Some("/plan" | "/todo" | "/approval")
+        Some("/plan" | "/todo" | "/agents" | "/approval")
     )
 }
 
@@ -1596,6 +1596,7 @@ pub(crate) fn steer_turn(
     match line.split_whitespace().next() {
         Some("/plan") => plan_step(line, workspace, approval, state, queued, stdout),
         Some("/todo") => show_todos(workspace, state.session_id(), stdout),
+        Some("/agents") => show_agents(workspace, state.session_id(), stdout),
         Some("/approval") => set_mode(line, approval, state, stdout),
         _ => Ok(()),
     }
@@ -1684,6 +1685,32 @@ pub(crate) fn show_todos(
         }
         None => {
             writeln!(stdout, "This session's TODOs could not be read.").map_err(terminal_failed)
+        }
+    }
+}
+
+/// Durable supervision state, rebuilt from the same session stream as resume.
+#[cfg(feature = "tui")]
+pub(crate) fn show_agents(
+    workspace: &Path,
+    session: SessionId,
+    stdout: &mut io::Stdout,
+) -> Result<(), Diagnostic> {
+    let projection = open_store(workspace).ok().and_then(|store| {
+        let graph =
+            arsy_kernel::orchestration::TaskGraph::new(store, session, crate::actor()).ok()?;
+        Some(arsy_kernel::hub::AgentHub::project(
+            &graph,
+            arsy_kernel::artifact::unix_time_ms(),
+            arsy_kernel::hub::HubFilter::All,
+        ))
+    });
+    match projection {
+        Some(projection) => {
+            write!(stdout, "{}", progress::human_agents(&projection)).map_err(terminal_failed)
+        }
+        None => {
+            writeln!(stdout, "This session's agents could not be read.").map_err(terminal_failed)
         }
     }
 }

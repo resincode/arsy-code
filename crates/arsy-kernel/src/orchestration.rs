@@ -1113,6 +1113,11 @@ impl TaskGraph {
             .filter(|assignment| !assignment.released)
     }
 
+    /// Every claim, including released views, in stable id order.
+    pub fn assignments(&self) -> impl Iterator<Item = &WorkspaceAssignment> {
+        self.assignments.values()
+    }
+
     /// Claims whose owner is gone: the lease has passed, or the attempt that
     /// held it has ended without the view being given back.
     ///

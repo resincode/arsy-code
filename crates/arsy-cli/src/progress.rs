@@ -15,6 +15,7 @@ use arsy_code::agent::planops::{PlanSnapshot, PlanStepStatus};
 use arsy_kernel::{
     domain::{Principal, SessionId},
     event::EventStore,
+    hub::AgentHub,
     todo::{TodoList, TodoSnapshot},
 };
 use serde_json::{json, Value};
@@ -139,6 +140,25 @@ pub fn human_todos(projection: &Value) -> String {
     text
 }
 
+pub fn human_agents(hub: &AgentHub) -> String {
+    if hub.rows.is_empty() {
+        return "This session has no delegated agents.\n".to_owned();
+    }
+    let mut text = format!("{} agent task(s)\n", hub.rows.len());
+    for row in &hub.rows {
+        let role = if row.role.is_empty() {
+            "unassigned"
+        } else {
+            &row.role
+        };
+        text.push_str(&format!(
+            "  {} · {role} · {:?} · proof {} · {} token(s) used\n",
+            row.task, row.task_state, row.proof, row.used.tokens
+        ));
+    }
+    text
+}
+
 /// One line of either listing. `>` marks where the work is, so a long list
 /// still answers "what now" without counting.
 fn row(entry: &Value, body: &str) -> String {
@@ -185,19 +205,25 @@ mod tests {
                     id: "step-1".into(),
                     description: "read the test".into(),
                     status: PlanStepStatus::Completed,
+                    depends_on: Vec::new(),
                     committed_as: None,
+                    committed_task: None,
                 },
                 arsy_code::agent::planops::PlanStep {
                     id: "step-2".into(),
                     description: "fix the bug".into(),
                     status: PlanStepStatus::InProgress,
+                    depends_on: Vec::new(),
                     committed_as: None,
+                    committed_task: None,
                 },
                 arsy_code::agent::planops::PlanStep {
                     id: "step-3".into(),
                     description: "run the suite".into(),
                     status: PlanStepStatus::Pending,
+                    depends_on: Vec::new(),
                     committed_as: None,
+                    committed_task: None,
                 },
             ],
         };

@@ -80,10 +80,11 @@ jobs:
           # workspace is at it. A shallow clone cannot answer that.
           fetch-depth: 0
       - run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
-      - run: rustup toolchain install 1.98.0 --profile minimal
+      - id: rust
+        uses: ./.github/actions/setup-workspace-rust
       # Not --release: this suite's trials run `cargo test`, so how fast the
       # runner binary is cannot change what it measures.
-      - run: cargo +1.98.0 build -p arsy-cli --locked
+      - run: cargo +${{ steps.rust.outputs.version }} build -p arsy-cli --locked
       - name: Smoke
         env:
           CI: "true"
@@ -105,8 +106,9 @@ jobs:
         with:
           fetch-depth: 0
       - run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
-      - run: rustup toolchain install 1.98.0 --profile minimal
-      - run: cargo +1.98.0 build --release -p arsy-cli --locked
+      - id: rust
+        uses: ./.github/actions/setup-workspace-rust
+      - run: cargo +${{ steps.rust.outputs.version }} build --release -p arsy-cli --locked
       - name: Semantic navigation
         env:
           ARSY_EVAL: "1"
@@ -131,8 +133,9 @@ jobs:
         with:
           fetch-depth: 0
       - run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
-      - run: rustup toolchain install 1.98.0 --profile minimal
-      - run: cargo +1.98.0 build --release -p arsy-cli --locked
+      - id: rust
+        uses: ./.github/actions/setup-workspace-rust
+      - run: cargo +${{ steps.rust.outputs.version }} build --release -p arsy-cli --locked
       - name: Answer quality
         env:
           ARSY_EVAL: "1"

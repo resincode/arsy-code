@@ -15,14 +15,15 @@
 use crate::{
     model_profile::{CapabilityState, ModelCapability},
     provider::ModelKey,
+    safety::AgentRole,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// What the turn is for. The harness distinguishes exactly these two today —
 /// a person waiting at a terminal, and a pipeline that is not — so those are
 /// the classes, rather than a taxonomy nothing produces.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskClass {
     /// Someone is watching the stream: latency decides.
@@ -44,6 +45,9 @@ pub struct Candidate {
     pub residency: Option<String>,
     /// Micro-units per thousand output tokens, when configuration states it.
     pub cost_micros_per_1k: Option<u64>,
+    pub context_window: Option<u64>,
+    pub modalities: BTreeSet<String>,
+    pub provider_features: BTreeSet<String>,
 }
 
 impl Candidate {
@@ -58,17 +62,34 @@ impl Candidate {
 ///
 /// Rolling means: a model that was slow once and fast fifty times ranks on the
 /// fifty, and a model with one sample is not treated as if it had many.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct Observations {
     samples: BTreeMap<ModelKey, Sample>,
+    records: Vec<Observation>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 struct Sample {
     turns: u64,
     failures: u64,
     latency_total_ms: u64,
     cost_total_micros: u64,
+}
+
+/// One dated, attributable measurement. Quality is a verified outcome from an
+/// eval or check, never the model's own completion claim.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Observation {
+    pub key: ModelKey,
+    pub observed_at_ms: u64,
+    pub endpoint_version: String,
+    pub sample_size: u64,
+    pub eval_suite: String,
+    pub role: Option<AgentRole>,
+    pub task_class: TaskClass,
+    pub latency_ms: u64,
+    pub cost_micros: u64,
+    pub verified_success: bool,
 }
 
 impl Observations {
@@ -78,13 +99,59 @@ impl Observations {
 
     /// Record one finished turn.
     pub fn record(&mut self, key: &ModelKey, latency_ms: u64, cost_micros: u64, succeeded: bool) {
+        self.record_observation(Observation {
+            key: key.clone(),
+            observed_at_ms: 0,
+            endpoint_version: String::new(),
+            sample_size: 1,
+            eval_suite: "runtime".into(),
+            role: None,
+            task_class: TaskClass::Interactive,
+            latency_ms,
+            cost_micros,
+            verified_success: succeeded,
+        });
+    }
+
+    pub fn record_observation(&mut self, observation: Observation) {
+        let key = observation.key.clone();
+        let sample_size = observation.sample_size.max(1);
         let sample = self.samples.entry(key.clone()).or_default();
-        sample.turns = sample.turns.saturating_add(1);
-        if !succeeded {
-            sample.failures = sample.failures.saturating_add(1);
+        sample.turns = sample.turns.saturating_add(sample_size);
+        if !observation.verified_success {
+            sample.failures = sample.failures.saturating_add(sample_size);
         }
-        sample.latency_total_ms = sample.latency_total_ms.saturating_add(latency_ms);
-        sample.cost_total_micros = sample.cost_total_micros.saturating_add(cost_micros);
+        sample.latency_total_ms = sample
+            .latency_total_ms
+            .saturating_add(observation.latency_ms.saturating_mul(sample_size));
+        sample.cost_total_micros = sample
+            .cost_total_micros
+            .saturating_add(observation.cost_micros.saturating_mul(sample_size));
+        self.records.push(observation);
+    }
+
+    pub fn records(&self) -> &[Observation] {
+        &self.records
+    }
+
+    fn scoped(&self, key: &ModelKey, role: Option<AgentRole>, task: TaskClass) -> Option<Sample> {
+        let mut sample = Sample::default();
+        for observation in self.records.iter().filter(|observation| {
+            observation.key == *key && observation.role == role && observation.task_class == task
+        }) {
+            let count = observation.sample_size.max(1);
+            sample.turns = sample.turns.saturating_add(count);
+            if !observation.verified_success {
+                sample.failures = sample.failures.saturating_add(count);
+            }
+            sample.latency_total_ms = sample
+                .latency_total_ms
+                .saturating_add(observation.latency_ms.saturating_mul(count));
+            sample.cost_total_micros = sample
+                .cost_total_micros
+                .saturating_add(observation.cost_micros.saturating_mul(count));
+        }
+        (sample.turns > 0).then_some(sample)
     }
 
     pub fn turns(&self, key: &ModelKey) -> u64 {
@@ -127,6 +194,9 @@ pub struct Constraints {
     pub required_capabilities: BTreeSet<String>,
     /// Cap on the mean cost of a turn.
     pub max_cost_micros: Option<u64>,
+    pub min_context_tokens: Option<u64>,
+    pub required_modalities: BTreeSet<String>,
+    pub required_provider_features: BTreeSet<String>,
 }
 
 impl Constraints {
@@ -161,6 +231,26 @@ impl Constraints {
             if !candidate.supports(capability) {
                 return Some(format!("it does not support `{capability}`"));
             }
+        }
+        if self
+            .min_context_tokens
+            .is_some_and(|minimum| candidate.context_window.is_none_or(|size| size < minimum))
+        {
+            return Some("its context window is missing or too small".to_owned());
+        }
+        if let Some(modality) = self
+            .required_modalities
+            .iter()
+            .find(|modality| !candidate.modalities.contains(*modality))
+        {
+            return Some(format!("it does not support `{modality}` input"));
+        }
+        if let Some(feature) = self
+            .required_provider_features
+            .iter()
+            .find(|feature| !candidate.provider_features.contains(*feature))
+        {
+            return Some(format!("its provider does not support `{feature}`"));
         }
         if let (Some(cap), Some(cost)) = (self.max_cost_micros, candidate.cost_micros_per_1k) {
             if cost > cap {
@@ -225,6 +315,7 @@ pub struct Preference {
     /// `false` disables ranking, not policy.
     pub route: bool,
     pub task: Option<TaskClass>,
+    pub role: Option<AgentRole>,
 }
 
 /// Decide which model a turn uses.
@@ -308,15 +399,15 @@ pub fn decide(
     let task = preference.task.unwrap_or(TaskClass::Interactive);
     let mut ranked: Vec<&Candidate> = eligible;
     ranked.sort_by(|left, right| {
-        rank(left, observations, task)
-            .cmp(&rank(right, observations, task))
+        rank(left, observations, preference.role, task)
+            .cmp(&rank(right, observations, preference.role, task))
             .then(left.key.provider.cmp(&right.key.provider))
             .then(left.key.model.cmp(&right.key.model))
     });
     let winner = ranked[0];
     Decision::Routed {
         key: winner.key.clone(),
-        reasons: explain(winner, observations, task),
+        reasons: explain(winner, observations, preference.role, task),
         excluded,
     }
 }
@@ -329,14 +420,21 @@ pub fn decide(
 fn rank(
     candidate: &Candidate,
     observations: &Observations,
+    role: Option<AgentRole>,
     task: TaskClass,
 ) -> (u64, u64, u64, usize) {
-    let failures = observations.failure_rate(&candidate.key).unwrap_or(0);
-    let latency = observations
-        .mean_latency_ms(&candidate.key)
+    let sample = observations.scoped(&candidate.key, role, task);
+    let failures = sample
+        .filter(|sample| sample.turns > 0)
+        .map(|sample| sample.failures.saturating_mul(1_000) / sample.turns)
+        .unwrap_or(0);
+    let latency = sample
+        .filter(|sample| sample.turns > 0)
+        .map(|sample| sample.latency_total_ms / sample.turns)
         .unwrap_or(u64::MAX);
-    let cost = observations
-        .mean_cost_micros(&candidate.key)
+    let cost = sample
+        .filter(|sample| sample.turns > 0)
+        .map(|sample| sample.cost_total_micros / sample.turns)
         .or(candidate.cost_micros_per_1k)
         .unwrap_or(u64::MAX);
     let (first, second) = match task {
@@ -345,31 +443,43 @@ fn rank(
     };
     // A model with no measurements at all sorts behind one with any, rather
     // than winning on a `u64::MAX` that happens to tie.
-    let unmeasured = usize::from(observations.turns(&candidate.key) == 0);
+    let unmeasured = usize::from(sample.is_none());
     (failures, first, second, unmeasured)
 }
 
-fn explain(candidate: &Candidate, observations: &Observations, task: TaskClass) -> Vec<String> {
+fn explain(
+    candidate: &Candidate,
+    observations: &Observations,
+    role: Option<AgentRole>,
+    task: TaskClass,
+) -> Vec<String> {
     let mut reasons = vec![format!(
-        "ranked for a {} turn",
+        "ranked for a {} turn{}",
         match task {
             TaskClass::Interactive => "latency-sensitive",
             TaskClass::Batch => "cost-sensitive",
-        }
+        },
+        role.map_or_else(String::new, |role| format!(" as {role:?}"))
     )];
-    match observations.turns(&candidate.key) {
-        0 => reasons.push("nothing has been measured for it yet".to_owned()),
-        turns => {
+    match observations.scoped(&candidate.key, role, task) {
+        None => {
+            reasons.push("nothing has been measured for this role and task class yet".to_owned())
+        }
+        Some(sample) => {
+            let turns = sample.turns;
             reasons.push(format!("measured over {turns} turn(s)"));
-            if let Some(latency) = observations.mean_latency_ms(&candidate.key) {
-                reasons.push(format!("mean latency {latency} ms"));
-            }
-            if let Some(cost) = observations.mean_cost_micros(&candidate.key) {
-                reasons.push(format!("mean cost {cost} micro-units"));
-            }
-            if let Some(rate) = observations.failure_rate(&candidate.key) {
-                reasons.push(format!("{rate} failures per thousand turns"));
-            }
+            reasons.push(format!(
+                "mean latency {} ms",
+                sample.latency_total_ms / turns
+            ));
+            reasons.push(format!(
+                "mean cost {} micro-units",
+                sample.cost_total_micros / turns
+            ));
+            reasons.push(format!(
+                "{} failures per thousand turns",
+                sample.failures.saturating_mul(1_000) / turns
+            ));
         }
     }
     reasons
@@ -389,6 +499,9 @@ mod tests {
             capabilities: model_profile::declared(None),
             residency: None,
             cost_micros_per_1k: None,
+            context_window: None,
+            modalities: BTreeSet::new(),
+            provider_features: BTreeSet::new(),
         }
     }
 
@@ -510,6 +623,89 @@ mod tests {
         assert!(excluded["us"].contains("not allowed"));
         assert!(excluded["unknown"].contains("unstated"));
         assert!(excluded["plain"].contains("tool_calls"));
+    }
+
+    #[test]
+    fn role_requirements_filter_before_ranking_and_observations_keep_provenance() {
+        let mut eligible = candidate("acme", "eligible");
+        eligible.context_window = Some(128_000);
+        eligible.modalities.insert("image".into());
+        eligible.provider_features.insert("json_schema".into());
+        let too_small = candidate("acme", "small");
+        let constraints = Constraints {
+            min_context_tokens: Some(64_000),
+            required_modalities: ["image".to_owned()].into(),
+            required_provider_features: ["json_schema".to_owned()].into(),
+            ..Constraints::default()
+        };
+        let decision = decide(
+            &[too_small, eligible.clone()],
+            &constraints,
+            &Observations::new(),
+            &Preference {
+                route: true,
+                role: Some(AgentRole::Reviewer),
+                ..Preference::default()
+            },
+        );
+        assert_eq!(routed(&decision), &eligible.key);
+        assert!(decision.excluded()[0].reason.contains("context window"));
+
+        let mut observations = Observations::new();
+        observations.record_observation(Observation {
+            key: eligible.key,
+            observed_at_ms: 42,
+            endpoint_version: "v1".into(),
+            sample_size: 3,
+            eval_suite: "held-out-review".into(),
+            role: Some(AgentRole::Reviewer),
+            task_class: TaskClass::Batch,
+            latency_ms: 100,
+            cost_micros: 20,
+            verified_success: true,
+        });
+        assert_eq!(observations.turns(&observations.records()[0].key), 3);
+        assert_eq!(observations.records()[0].eval_suite, "held-out-review");
+    }
+
+    #[test]
+    fn ranking_uses_only_observations_for_the_requested_role_and_task_class() {
+        let candidates = vec![candidate("acme", "planner"), candidate("acme", "coder")];
+        let mut observations = Observations::new();
+        for (key, role, latency) in [
+            (&candidates[0].key, AgentRole::Planner, 10),
+            (&candidates[1].key, AgentRole::Planner, 100),
+            (&candidates[0].key, AgentRole::Implementer, 100),
+            (&candidates[1].key, AgentRole::Implementer, 10),
+        ] {
+            observations.record_observation(Observation {
+                key: key.clone(),
+                observed_at_ms: 1,
+                endpoint_version: "v1".into(),
+                sample_size: 10,
+                eval_suite: "held-out-role".into(),
+                role: Some(role),
+                task_class: TaskClass::Interactive,
+                latency_ms: latency,
+                cost_micros: 1,
+                verified_success: true,
+            });
+        }
+
+        let routed_for = |role| {
+            decide(
+                &candidates,
+                &Constraints::default(),
+                &observations,
+                &Preference {
+                    route: true,
+                    role: Some(role),
+                    ..Preference::default()
+                },
+            )
+        };
+        assert_eq!(routed(&routed_for(AgentRole::Planner)).model, "planner");
+        assert_eq!(routed(&routed_for(AgentRole::Implementer)).model, "coder");
     }
 
     #[test]

@@ -820,7 +820,8 @@ pub const TOOLS: &[Tool] = &[
             object(
                 json!({
                     "description": {"type": "string", "description": "What the step is."},
-                    "after": {"type": "string", "description": "Step id to insert after. Defaults to the end of the plan."}
+                    "after": {"type": "string", "description": "Step id to insert after. Defaults to the end of the plan."},
+                    "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Earlier step ids that must finish first after commit."}
                 }),
                 &["description"],
             )
@@ -829,6 +830,9 @@ pub const TOOLS: &[Tool] = &[
             let mut input = json!({"description": text(arguments, "description")});
             if let Some(after) = arguments.get("after").and_then(Value::as_str) {
                 input["after"] = json!(after);
+            }
+            if let Some(depends_on) = arguments.get("depends_on").and_then(Value::as_array) {
+                input["depends_on"] = json!(depends_on);
             }
             Ok(input)
         },
