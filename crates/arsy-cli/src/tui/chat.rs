@@ -25,7 +25,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/agents",
         "show agents; pause|resume|cancel|steer ATTEMPT [MESSAGE]",
     ),
-    ("/provider", "choose, add, or remove a provider endpoint"),
+    (
+        "/provider",
+        "providers: choose access (OAuth/key/custom/local), add, sign in, or remove",
+    ),
     ("/model", "choose the provider model"),
     ("/effort", "set reasoning effort; low | medium | high | off"),
     (
@@ -51,7 +54,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/doctor", "check workspace, storage, and sandbox assurance"),
     (
         "/auth",
-        "manage credentials; list | login PROVIDER | set PROVIDER | remove HANDLE",
+        "alias of /provider (access, sign-in, and credentials)",
     ),
     (
         "/compat",
