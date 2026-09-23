@@ -1,0 +1,224 @@
+name: Release smoke
+
+# Proves a published release rather than asserting it: every supported channel
+# is installed from its own front door on every claimed target, and what each
+# one launches is recorded.
+#
+# This runs after npm-publish rather than inside release.yml because the npm
+# package does not exist until that workflow finishes, and a channel cannot be
+# smoke-tested before it is published. release.yml's `verify-release` job stays
+# where it is -- it is the fast gate inside the release; this is the full one
+# after it.
+#
+# Cost: once per release tag. Nothing here compiles; every job downloads a
+# finished binary and runs it, so the wall time is dominated by the downloads.
+# Projected, to be replaced by the first measured run:
+#
+#   6 × target job   ~4 min each   Linux 2 × 1, macOS 2 × 10, Windows 2 × 2
+#   1 × report job   ~1 min
+#
+# which bills at roughly 4×(2×1 + 2×10 + 2×2) + 1 = ~105 runner-minutes per
+# release. Adding a target costs one job; adding a PR trigger would cost all of
+# it on every push, which is why there isn't one.
+
+on:
+  workflow_run:
+    workflows: ["npm-publish"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to smoke-test (e.g. v0.4.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ inputs.tag || github.event.workflow_run.head_branch }}
+
+jobs:
+  channels:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runner: ubuntu-24.04
+            archive: arsy-linux-x86_64.tar.gz
+            homebrew: true
+          - target: linux-aarch64
+            runner: ubuntu-24.04-arm
+            archive: arsy-linux-aarch64.tar.gz
+          - target: macos-x86_64
+            runner: macos-15-intel
+            archive: arsy-macos-x86_64.tar.gz
+            homebrew: true
+          - target: macos-aarch64
+            runner: macos-latest
+            archive: arsy-macos-aarch64.tar.gz
+            homebrew: true
+          - target: windows-x86_64
+            runner: windows-latest
+            archive: arsy-windows-x86_64.zip
+            scoop: true
+          - target: windows-aarch64
+            runner: windows-11-arm
+            archive: arsy-windows-aarch64.zip
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCHIVE: ${{ matrix.archive }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Download the published assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release \
+            --pattern "$ARCHIVE" --pattern SHA256SUMS --pattern SHA256SUMS.bundle \
+            --pattern install.sh --pattern install.ps1
+
+      # One helper instead of the same jq line in five steps. A channel that
+      # cannot launch never reaches its `record`, so a missing entry in the
+      # report is itself a failure -- the report job counts them.
+      - name: Install the channel recorder
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > record.sh <<'SH'
+          #!/bin/sh
+          set -eu
+          jq -cn --arg channel "$1" --arg launch "$2" --arg tag "$TAG" \
+            --arg target "$TARGET" --arg digest "$DIGEST" \
+            '{schema:1,channel:$channel,tag:$tag,target:$target,digest:$digest,signature:true,launch:$launch}' \
+            >> "smoke-$TARGET.ndjson"
+          SH
+          chmod +x record.sh
+
+      - name: Verify the signature and the canonical digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release
+          cosign verify-blob SHA256SUMS --bundle SHA256SUMS.bundle \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}"
+          # macOS has no sha256sum; Git Bash on Windows has no shasum.
+          if command -v sha256sum >/dev/null; then
+            actual="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
+          else
+            actual="$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
+          fi
+          expected="$(awk -v name="$ARCHIVE" '$2 == name { found = 1; print $1 } END { exit !found }' SHA256SUMS)"
+          test "$expected" = "$actual"
+          echo "DIGEST=$actual" >> "$GITHUB_ENV"
+
+      - name: GitHub Release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          # bsdtar on Windows reads the zip, GNU tar auto-detects the gzip, so
+          # one command covers every target.
+          mkdir archive && tar -xf "release/$ARCHIVE" -C archive
+          suffix=""
+          [ "$RUNNER_OS" = "Windows" ] && suffix=".exe"
+          test -f "archive/fluxguard$suffix"
+          ./record.sh github-release "$("archive/arsy$suffix" --version)"
+
+      - name: Installer script
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARSY_VERSION="$TAG" ARSY_INSTALL_DIR="$PWD/installer-bin" sh release/install.sh
+          test -f installer-bin/fluxguard
+          ./record.sh installer "$(installer-bin/arsy --version)"
+
+      - name: Installer script
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:ARSY_VERSION = $env:TAG
+          $env:ARSY_INSTALL_DIR = "$PWD\installer-bin"
+          & release\install.ps1
+          if (-not (Test-Path installer-bin\fluxguard.exe)) { throw "fluxguard missing" }
+          bash ./record.sh installer "$(& installer-bin\arsy.exe --version)"
+
+      # Every channel is launched through its own path rather than through
+      # PATH: once one of them installs an `arsy`, a bare `arsy --version`
+      # would credit whichever channel happens to shadow the others.
+      - name: npm
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global "@suiflex/arsy-code@${TAG#v}"
+          launcher="$(npm root -g)/@suiflex/arsy-code/bin/arsy.js"
+          ./record.sh npm "$(node "$launcher" --version)"
+
+      - name: Homebrew tap
+        if: matrix.homebrew
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install suiflex/tap/arsy-code
+          prefix="$(brew --prefix arsy-code)"
+          test -x "$prefix/bin/fluxguard"
+          ./record.sh homebrew "$("$prefix/bin/arsy" --version)"
+
+      - name: Scoop bucket
+        if: matrix.scoop
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass -Force
+          Invoke-RestMethod get.scoop.sh -OutFile install-scoop.ps1
+          & .\install-scoop.ps1 -RunAsAdmin
+          scoop bucket add suiflex https://github.com/suiflex/scoop-bucket
+          scoop install arsy-code
+          $prefix = scoop prefix arsy-code
+          if (-not (Test-Path (Join-Path $prefix "fluxguard.exe"))) { throw "fluxguard missing" }
+          bash ./record.sh scoop "$(& (Join-Path $prefix "arsy.exe") --version)"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: smoke-${{ matrix.target }}
+          path: smoke-${{ matrix.target }}.ndjson
+          if-no-files-found: error
+
+  # The report is uploaded to the release itself, not only as a workflow
+  # artifact: artifacts expire, and a claim that a channel was proven has to
+  # outlive the run that proved it.
+  report:
+    needs: channels
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: reports
+          pattern: smoke-*
+          merge-multiple: true
+      - name: Merge the per-target records and attach them to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat reports/*.ndjson |
+            jq -s --arg tag "$TAG" \
+              '{schema:1,tag:$tag,channels:(. | sort_by(.target,.channel))}' \
+              > release-smoke-report.json
+          # 6 targets × (release + installer + npm) + 3 homebrew + 1 scoop.
+          test "$(jq '.channels | length' release-smoke-report.json)" = "22"
+          jq -r '.channels[] | "\(.target)\t\(.channel)\t\(.launch)"' release-smoke-report.json
+          gh release upload "$TAG" release-smoke-report.json --repo "$GITHUB_REPOSITORY" --clobber
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-smoke-report
+          path: release-smoke-report.json
+          if-no-files-found: error
