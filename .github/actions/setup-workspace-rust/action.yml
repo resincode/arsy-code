@@ -1,0 +1,30 @@
+name: Setup workspace Rust
+description: Install the Rust version declared by workspace.package.rust-version
+inputs:
+  components:
+    description: Optional comma-separated rustup components
+    required: false
+    default: ""
+outputs:
+  version:
+    description: Workspace Rust version
+    value: ${{ steps.version.outputs.value }}
+runs:
+  using: composite
+  steps:
+    - id: version
+      shell: bash
+      run: |
+        version="$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+        test -n "$version"
+        echo "value=$version" >> "$GITHUB_OUTPUT"
+    - shell: bash
+      env:
+        VERSION: ${{ steps.version.outputs.value }}
+        COMPONENTS: ${{ inputs.components }}
+      run: |
+        if [ -n "$COMPONENTS" ]; then
+          rustup toolchain install "$VERSION" --profile minimal --component "$COMPONENTS"
+        else
+          rustup toolchain install "$VERSION" --profile minimal
+        fi

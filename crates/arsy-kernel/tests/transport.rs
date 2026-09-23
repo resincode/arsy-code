@@ -50,6 +50,7 @@ fn every_request() -> Vec<ProtocolEnvelope<ClientRequest>> {
         }),
         ClientRequest::AgentControl(AgentControl {
             agent: AgentId::new(),
+            attempt: None,
             action: AgentAction::Interrupt,
             extensions: Extensions::new(),
         }),

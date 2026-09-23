@@ -12,11 +12,12 @@ use arsy_code::{
 use arsy_kernel::{
     artifact::{ArtifactStore, FileArtifactStore},
     capability::{CapabilityAction, PolicySource, ResourcePattern},
-    domain::Principal,
+    domain::{Principal, StateVersion},
     policy::{
         ActorMatch, PolicyRule, RiskContext, RuleEffect, RuleSet, SandboxAssurance,
         WorkspaceCleanliness,
     },
+    safety::{SafetyDecision, TrustState},
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -38,6 +39,14 @@ fn rules(actions: &[CapabilityAction]) -> RuleSet {
 }
 
 fn runtime(root: &std::path::Path, rules: RuleSet) -> ToolRuntime {
+    runtime_with_sandbox(root, rules, SandboxAssurance::None)
+}
+
+fn runtime_with_sandbox(
+    root: &std::path::Path,
+    rules: RuleSet,
+    sandbox: SandboxAssurance,
+) -> ToolRuntime {
     let workspace = Workspace::open(root).unwrap();
     let artifacts: Arc<dyn ArtifactStore> =
         Arc::new(FileArtifactStore::open(root.join(".arsy/artifacts"), 0).unwrap());
@@ -50,7 +59,7 @@ fn runtime(root: &std::path::Path, rules: RuleSet) -> ToolRuntime {
         RiskContext {
             reversible: true,
             workspace: WorkspaceCleanliness::Clean,
-            sandbox: SandboxAssurance::None,
+            sandbox,
         },
         arsy_code::operations::Reachable::default(),
         "test",
@@ -58,6 +67,49 @@ fn runtime(root: &std::path::Path, rules: RuleSet) -> ToolRuntime {
         &[],
     )
     .unwrap()
+}
+
+#[test]
+fn safe_auto_reviews_exact_calls_and_keeps_an_audit_record() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = runtime_with_sandbox(
+        root.path(),
+        rules(CapabilityAction::ALL),
+        SandboxAssurance::Filesystem,
+    );
+    let intent = StateVersion::from_digest([7; 32]);
+
+    let write = runtime
+        .prepare("fs.write", &json!({"path": "safe.txt", "content": "ok"}))
+        .unwrap();
+    assert_eq!(
+        runtime
+            .review_auto(&write, intent, TrustState::Trusted, false)
+            .decision,
+        SafetyDecision::Allow
+    );
+
+    let delete = runtime
+        .prepare("fs.delete", &json!({"path": "safe.txt"}))
+        .unwrap();
+    assert_eq!(
+        runtime
+            .review_auto(&delete, intent, TrustState::Trusted, false)
+            .decision,
+        SafetyDecision::RequireApproval
+    );
+    assert_eq!(
+        runtime
+            .review_auto(&delete, intent, TrustState::Trusted, true)
+            .decision,
+        SafetyDecision::Deny
+    );
+
+    let audits = runtime.take_safety_audits();
+    assert_eq!(audits.len(), 3);
+    assert_eq!(audits[0].envelope.operation.as_str(), "fs.write");
+    assert_eq!(audits[1].envelope.operation.as_str(), "fs.delete");
+    assert_eq!(audits[2].result.decision, SafetyDecision::Deny);
 }
 
 /// A runtime that may do anything, for the tests about behaviour rather than

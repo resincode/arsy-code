@@ -22,6 +22,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/todo", "show this session's durable checklist"),
     (
+        "/agents",
+        "show agents; pause|resume|cancel|steer ATTEMPT [MESSAGE]",
+    ),
+    (
         "/provider",
         "providers: choose access (OAuth/key/custom/local), add, sign in, or remove",
     ),

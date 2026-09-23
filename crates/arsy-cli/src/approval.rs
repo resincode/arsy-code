@@ -6,9 +6,9 @@
 //! There is no command classifier here and no background safety check, so
 //! [`ApprovalMode::Plan`] and [`ApprovalMode::BypassPermissions`] are defined
 //! by what they refuse or skip rather than by a heuristic this codebase does
-//! not have — `BypassPermissions` behaves exactly like `Auto` today, and is
-//! kept as its own name so a future check has somewhere to attach without
-//! moving `Auto`'s callers under it by surprise.
+//! not have. `Auto` runs bounded structured work and asks for broader effects;
+//! `BypassPermissions` skips that approval conversion but remains inside hard
+//! policy ceilings.
 //!
 //! Policy can still deny a call in every mode: none of this skips
 //! `RuleSet::evaluate`, only how a call that reaches `NeedsApproval` is
@@ -33,13 +33,12 @@ pub enum ApprovalMode {
     /// the workspace is refused outright, not asked. For exploring a
     /// codebase before deciding to change it.
     Plan,
-    /// Everything runs without asking.
+    /// Bounded reads, edits, and harness bookkeeping run; broader effects ask.
     Auto,
     /// Reads run; anything else that would ask is refused instead of
     /// prompting. For a script or CI run where nobody is at the keyboard.
     DontAsk,
-    /// Everything runs without asking. See the module docs for why this is
-    /// not distinct from `Auto` yet.
+    /// Everything policy left for approval runs without asking.
     BypassPermissions,
 }
 
@@ -76,9 +75,9 @@ impl ApprovalMode {
             Self::Default => "reads only; everything else asks",
             Self::AcceptEdits => "reads and file writes/creates/edits/moves; everything else asks",
             Self::Plan => "reads and the plan/validation tools; everything else is refused",
-            Self::Auto => "everything runs without asking",
+            Self::Auto => "bounded reads and edits run; broader effects ask",
             Self::DontAsk => "reads only; everything else is refused instead of asked",
-            Self::BypassPermissions => "everything runs without asking (same as auto)",
+            Self::BypassPermissions => "everything inside hard policy ceilings runs",
         }
     }
 
@@ -86,9 +85,9 @@ impl ApprovalMode {
     ///
     /// Only the modes an operator at a keyboard would choose between are in the
     /// ring. `dontAsk` exists for a run with nobody watching, and
-    /// `bypassPermissions` is `auto` under another name — putting either one a
-    /// keypress away would mean stepping past the mode you wanted into one that
-    /// behaves identically or refuses everything.
+    /// `bypassPermissions` deliberately stays out of the keyboard cycle: it
+    /// skips Safe Auto's independent review and is too risky to enable with an
+    /// accidental keypress. `dontAsk` is reserved for unattended runs.
     pub const fn cycle(self) -> Self {
         match self {
             Self::Default => Self::AcceptEdits,
@@ -355,7 +354,14 @@ fn is_plan_tool(name: &str) -> bool {
 /// or denies outright never reaches this.
 pub fn decide(mode: ApprovalMode, name: &str) -> Decision {
     match mode {
-        ApprovalMode::Auto | ApprovalMode::BypassPermissions => Decision::Approve,
+        ApprovalMode::Auto => {
+            if is_read(name) || is_edit(name) || is_plan_tool(name) {
+                Decision::Approve
+            } else {
+                Decision::Ask
+            }
+        }
+        ApprovalMode::BypassPermissions => Decision::Approve,
         ApprovalMode::Default => {
             if is_read(name) {
                 Decision::Approve
@@ -452,10 +458,14 @@ mod tests {
     }
 
     #[test]
-    fn auto_and_bypass_approve_everything() {
-        for mode in [ApprovalMode::Auto, ApprovalMode::BypassPermissions] {
-            assert_eq!(decide(mode, "bash"), Decision::Approve);
-            assert_eq!(decide(mode, "fs.delete"), Decision::Approve);
+    fn auto_reviews_broad_effects_while_bypass_approves_them() {
+        assert_eq!(decide(ApprovalMode::Auto, "fs.write"), Decision::Approve);
+        for name in ["bash", "fs.delete", "unknown.future.tool"] {
+            assert_eq!(decide(ApprovalMode::Auto, name), Decision::Ask);
+            assert_eq!(
+                decide(ApprovalMode::BypassPermissions, name),
+                Decision::Approve
+            );
         }
     }
 

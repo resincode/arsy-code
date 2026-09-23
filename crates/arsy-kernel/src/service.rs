@@ -8,10 +8,11 @@ use crate::{
     capability::CapabilityGrant,
     domain::{CorrelationId, EventId, Principal, SessionId, StateVersion, SubscriptionId, TurnId},
     event::{EventEnvelope, EventPayload, EventStore, SchemaVersion, StoreError, StreamVersion},
+    orchestration::{AttemptRequest, GraphError, MessageKind, TaskGraph},
     projection::{ProjectionError, ProjectionSet, TurnStatus, UsageTotals},
     protocol::{
-        ClientRequest, IdempotencyKey, ProtocolEnvelope, ProtocolError, RequestLedger, ServerEvent,
-        SubscriptionCursor, MAX_SUBSCRIPTION_BATCH,
+        AgentAction, AgentControl, ClientRequest, IdempotencyKey, ProtocolEnvelope, ProtocolError,
+        RequestLedger, ServerEvent, SubscriptionCursor, MAX_SUBSCRIPTION_BATCH,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -167,6 +168,138 @@ impl AgentService {
 
     pub const fn session(&self) -> SessionId {
         self.session
+    }
+
+    /// Apply one typed supervision command to the canonical task stream.
+    pub fn control_agent(
+        &self,
+        actor: Principal,
+        control: &AgentControl,
+    ) -> Result<Value, ServiceError> {
+        let mut graph = TaskGraph::new(Arc::clone(&self.store), self.session, actor)?;
+        let located = graph.tasks().find_map(|task| {
+            let attempt = match control.attempt {
+                Some(id) if task.runtime.attempts.contains(&id) => graph.attempt(id),
+                Some(_) => None,
+                None => task
+                    .runtime
+                    .current_attempt
+                    .and_then(|id| graph.attempt(id))
+                    .or_else(|| {
+                        task.runtime
+                            .attempts
+                            .last()
+                            .and_then(|id| graph.attempt(*id))
+                    }),
+            }?;
+            (attempt.assignee == control.agent).then_some((task.id, attempt.clone()))
+        });
+        let (task, attempt) = located.ok_or_else(|| {
+            ServiceError::Graph(format!("agent {} is not in this session", control.agent))
+        })?;
+        let target = || {
+            control
+                .attempt
+                .filter(|id| *id == attempt.id)
+                .ok_or_else(|| {
+                    ServiceError::Graph(
+                    "state-changing supervision requires the exact attempt the operator inspected"
+                        .into(),
+                )
+                })
+        };
+        let live_target = || {
+            let id = target()?;
+            attempt
+                .state
+                .is_live()
+                .then_some(id)
+                .ok_or_else(|| ServiceError::Graph(format!("attempt {id} is stale")))
+        };
+
+        match &control.action {
+            AgentAction::InspectTranscript => Ok(json!({
+                "task": task,
+                "attempt": attempt.id,
+                "trace": graph.trace_of(attempt.id),
+            })),
+            AgentAction::InspectAuthority => Ok(json!({
+                "task": task,
+                "attempt": attempt.id,
+                "authority": attempt.authority,
+            })),
+            AgentAction::OpenEvidence => Ok(json!({
+                "task": task,
+                "attempt": attempt.id,
+                "evidence": attempt.evidence,
+            })),
+            AgentAction::OpenDiff => {
+                let assignment = graph
+                    .assignments()
+                    .find(|assignment| assignment.attempt == attempt.id);
+                Ok(json!({
+                    "task": task,
+                    "attempt": attempt.id,
+                    "workspace": assignment,
+                    "result": assignment.and_then(|assignment| graph.writer_result(assignment.id)),
+                }))
+            }
+            AgentAction::Message { body } | AgentAction::Steer { body } => {
+                let id = live_target()?;
+                let message = graph.send(
+                    task,
+                    task,
+                    MessageKind::Instruction,
+                    json!(body),
+                    None,
+                    crate::artifact::unix_time_ms(),
+                )?;
+                Ok(json!({"attempt": id, "message": message, "result": "recorded"}))
+            }
+            AgentAction::PauseAdmission | AgentAction::Pause => {
+                let id = live_target()?;
+                graph.request_pause(id)?;
+                Ok(json!({"attempt": id, "result": "pause_requested"}))
+            }
+            AgentAction::Resume => {
+                let id = live_target()?;
+                graph.resume(id)?;
+                Ok(json!({"attempt": id, "result": "resumed"}))
+            }
+            AgentAction::Cancel { reason } => {
+                let id = live_target()?;
+                graph.request_cancel(id, reason)?;
+                Ok(json!({"attempt": id, "result": "cancel_requested"}))
+            }
+            AgentAction::Interrupt => {
+                let id = live_target()?;
+                graph.request_cancel(id, "interrupted by supervisor")?;
+                Ok(json!({"attempt": id, "result": "cancel_requested"}))
+            }
+            AgentAction::Retry => {
+                let id = target()?;
+                let duration = attempt
+                    .lease_expires_at_ms
+                    .saturating_sub(attempt.started_at_ms);
+                let now = crate::artifact::unix_time_ms();
+                let retried = graph.retry(
+                    task,
+                    &AttemptRequest {
+                        role: attempt.role,
+                        assignee: attempt.assignee,
+                        model: attempt.model,
+                        base_revision: attempt.base_revision,
+                        started_at_ms: now,
+                        lease_expires_at_ms: now.saturating_add(duration),
+                    },
+                    3,
+                )?;
+                Ok(json!({"attempt": retried, "retry_of": id, "result": "started"}))
+            }
+            AgentAction::Integrate => Err(ServiceError::Graph(
+                "integration requires the workspace policy and conflict checks".into(),
+            )),
+        }
     }
 
     /// Read one stream in full, in sequence order.
@@ -693,6 +826,7 @@ pub enum ServiceError {
     EmptyStream(SessionId),
     MissingEvidence(String),
     LedgerDesync,
+    Graph(String),
     Poisoned,
 }
 
@@ -711,6 +845,12 @@ impl From<ProjectionError> for ServiceError {
 impl From<ProtocolError> for ServiceError {
     fn from(value: ProtocolError) -> Self {
         Self::Protocol(value)
+    }
+}
+
+impl From<GraphError> for ServiceError {
+    fn from(value: GraphError) -> Self {
+        Self::Graph(value.to_string())
     }
 }
 
@@ -735,6 +875,7 @@ impl fmt::Display for ServiceError {
             Self::LedgerDesync => {
                 formatter.write_str("idempotency key was admitted without a recorded turn")
             }
+            Self::Graph(error) => write!(formatter, "task graph: {error}"),
             Self::Poisoned => formatter.write_str("agent service lock poisoned"),
         }
     }

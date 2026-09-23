@@ -105,8 +105,9 @@ jobs:
       - name: Install Linux credential-store dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
-      - run: rustup toolchain install 1.98.0 --profile minimal
-      - run: cargo +1.98.0 build --workspace --all-features --locked --release
+      - id: rust
+        uses: ./.github/actions/setup-workspace-rust
+      - run: cargo +${{ steps.rust.outputs.version }} build --workspace --all-features --locked --release
       # Downloaded rather than built here: FluxGuard releases the same six
       # targets under the same names, already checksummed, and rebuilding it
       # from source would ship a binary nobody else can verify against. A
@@ -195,13 +196,14 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           ref: ${{ inputs.tag || github.ref_name }}
-      - run: rustup toolchain install 1.98.0 --profile minimal
+      - id: rust
+        uses: ./.github/actions/setup-workspace-rust
       - name: Generate CycloneDX SBOM
         shell: bash
         run: |
           set -euo pipefail
-          cargo +1.98.0 install cargo-cyclonedx --version 0.5.9 --locked
-          cargo +1.98.0 cyclonedx --all --format json
+          cargo +${{ steps.rust.outputs.version }} install cargo-cyclonedx --version 0.5.9 --locked
+          cargo +${{ steps.rust.outputs.version }} cyclonedx --all --format json
           mkdir -p dist
           find . -name '*.cdx.json' -not -path './dist/*' -print0 |
             xargs -0 -I{} sh -c 'cp "{}" "dist/$(basename "{}")"'
@@ -374,3 +376,52 @@ jobs:
           git add bucket/arsy-code.json
           git commit -m "arsy-code ${version}" || { echo "bucket already up to date"; exit 0; }
           git push
+
+  verify-release:
+    needs: [publish, publish-homebrew, publish-scoop]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Download final published assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          mkdir release
+          gh release download "$TAG" --dir release \
+            --pattern 'arsy-*.tar.gz' --pattern 'arsy-*.zip' \
+            --pattern 'SHA256SUMS' --pattern 'SHA256SUMS.bundle' \
+            --pattern 'install.sh' --pattern 'install.ps1'
+      - name: Independently verify digest and workflow identity
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          cd release
+          sha256sum --check SHA256SUMS
+          cosign verify-blob SHA256SUMS --bundle SHA256SUMS.bundle \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}"
+      - name: Smoke-test Linux archive and record durable report
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          mkdir smoke
+          tar -xzf release/arsy-linux-x86_64.tar.gz -C smoke
+          test -x smoke/arsy
+          test -x smoke/fluxguard
+          version="$(smoke/arsy --version)"
+          digest="$(sha256sum release/arsy-linux-x86_64.tar.gz | awk '{print $1}')"
+          jq -n --arg channel github-release --arg tag "$TAG" \
+            --arg target linux-x86_64 --arg digest "$digest" --arg version "$version" \
+            '{schema:1,channel:$channel,tag:$tag,target:$target,digest:$digest,signature:true,installer_assets:true,launch:$version}' \
+            > release-smoke-report.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-smoke-report
+          path: release-smoke-report.json
+          if-no-files-found: error

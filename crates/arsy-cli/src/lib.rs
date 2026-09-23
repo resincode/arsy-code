@@ -3056,6 +3056,7 @@ pub(crate) fn child_turn(
     ) -> Option<arsy_kernel::observer::Intervention>,
     trace: &mut dyn FnMut(&str, Value),
     steer: &mut dyn FnMut() -> Vec<String>,
+    boundary: &mut dyn FnMut() -> bool,
     cancel: &arsy_kernel::scheduler::CancelToken,
     tokens: &mut (u64, u64),
 ) -> Result<String, String> {
@@ -3069,7 +3070,7 @@ pub(crate) fn child_turn(
     let mut answer = String::new();
 
     for round in 0..MAX_CHILD_TOOL_ROUNDS {
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || !boundary() {
             return Err(CHILD_CANCELLED.to_owned());
         }
         absorb_steering(&mut request.messages, steer(), trace);
@@ -3114,7 +3115,7 @@ pub(crate) fn child_turn(
             // Between calls, not mid-call: a tool that has started is allowed
             // to finish and say what it did, so a cancelled child still
             // reports the effects it already had.
-            if cancel.is_cancelled() {
+            if cancel.is_cancelled() || !boundary() {
                 return Err(CHILD_CANCELLED.to_owned());
             }
             let result = runtime.invoke(name, arguments);
@@ -4345,8 +4346,9 @@ mod tests {
                 },
             ],
         ]);
-        let approval =
-            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Auto));
+        let approval = std::sync::Arc::new(approval::ApprovalCell::new(
+            approval::ApprovalMode::BypassPermissions,
+        ));
         let (_keys_sender, keys) = std::sync::mpsc::channel();
         let mut conversation = vec![ModelMessage {
             role: ModelRole::User,
@@ -4482,8 +4484,9 @@ mod tests {
                 },
             ],
         ]);
-        let approval =
-            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Auto));
+        let approval = std::sync::Arc::new(approval::ApprovalCell::new(
+            approval::ApprovalMode::BypassPermissions,
+        ));
         let (_keys_sender, keys) = std::sync::mpsc::channel();
         let mut conversation = Vec::new();
         let turn = native_turn(
@@ -5439,6 +5442,7 @@ mod tests {
                     | "/approval"
                     | "/plan"
                     | "/todo"
+                    | "/agents"
                     | "/skill"
             ) || INSPECTIONS.iter().any(|(slash, _, _)| slash == name);
             assert!(handled, "{name} is offered but never dispatched");

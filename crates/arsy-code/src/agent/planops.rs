@@ -13,15 +13,16 @@
 //! kind shares one `Arc<Mutex<PlanState>>`, so an `add` and the `update` that
 //! follows it in the same turn see each other's effect.
 
-use super::todoops::Journal;
+use super::{input_string, todoops::Journal};
 use arsy_kernel::{
     artifact::ArtifactStore,
     capability::{CapabilityAction, CapabilityGrant},
-    domain::{Principal, ResourceRef},
+    domain::{Principal, ResourceRef, TaskId},
     operation::{
         ConcurrencyRule, Effect, Idempotency, InputSchema, JsonType, OperationContract,
         OperationError, OperationExecutor, OperationKind, OperationOutcome, OperationRequest,
     },
+    orchestration::{Budget, TaskGraph, TaskNode, TaskRuntime, TaskState, WorkspaceRequirement},
     todo::{TodoAuthor, TodoList},
 };
 use serde::{Deserialize, Serialize};
@@ -45,11 +46,17 @@ pub struct PlanStep {
     pub id: String,
     pub description: String,
     pub status: PlanStepStatus,
+    /// Other plan steps that must finish first. These stay scratch until
+    /// commit, when they become TODO and TaskGraph edges.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
     /// The durable TODO this step became, once it was committed. A plan is
     /// revised freely and kept in the process; this is the one transition that
     /// puts part of it on the record, and it happens once per step.
     #[serde(default)]
     pub committed_as: Option<String>,
+    #[serde(default)]
+    pub committed_task: Option<TaskId>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -206,7 +213,10 @@ impl PlanOperation {
         let string = |name: &str| (name.to_owned(), JsonType::String);
         let array = |name: &str| (name.to_owned(), JsonType::Array);
         let (required, optional) = match self {
-            Self::Add => (vec![string("description")], vec![string("after")]),
+            Self::Add => (
+                vec![string("description")],
+                vec![string("after"), array("depends_on")],
+            ),
             Self::Update => (
                 vec![string("id")],
                 vec![string("status"), string("description")],
@@ -296,29 +306,139 @@ impl PlanExecutor {
             journal.actor.clone(),
         )
         .map_err(|error| OperationError::Execution(error.to_string()))?;
-        let uncommitted: Vec<usize> = state
-            .steps
-            .iter()
-            .enumerate()
-            .filter_map(|(index, step)| step.committed_as.is_none().then_some(index))
-            .collect();
-        if uncommitted.is_empty() {
+        let graph_required = state.steps.iter().any(|step| !step.depends_on.is_empty());
+        if state.steps.iter().all(|step| step.committed_as.is_some())
+            && (!graph_required || state.steps.iter().all(|step| step.committed_task.is_some()))
+        {
             return Err(OperationError::Execution(
                 "every step of this plan is already a commitment".into(),
             ));
         }
-        for index in uncommitted {
+        let by_id: HashMap<_, _> = state
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| (step.id.clone(), index))
+            .collect();
+        let order = dependency_order(&state.steps, &by_id)?;
+        for &index in &order {
+            if state.steps[index].committed_as.is_some() {
+                continue;
+            }
+            let dependencies = state.steps[index]
+                .depends_on
+                .iter()
+                .map(|dependency| {
+                    by_id
+                        .get(dependency)
+                        .and_then(|index| state.steps[*index].committed_as.clone())
+                        .ok_or_else(|| {
+                            OperationError::Execution(format!(
+                                "step {} depends on uncommitted {dependency}",
+                                state.steps[index].id
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let item = list
                 .add(
                     &state.steps[index].description,
-                    Vec::new(),
+                    dependencies,
                     TodoAuthor::Model,
                 )
                 .map_err(|error| OperationError::Execution(error.to_string()))?;
             state.steps[index].committed_as = Some(item.id);
         }
+
+        if graph_required {
+            let mut graph = TaskGraph::new(
+                Arc::clone(&journal.store),
+                journal.session,
+                journal.actor.clone(),
+            )
+            .map_err(|error| OperationError::Execution(error.to_string()))?;
+            for &index in &order {
+                if state.steps[index].committed_task.is_some() {
+                    continue;
+                }
+                let dependencies = state.steps[index]
+                    .depends_on
+                    .iter()
+                    .map(|dependency| {
+                        by_id
+                            .get(dependency)
+                            .and_then(|index| state.steps[*index].committed_task)
+                            .ok_or_else(|| {
+                                OperationError::Execution(format!(
+                                    "step {} depends on uncompiled {dependency}",
+                                    state.steps[index].id
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let id = TaskId::new();
+                graph
+                    .add(TaskNode {
+                        id,
+                        goal: state.steps[index].description.clone(),
+                        dependencies,
+                        assignee: None,
+                        required_output: "text".into(),
+                        workspace: WorkspaceRequirement::ReadOnlySnapshot,
+                        budget: Budget::default(),
+                        authority: Vec::new(),
+                        state: TaskState::Pending,
+                        lease_expires_at_ms: None,
+                        runtime: TaskRuntime {
+                            parent: journal.task,
+                            ..TaskRuntime::default()
+                        },
+                    })
+                    .map_err(|error| OperationError::Execution(error.to_string()))?;
+                state.steps[index].committed_task = Some(id);
+            }
+        }
         Ok(())
     }
+}
+
+fn dependency_order(
+    steps: &[PlanStep],
+    by_id: &HashMap<String, usize>,
+) -> Result<Vec<usize>, OperationError> {
+    let mut marks = vec![0_u8; steps.len()];
+    let mut order = Vec::with_capacity(steps.len());
+    for index in 0..steps.len() {
+        visit_step(index, steps, by_id, &mut marks, &mut order)?;
+    }
+    Ok(order)
+}
+
+fn visit_step(
+    index: usize,
+    steps: &[PlanStep],
+    by_id: &HashMap<String, usize>,
+    marks: &mut [u8],
+    order: &mut Vec<usize>,
+) -> Result<(), OperationError> {
+    match marks[index] {
+        2 => return Ok(()),
+        1 => {
+            return Err(OperationError::Execution(
+                "plan dependencies are cyclic".into(),
+            ))
+        }
+        _ => marks[index] = 1,
+    }
+    for dependency in &steps[index].depends_on {
+        let dependency = *by_id
+            .get(dependency)
+            .ok_or_else(|| OperationError::Execution(format!("no dependency step {dependency}")))?;
+        visit_step(dependency, steps, by_id, marks, order)?;
+    }
+    marks[index] = 2;
+    order.push(index);
+    Ok(())
 }
 
 fn status_of(value: &str) -> Result<PlanStepStatus, OperationError> {
@@ -332,6 +452,109 @@ fn status_of(value: &str) -> Result<PlanStepStatus, OperationError> {
     }
 }
 
+fn add_step(state: &mut PlanState, input: &Value) -> Result<(), OperationError> {
+    let description = input_string(input, "description");
+    if description.is_empty() {
+        return Err(OperationError::Execution(
+            "a plan step needs a description".into(),
+        ));
+    }
+    state.next_id += 1;
+    let step = PlanStep {
+        id: format!("step-{}", state.next_id),
+        description,
+        status: PlanStepStatus::Pending,
+        depends_on: input
+            .get("depends_on")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        committed_as: None,
+        committed_task: None,
+    };
+    if let Some(missing) = step
+        .depends_on
+        .iter()
+        .find(|dependency| state.position(dependency).is_none())
+    {
+        return Err(OperationError::Execution(format!(
+            "no dependency step {missing}"
+        )));
+    }
+    match input.get("after").and_then(Value::as_str) {
+        Some(after) if !after.is_empty() => {
+            let position = state
+                .position(after)
+                .ok_or_else(|| OperationError::Execution(format!("no step {after}")))?;
+            state.steps.insert(position + 1, step);
+        }
+        _ => state.steps.push(step),
+    }
+    Ok(())
+}
+
+fn update_step(state: &mut PlanState, input: &Value) -> Result<(), OperationError> {
+    let id = input_string(input, "id");
+    let position = state
+        .position(&id)
+        .ok_or_else(|| OperationError::Execution(format!("no step {id}")))?;
+    if let Some(status) = input.get("status").and_then(Value::as_str) {
+        state.steps[position].status = status_of(status)?;
+    }
+    if let Some(description) = input
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|description| !description.is_empty())
+    {
+        state.steps[position].description = description.to_owned();
+    }
+    Ok(())
+}
+
+fn remove_step(state: &mut PlanState, input: &Value) -> Result<(), OperationError> {
+    let id = input_string(input, "id");
+    let position = state
+        .position(&id)
+        .ok_or_else(|| OperationError::Execution(format!("no step {id}")))?;
+    state.steps.remove(position);
+    Ok(())
+}
+
+fn reorder_steps(state: &mut PlanState, input: &Value) -> Result<(), OperationError> {
+    let order: Vec<String> = input
+        .get("order")
+        .and_then(Value::as_array)
+        .ok_or_else(|| OperationError::Execution("`order` must be an array".into()))?
+        .iter()
+        .map(|value| value.as_str().unwrap_or_default().to_owned())
+        .collect();
+    let mut current: Vec<&str> = state.steps.iter().map(|step| step.id.as_str()).collect();
+    current.sort_unstable();
+    let mut requested: Vec<&str> = order.iter().map(String::as_str).collect();
+    requested.sort_unstable();
+    if current != requested {
+        return Err(OperationError::Execution(
+            "`order` must name exactly the current steps, once each".into(),
+        ));
+    }
+    let by_id: HashMap<_, _> = state
+        .steps
+        .drain(..)
+        .map(|step| (step.id.clone(), step))
+        .collect();
+    state.steps = order
+        .iter()
+        .map(|id| by_id.get(id).expect("checked above").clone())
+        .collect();
+    Ok(())
+}
+
 impl OperationExecutor for PlanExecutor {
     fn contract(&self) -> &OperationContract {
         &self.contract
@@ -343,90 +566,16 @@ impl OperationExecutor for PlanExecutor {
         _grants: &[CapabilityGrant],
     ) -> Result<OperationOutcome, OperationError> {
         let input = &request.input;
-        let string = |key: &str| {
-            input
-                .get(key)
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned()
-        };
         let mut state = self
             .state
             .lock()
             .map_err(|_| OperationError::Execution("plan state poisoned".into()))?;
 
         match self.operation {
-            PlanOperation::Add => {
-                let description = string("description");
-                if description.is_empty() {
-                    return Err(OperationError::Execution(
-                        "a plan step needs a description".into(),
-                    ));
-                }
-                state.next_id += 1;
-                let id = format!("step-{}", state.next_id);
-                let step = PlanStep {
-                    id,
-                    description,
-                    status: PlanStepStatus::Pending,
-                    committed_as: None,
-                };
-                match input.get("after").and_then(Value::as_str) {
-                    Some(after) if !after.is_empty() => {
-                        let position = state
-                            .position(after)
-                            .ok_or_else(|| OperationError::Execution(format!("no step {after}")))?;
-                        state.steps.insert(position + 1, step);
-                    }
-                    _ => state.steps.push(step),
-                }
-            }
-            PlanOperation::Update => {
-                let id = string("id");
-                let position = state
-                    .position(&id)
-                    .ok_or_else(|| OperationError::Execution(format!("no step {id}")))?;
-                if let Some(status) = input.get("status").and_then(Value::as_str) {
-                    state.steps[position].status = status_of(status)?;
-                }
-                if let Some(description) = input.get("description").and_then(Value::as_str) {
-                    if !description.is_empty() {
-                        state.steps[position].description = description.to_owned();
-                    }
-                }
-            }
-            PlanOperation::Remove => {
-                let id = string("id");
-                let position = state
-                    .position(&id)
-                    .ok_or_else(|| OperationError::Execution(format!("no step {id}")))?;
-                state.steps.remove(position);
-            }
-            PlanOperation::Reorder => {
-                let order: Vec<String> = input
-                    .get("order")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| OperationError::Execution("`order` must be an array".into()))?
-                    .iter()
-                    .map(|value| value.as_str().unwrap_or_default().to_owned())
-                    .collect();
-                let mut current: Vec<&str> =
-                    state.steps.iter().map(|step| step.id.as_str()).collect();
-                current.sort_unstable();
-                let mut requested: Vec<&str> = order.iter().map(String::as_str).collect();
-                requested.sort_unstable();
-                if current != requested {
-                    return Err(OperationError::Execution(
-                        "`order` must name exactly the current steps, once each".into(),
-                    ));
-                }
-                let mut reordered = Vec::with_capacity(state.steps.len());
-                for id in &order {
-                    let position = state.position(id).expect("checked above");
-                    reordered.push(state.steps[position].clone());
-                }
-                state.steps = reordered;
-            }
+            PlanOperation::Add => add_step(&mut state, input)?,
+            PlanOperation::Update => update_step(&mut state, input)?,
+            PlanOperation::Remove => remove_step(&mut state, input)?,
+            PlanOperation::Reorder => reorder_steps(&mut state, input)?,
             PlanOperation::List => {}
             PlanOperation::Commit => self.commit(&mut state)?,
         }
@@ -519,6 +668,7 @@ mod tests {
         use arsy_kernel::{
             domain::SessionId,
             event::{EventStore, MemoryEventStore},
+            orchestration::TaskGraph,
             todo::TodoList,
         };
 
@@ -546,7 +696,7 @@ mod tests {
             &executors,
             &artifacts,
             "plan.add",
-            serde_json::json!({"description": "run the suite"}),
+            serde_json::json!({"description": "run the suite", "depends_on": ["step-1"]}),
         );
         let committed = call(&executors, &artifacts, "plan.commit", serde_json::json!({}));
         assert_eq!(
@@ -562,6 +712,18 @@ mod tests {
         let items = list.snapshot().items;
         assert_eq!(items.len(), 2, "the commitment outlives the plan");
         assert_eq!(items[0].text, "write the fix");
+        assert_eq!(items[1].depends_on, vec!["todo-1"]);
+
+        let graph = TaskGraph::new(Arc::clone(&store), session, Principal::System).unwrap();
+        let tasks: Vec<_> = graph.tasks().collect();
+        assert_eq!(tasks.len(), 2, "dependency-bearing commitments compile");
+        let dependent = tasks
+            .iter()
+            .find(|task| !task.dependencies.is_empty())
+            .expect("one task has the plan dependency");
+        assert!(tasks
+            .iter()
+            .any(|task| dependent.dependencies == vec![task.id]));
 
         assert!(
             try_call(&executors, &artifacts, "plan.commit", serde_json::json!({})).is_err(),

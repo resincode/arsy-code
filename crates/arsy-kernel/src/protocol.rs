@@ -5,8 +5,8 @@
 
 use crate::{
     domain::{
-        AgentId, ApprovalId, ArtifactId, RequestId, ResourceRef, SessionId, StateVersion,
-        SubscriptionId, TurnId, WorkspaceId,
+        AgentId, ApprovalId, ArtifactId, AttemptId, RequestId, ResourceRef, SessionId,
+        StateVersion, SubscriptionId, TurnId, WorkspaceId,
     },
     event::EventEnvelope,
 };
@@ -238,14 +238,35 @@ pub struct ApprovalResolution {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct AgentControl {
     pub agent: AgentId,
+    /// Binds a state-changing command to the attempt the operator inspected;
+    /// a finished/retried attempt cannot receive a stale command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<AttemptId>,
     pub action: AgentAction,
     #[serde(default, flatten, skip_serializing_if = "Extensions::is_empty")]
     pub extensions: Extensions,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentAction {
+    InspectTranscript,
+    InspectAuthority,
+    Message {
+        body: String,
+    },
+    Steer {
+        body: String,
+    },
+    PauseAdmission,
+    Retry,
+    Cancel {
+        reason: String,
+    },
+    OpenDiff,
+    OpenEvidence,
+    Integrate,
+    /// Compatibility names retained for ACP and older canonical clients.
     Interrupt,
     Pause,
     Resume,

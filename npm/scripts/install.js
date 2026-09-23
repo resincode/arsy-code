@@ -12,12 +12,12 @@ const platform = process.platform;
 const architecture = process.arch;
 
 const platforms = {
-  "linux:x64": ["arsy-linux-x86_64.tar.gz", "tar"],
-  "linux:arm64": ["arsy-linux-aarch64.tar.gz", "tar"],
-  "darwin:x64": ["arsy-macos-x86_64.tar.gz", "tar"],
-  "darwin:arm64": ["arsy-macos-aarch64.tar.gz", "tar"],
-  "win32:x64": ["arsy-windows-x86_64.zip", "zip"],
-  "win32:arm64": ["arsy-windows-aarch64.zip", "zip"],
+  "linux:x64": ["arsy-linux-x86_64.tar.gz", "tar", "@suiflex/arsy-code-linux-x64"],
+  "linux:arm64": ["arsy-linux-aarch64.tar.gz", "tar", "@suiflex/arsy-code-linux-arm64"],
+  "darwin:x64": ["arsy-macos-x86_64.tar.gz", "tar", "@suiflex/arsy-code-darwin-x64"],
+  "darwin:arm64": ["arsy-macos-aarch64.tar.gz", "tar", "@suiflex/arsy-code-darwin-arm64"],
+  "win32:x64": ["arsy-windows-x86_64.zip", "zip", "@suiflex/arsy-code-win32-x64"],
+  "win32:arm64": ["arsy-windows-aarch64.zip", "zip", "@suiflex/arsy-code-win32-arm64"],
 };
 
 const target = platforms[`${platform}:${architecture}`];
@@ -25,7 +25,7 @@ if (!target) {
   throw new Error(`Unsupported ARSY CODE platform: ${platform}/${architecture}`);
 }
 
-const [archiveName, archiveType] = target;
+const [archiveName, archiveType, platformPackage] = target;
 const baseUrl = `https://github.com/suiflex/arsy-code/releases/download/v${version}`;
 const archivePath = path.join(os.tmpdir(), `${archiveName}-${process.pid}`);
 const checksumPath = `${archivePath}.sha256`;
@@ -64,6 +64,20 @@ function checksum(file) {
 
 async function main() {
   fs.mkdirSync(vendorDirectory, { recursive: true });
+  try {
+    const manifestPath = require.resolve(`${platformPackage}/package.json`, { paths: [packageRoot] });
+    const manifest = require(manifestPath);
+    if (manifest.version === version) {
+      const source = path.join(path.dirname(manifestPath), "bin");
+      for (const name of fs.readdirSync(source)) {
+        fs.copyFileSync(path.join(source, name), path.join(vendorDirectory, name));
+      }
+      return verifyBinaries();
+    }
+  } catch (error) {
+    if (error.code !== "MODULE_NOT_FOUND") throw error;
+  }
+
   await download(`${baseUrl}/${archiveName}`, archivePath);
   await download(`${baseUrl}/${archiveName}.sha256`, checksumPath);
 
@@ -82,8 +96,13 @@ async function main() {
     ]);
   }
 
-  // FluxGuard ships in the same archive and stays beside `arsy` in vendor/,
-  // which is where ARSY looks for it when it declares the bundled MCP server.
+  verifyBinaries();
+  fs.rmSync(archivePath, { force: true });
+  fs.rmSync(checksumPath, { force: true });
+}
+
+function verifyBinaries() {
+  // FluxGuard stays beside `arsy`, which is where ARSY discovers it.
   const suffix = platform === "win32" ? ".exe" : "";
   for (const name of ["arsy", "fluxguard"]) {
     const binary = path.join(vendorDirectory, `${name}${suffix}`);
@@ -92,8 +111,6 @@ async function main() {
     }
     if (platform !== "win32") fs.chmodSync(binary, 0o755);
   }
-  fs.rmSync(archivePath, { force: true });
-  fs.rmSync(checksumPath, { force: true });
 }
 
 main().catch((error) => {

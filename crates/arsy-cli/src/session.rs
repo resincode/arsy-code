@@ -7,8 +7,11 @@
 
 use crate::{storage_failed, usage, Command, Diagnostic, Emitter, Invocation, Output};
 use arsy_kernel::{
+    artifact::unix_time_ms,
     domain::{EventId, SessionId},
     event::{EventPayload, EventStore},
+    hub::{AgentHub, HubFilter},
+    orchestration::TaskGraph,
     projection::{ProjectionSet, TurnStatus},
     service::{AgentService, BranchMode, ServiceError},
     sqlite::SessionSummary,
@@ -308,6 +311,8 @@ pub fn show(
     let projection = ProjectionSet::rebuild(session, &history).map_err(storage_failed)?;
     let usage = projection.usage();
     let ancestry = AgentService::ancestry(store.as_ref(), session).map_err(storage_failed)?;
+    let graph = TaskGraph::new(store.clone(), session, crate::actor()).map_err(storage_failed)?;
+    let hub = AgentHub::project(&graph, unix_time_ms(), HubFilter::All);
 
     let mut report = json!({
         "session": session.to_string(),
@@ -319,6 +324,7 @@ pub fn show(
             "cost_micros": usage.cost_micros,
         },
         "turns": projection.turns().len(),
+        "agents": hub.rows,
         "branched_from": ancestry.as_ref().map(|branch| json!({
             "session": branch.parent.to_string(),
             "mode": branch.mode.as_str(),
@@ -395,6 +401,21 @@ fn human_show(report: &Value) -> Value {
             branch["at_sequence"],
             branch["inherits_prefix"],
         ));
+    }
+    if let Some(rows) = report["agents"].as_array().filter(|rows| !rows.is_empty()) {
+        text.push_str(&format!("  agents: {}\n", rows.len()));
+        for row in rows {
+            text.push_str(&format!(
+                "    {} · {} · {} · proof {}\n",
+                row["task"].as_str().unwrap_or("?"),
+                row["role"]
+                    .as_str()
+                    .filter(|role| !role.is_empty())
+                    .unwrap_or("unassigned"),
+                row["task_state"].as_str().unwrap_or("?"),
+                row["proof"].as_str().unwrap_or("pending"),
+            ));
+        }
     }
     for turn in report["turn_detail"].as_array().unwrap_or(&Vec::new()) {
         text.push_str(&format!(

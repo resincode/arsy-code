@@ -1850,7 +1850,7 @@ pub(crate) fn open_route(invocation: &Invocation, workspace: &Path) -> Result<Op
 pub(crate) fn steers_turn(line: &str) -> bool {
     matches!(
         line.split_whitespace().next(),
-        Some("/plan" | "/todo" | "/approval")
+        Some("/plan" | "/todo" | "/agents" | "/approval")
     )
 }
 
@@ -1866,6 +1866,7 @@ pub(crate) fn steer_turn(
     match line.split_whitespace().next() {
         Some("/plan") => plan_step(line, workspace, approval, state, queued, stdout),
         Some("/todo") => show_todos(workspace, state.session_id(), stdout),
+        Some("/agents") => agents_step(line, workspace, state.session_id(), stdout),
         Some("/approval") => set_mode(line, approval, state, stdout),
         _ => Ok(()),
     }
@@ -1956,6 +1957,95 @@ pub(crate) fn show_todos(
             writeln!(stdout, "This session's TODOs could not be read.").map_err(terminal_failed)
         }
     }
+}
+
+/// Durable supervision state, rebuilt from the same session stream as resume.
+#[cfg(feature = "tui")]
+pub(crate) fn show_agents(
+    workspace: &Path,
+    session: SessionId,
+    stdout: &mut io::Stdout,
+) -> Result<(), Diagnostic> {
+    let projection = open_store(workspace).ok().and_then(|store| {
+        let graph =
+            arsy_kernel::orchestration::TaskGraph::new(store, session, crate::actor()).ok()?;
+        Some(arsy_kernel::hub::AgentHub::project(
+            &graph,
+            arsy_kernel::artifact::unix_time_ms(),
+            arsy_kernel::hub::HubFilter::All,
+        ))
+    });
+    match projection {
+        Some(projection) => {
+            write!(stdout, "{}", progress::human_agents(&projection)).map_err(terminal_failed)
+        }
+        None => {
+            writeln!(stdout, "This session's agents could not be read.").map_err(terminal_failed)
+        }
+    }
+}
+
+/// Inspect or cooperatively control one exact attempt from the Agent Hub.
+#[cfg(feature = "tui")]
+fn agents_step(
+    line: &str,
+    workspace: &Path,
+    session: SessionId,
+    stdout: &mut io::Stdout,
+) -> Result<(), Diagnostic> {
+    let mut words = line
+        .splitn(4, char::is_whitespace)
+        .filter(|word| !word.is_empty());
+    let _ = words.next();
+    let Some(action) = words.next() else {
+        return show_agents(workspace, session, stdout);
+    };
+    let attempt: arsy_kernel::domain::AttemptId = words
+        .next()
+        .ok_or_else(|| usage(format!("/agents {action} requires an attempt ID")))?
+        .parse()
+        .map_err(|_| usage("the attempt ID is not canonical"))?;
+    let store = open_store(workspace)?;
+    let mut graph = arsy_kernel::orchestration::TaskGraph::new(
+        store as Arc<dyn EventStore>,
+        session,
+        crate::actor(),
+    )
+    .map_err(storage_failed)?;
+    match action {
+        "pause" => graph.request_pause(attempt).map_err(storage_failed)?,
+        "resume" => graph.resume(attempt).map_err(storage_failed)?,
+        "cancel" => graph
+            .request_cancel(attempt, words.next().unwrap_or("cancelled by operator"))
+            .map_err(storage_failed)?,
+        "steer" => {
+            let body = words
+                .next()
+                .filter(|body| !body.trim().is_empty())
+                .ok_or_else(|| usage("/agents steer requires a message"))?;
+            let task = graph
+                .tasks()
+                .find(|task| task.runtime.attempts.contains(&attempt))
+                .map(|task| task.id)
+                .ok_or_else(|| usage("the attempt is not in this session"))?;
+            graph
+                .send(
+                    task,
+                    task,
+                    arsy_kernel::orchestration::MessageKind::Instruction,
+                    json!(body),
+                    None,
+                    arsy_kernel::artifact::unix_time_ms(),
+                )
+                .map_err(storage_failed)?;
+        }
+        other => {
+            return Err(usage(format!(
+                "/agents action must be pause, resume, cancel, or steer; not {other:?}"
+            )))
+        }
+    }
+    writeln!(stdout, "Agent control recorded for attempt {attempt}.").map_err(terminal_failed)
 }
 
 /// Take the approval mode a command named, or report the one in force.

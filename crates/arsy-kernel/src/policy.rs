@@ -14,6 +14,7 @@ use crate::{
     protocol::ApprovalResolution,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
@@ -140,6 +141,12 @@ impl RuleSet {
 
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
+    }
+
+    /// Stable digest of the normalized rules used for an authorization.
+    pub fn revision(&self) -> StateVersion {
+        let bytes = serde_json::to_vec(&self.rules).expect("policy rules serialize");
+        StateVersion::from_digest(Sha256::digest(bytes).into())
     }
 
     /// Decide one query, and say why.
