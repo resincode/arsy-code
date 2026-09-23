@@ -71,6 +71,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// One string field of a call's input, or the empty string.
+fn input_string(input: &Value, key: &str) -> String {
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
 /// Enough output to read a test failure, little enough to leave a turn's
 /// context for the answer.
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 16 * 1024;

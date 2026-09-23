@@ -23,6 +23,7 @@
 //! mandatory: a workspace with no Rust and no server still answers, at the
 //! confidence that evidence deserves.
 
+use super::input_string;
 use crate::{
     edit::{self, EditAddress, EditOperation, RangeReplacement},
     intelligence::{
@@ -286,7 +287,7 @@ impl OperationExecutor for CodeExecutor {
     ) -> Result<OperationOutcome, OperationError> {
         let workspace = Workspace::open(&self.workspace)
             .map_err(|error| OperationError::Execution(error.to_string()))?;
-        let text = |key: &str| text(&request.input, key);
+        let text = |key: &str| input_string(&request.input, key);
 
         let outcome = match self.operation {
             CodeOperation::Symbol => {
@@ -435,15 +436,6 @@ impl CodeExecutor {
             .map(|graph| Box::new(graph) as Box<dyn CodeIntelligence + 'a>)
             .map_err(semantic)
     }
-}
-
-/// One string field of a call's input, or the empty string.
-fn text(input: &Value, key: &str) -> String {
-    input
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned()
 }
 
 /// The workspace-relative file an `lsp:` id names.

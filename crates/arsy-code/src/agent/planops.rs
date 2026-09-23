@@ -13,7 +13,7 @@
 //! kind shares one `Arc<Mutex<PlanState>>`, so an `add` and the `update` that
 //! follows it in the same turn see each other's effect.
 
-use super::todoops::Journal;
+use super::{input_string, todoops::Journal};
 use arsy_kernel::{
     artifact::ArtifactStore,
     capability::{CapabilityAction, CapabilityGrant},
@@ -450,14 +450,6 @@ fn status_of(value: &str) -> Result<PlanStepStatus, OperationError> {
             "`{other}` is not a plan step status; use pending, in_progress, or completed"
         ))),
     }
-}
-
-fn input_string(input: &Value, key: &str) -> String {
-    input
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned()
 }
 
 fn add_step(state: &mut PlanState, input: &Value) -> Result<(), OperationError> {
