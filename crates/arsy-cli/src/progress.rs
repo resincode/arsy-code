@@ -144,19 +144,31 @@ pub fn human_agents(hub: &AgentHub) -> String {
     if hub.rows.is_empty() {
         return "This session has no delegated agents.\n".to_owned();
     }
-    let mut text = format!("{} agent task(s)\n", hub.rows.len());
-    for row in &hub.rows {
-        let role = if row.role.is_empty() {
-            "unassigned"
-        } else {
-            &row.role
-        };
-        text.push_str(&format!(
-            "  {} · {role} · {:?} · proof {} · {} token(s) used\n",
-            row.task, row.task_state, row.proof, row.used.tokens
-        ));
-    }
-    text
+    format!(
+        "{} agent task(s)\n{}",
+        hub.rows.len(),
+        hub.rows
+            .iter()
+            .map(|row| format!(
+                "  {} · attempt {} · {} · {} · proof {} · {} token(s) used\n",
+                row.task,
+                row.attempt
+                    .map_or_else(|| "none".to_owned(), |id| id.to_string()),
+                if row.role.is_empty() {
+                    "unassigned"
+                } else {
+                    &row.role
+                },
+                if row.pause_requested {
+                    "pause requested".to_owned()
+                } else {
+                    format!("{:?}", row.task_state)
+                },
+                row.proof,
+                row.used.tokens
+            ))
+            .collect::<String>()
+    )
 }
 
 /// One line of either listing. `>` marks where the work is, so a long list

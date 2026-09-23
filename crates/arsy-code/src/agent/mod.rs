@@ -53,17 +53,21 @@ use crate::resource::Workspace;
 use arsy_kernel::{
     artifact::{unix_time_ms, ArtifactReadLimits, ArtifactStore},
     capability::{CapabilityAction, CapabilityGrant, CapabilityRequirement},
-    domain::{ArtifactId, OperationId, Principal},
+    domain::{ArtifactId, OperationId, Principal, StateVersion},
     operation::{
         OperationError, OperationKind, OperationOutcome, OperationRegistry, OperationRequest,
     },
     policy::{ApprovalRequest, PolicyDecision, PolicyQuery, RiskContext, RuleSet},
     provider::ToolSchema,
+    safety::{
+        review, RiskFlag, SafetyAuditRecord, SafetyDecision, SafetyReviewCache,
+        SafetyReviewEnvelope, SafetyReviewResult, TrustState, REVIEW_SCHEMA_VERSION,
+    },
 };
 use serde_json::{json, Value};
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -1098,6 +1102,8 @@ pub struct ToolRuntime {
     /// runtime offers the same set — the TUI and a background turn must not
     /// disagree about which tools exist.
     dynamic: Arc<Vec<DynamicTool>>,
+    safety_cache: Arc<Mutex<SafetyReviewCache>>,
+    safety_audits: Arc<Mutex<Vec<SafetyAuditRecord>>>,
 }
 
 /// The execution ceiling applied after decoding and before dispatch.
@@ -1130,6 +1136,8 @@ impl ToolRuntime {
             context,
             mode: ExecutionMode::Normal,
             dynamic: Arc::new(Vec::new()),
+            safety_cache: Arc::new(Mutex::new(SafetyReviewCache::new(128))),
+            safety_audits: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1456,6 +1464,101 @@ impl ToolRuntime {
         } else {
             Authorization::NeedsApproval { granted, approvals }
         }
+    }
+
+    /// Independently review one already-prepared and policy-authorized call.
+    /// The result can only narrow what policy allowed.
+    pub fn review_auto(
+        &self,
+        request: &OperationRequest,
+        intent_digest: StateVersion,
+        trust: TrustState,
+        unattended: bool,
+    ) -> SafetyReviewResult {
+        let reversible = self
+            .registry
+            .contract(&request.kind)
+            .is_some_and(|contract| contract.reversible);
+        let mut flags = Vec::new();
+        for requirement in &request.requirements {
+            match requirement.action {
+                CapabilityAction::CredentialUse => flags.push(RiskFlag::CredentialUse),
+                CapabilityAction::SystemModify => flags.push(RiskFlag::SystemModification),
+                CapabilityAction::FsDelete => flags.push(RiskFlag::Destructive),
+                _ => {}
+            }
+            if requirement.resource.scheme() == "file" {
+                let target = Path::new(requirement.resource.value());
+                if target.is_absolute() && !target.starts_with(&self.workspace) {
+                    flags.push(RiskFlag::ScopeEscape);
+                }
+            }
+        }
+        if !reversible {
+            flags.push(RiskFlag::Irreversible);
+        }
+        if self.context.workspace != arsy_kernel::policy::WorkspaceCleanliness::Clean {
+            flags.push(RiskFlag::DirtyWorkspace);
+        }
+        if self.context.sandbox == arsy_kernel::policy::SandboxAssurance::None {
+            flags.push(RiskFlag::UnknownSandbox);
+        }
+        flags.sort_unstable();
+        flags.dedup();
+        let now = unix_time_ms();
+        let envelope = SafetyReviewEnvelope {
+            schema: REVIEW_SCHEMA_VERSION,
+            intent_digest,
+            operation: request.kind.clone(),
+            operation_digest: request.digest(),
+            capabilities: request
+                .requirements
+                .iter()
+                .map(|requirement| requirement.action)
+                .collect(),
+            targets: request
+                .requirements
+                .iter()
+                .map(|requirement| requirement.resource.clone())
+                .collect(),
+            reversible,
+            workspace: self.context.workspace,
+            sandbox: self.context.sandbox,
+            trust,
+            flags,
+            policy_revision: self.rules.revision(),
+            reviewer_version: "deterministic-v1".into(),
+            expires_at_ms: now.saturating_add(30_000),
+        };
+        let result = self
+            .safety_cache
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.review(&envelope, unattended, now).ok())
+            .unwrap_or_else(|| {
+                let mut result = review(&envelope, unattended);
+                result.decision = if unattended {
+                    SafetyDecision::Deny
+                } else {
+                    SafetyDecision::RequireApproval
+                };
+                result.reasons = vec!["safety review cache was unavailable".into()];
+                result
+            });
+        if let Ok(mut audits) = self.safety_audits.lock() {
+            audits.push(SafetyAuditRecord {
+                envelope,
+                result: result.clone(),
+            });
+        }
+        result
+    }
+
+    pub fn take_safety_audits(&self) -> Vec<SafetyAuditRecord> {
+        self.safety_audits
+            .lock()
+            .map(|mut audits| std::mem::take(&mut *audits))
+            .unwrap_or_default()
     }
 
     /// Run one call end to end, deciding authority itself.

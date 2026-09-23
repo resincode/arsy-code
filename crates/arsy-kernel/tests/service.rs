@@ -2,11 +2,12 @@
 
 use arsy_kernel::{
     capability::{CapabilityAction, CapabilityGrant, PolicySource, ResourcePattern, ResourceScope},
-    domain::{GrantId, Principal, SessionId, SubscriptionId, TurnId},
+    domain::{AgentId, AttemptId, GrantId, Principal, SessionId, SubscriptionId, TaskId, TurnId},
     event::{EventStore, MemoryEventStore},
+    orchestration::{Budget, TaskGraph, TaskNode, TaskRuntime, TaskState, WorkspaceRequirement},
     protocol::{
-        ClientRequest, IdempotencyKey, ProtocolEnvelope, ServerEvent, TurnStart,
-        MAX_SUBSCRIPTION_BATCH,
+        AgentAction, AgentControl, ClientRequest, Extensions, IdempotencyKey, ProtocolEnvelope,
+        ServerEvent, TurnStart, MAX_SUBSCRIPTION_BATCH,
     },
     service::{AgentService, BranchMode, ServiceError, TurnFinishedEvidence, TurnStartedEvidence},
     sqlite::{Durability, SqliteEventStore},
@@ -27,6 +28,79 @@ fn subscription_of(events: &[ServerEvent]) -> SubscriptionId {
         ServerEvent::Subscribed { subscription, .. } => *subscription,
         other => panic!("expected subscribed, got {other:?}"),
     }
+}
+
+#[test]
+fn typed_agent_controls_are_attempt_bound_and_replayable() {
+    let store = Arc::new(MemoryEventStore::default());
+    let session = SessionId::new();
+    let agent = AgentId::new();
+    let task = TaskId::new();
+    let attempt = {
+        let mut graph = TaskGraph::new(store.clone(), session, Principal::System).unwrap();
+        graph
+            .add(TaskNode {
+                id: task,
+                goal: "inspect safely".into(),
+                dependencies: Vec::new(),
+                assignee: Some(agent),
+                required_output: "text".into(),
+                workspace: WorkspaceRequirement::ReadOnlySnapshot,
+                budget: Budget::default(),
+                authority: Vec::new(),
+                state: TaskState::Pending,
+                lease_expires_at_ms: None,
+                runtime: TaskRuntime::default(),
+            })
+            .unwrap();
+        graph.ready().unwrap();
+        graph.lease(task, agent, u64::MAX).unwrap()
+    };
+    let service = AgentService::attach(store.clone(), session).unwrap();
+    let control = |action| AgentControl {
+        agent,
+        attempt: Some(attempt),
+        action,
+        extensions: Extensions::default(),
+    };
+
+    service
+        .control_agent(
+            Principal::User("operator".into()),
+            &control(AgentAction::Pause),
+        )
+        .unwrap();
+    assert!(TaskGraph::new(store.clone(), session, Principal::System)
+        .unwrap()
+        .is_paused(attempt));
+    service
+        .control_agent(
+            Principal::User("operator".into()),
+            &control(AgentAction::Resume),
+        )
+        .unwrap();
+    assert!(!TaskGraph::new(store.clone(), session, Principal::System)
+        .unwrap()
+        .is_paused(attempt));
+
+    let stale = AgentControl {
+        agent,
+        attempt: Some(AttemptId::new()),
+        action: AgentAction::Pause,
+        extensions: Extensions::default(),
+    };
+    assert!(matches!(
+        service.control_agent(Principal::System, &stale),
+        Err(ServiceError::Graph(_))
+    ));
+
+    let events = store.read(session, 1, 32).unwrap();
+    let pause = events
+        .iter()
+        .find(|event| event.kind == "task.attempt_pause_requested")
+        .unwrap();
+    assert_eq!(pause.actor, Principal::User("operator".into()));
+    assert!(pause.causation.is_some());
 }
 
 #[test]

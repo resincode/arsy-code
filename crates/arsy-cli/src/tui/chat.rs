@@ -23,7 +23,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/todo", "show this session's durable checklist"),
     (
         "/agents",
-        "show durable agent, budget, workspace, and proof state",
+        "show agents; pause|resume|cancel|steer ATTEMPT [MESSAGE]",
     ),
     ("/provider", "choose, add, or remove a provider endpoint"),
     ("/model", "choose the provider model"),

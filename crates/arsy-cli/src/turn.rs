@@ -7,6 +7,8 @@ use crate::run::{charge_turn, context_budget, is_stale_oauth_token, merge, prepa
 use crate::*;
 #[cfg(feature = "tui")]
 use arsy_kernel::provider::Effort;
+#[cfg(feature = "tui")]
+use sha2::{Digest, Sha256};
 
 #[cfg(feature = "tui")]
 struct RecordedTurn {
@@ -361,10 +363,8 @@ pub(crate) fn run_turn(
         }),
     );
     let outcome = match native.as_deref_mut() {
-        Some(resolved) => native_turn(
-            resolved,
-            &config,
-            &agent_runtime(
+        Some(resolved) => {
+            let runtime = agent_runtime(
                 &root,
                 &config,
                 true,
@@ -375,21 +375,41 @@ pub(crate) fn run_turn(
                 emitter,
                 &prompt_skills(&root, &config),
             )?
-            .with_execution_mode(approval.get().execution_mode()),
-            conversation,
-            history,
-            route,
-            effort,
-            admission.turn,
-            colour,
-            footer,
-            keys,
-            decoder,
-            composer,
-            transcript,
-            approval,
-            hooks,
-        ),
+            .with_execution_mode(approval.get().execution_mode());
+            let outcome = native_turn(
+                resolved,
+                &config,
+                &runtime,
+                conversation,
+                history,
+                route,
+                effort,
+                admission.turn,
+                colour,
+                footer,
+                keys,
+                decoder,
+                composer,
+                transcript,
+                approval,
+                hooks,
+            );
+            if let Some(attempt) = graph
+                .node(node)
+                .and_then(|node| node.runtime.current_attempt)
+            {
+                for audit in runtime.take_safety_audits() {
+                    graph
+                        .record(
+                            attempt,
+                            "safety.review",
+                            serde_json::to_value(audit).unwrap_or(Value::Null),
+                        )
+                        .map_err(graph_failed)?;
+                }
+            }
+            outcome
+        }
         None => external_status(
             &root,
             &task,
@@ -526,6 +546,21 @@ enum Answer {
 /// keyboard, and a declined call is reported to the model as a failed result
 /// rather than hidden, so it can say what it would do instead.
 #[cfg(feature = "tui")]
+fn user_intent_digest(conversation: &[ModelMessage]) -> arsy_kernel::domain::StateVersion {
+    let intent = conversation
+        .iter()
+        .rev()
+        .filter(|message| message.role == ModelRole::User)
+        .flat_map(|message| message.content.iter())
+        .find_map(|content| match content {
+            ModelContent::Text { text } => Some(text.as_bytes()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    arsy_kernel::domain::StateVersion::from_digest(Sha256::digest(intent).into())
+}
+
+#[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn native_turn(
     resolved: &mut provider::Resolved,
@@ -545,6 +580,7 @@ pub(crate) fn native_turn(
     approval: &approval::ApprovalCell,
     hooks: Option<&arsy_code::hook::HookEngine>,
 ) -> io::Result<Turn> {
+    let intent_digest = user_intent_digest(conversation);
     // rather than taken from the last one: an audit that reads a tool-using
     // turn as the price of its final request under-reports what it cost.
     let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
@@ -625,6 +661,7 @@ pub(crate) fn native_turn(
         let (results, all_repeated, newly_changed) = run_round_calls(
             &calls,
             runtime,
+            intent_digest,
             &mut terminal,
             colour,
             keys,
@@ -1758,6 +1795,7 @@ struct CallResult {
 #[cfg(feature = "tui")]
 fn run_call(
     runtime: &arsy_code::agent::ToolRuntime,
+    intent_digest: arsy_kernel::domain::StateVersion,
     terminal: &mut io::Stdout,
     colour: bool,
     summary: &str,
@@ -1771,6 +1809,7 @@ fn run_call(
     }
     match execute_call(
         runtime,
+        intent_digest,
         terminal,
         colour,
         call.name,
@@ -1835,6 +1874,7 @@ enum Executed {
 #[allow(clippy::too_many_arguments)]
 fn execute_call(
     runtime: &arsy_code::agent::ToolRuntime,
+    intent_digest: arsy_kernel::domain::StateVersion,
     terminal: &mut io::Stdout,
     colour: bool,
     name: &str,
@@ -1873,6 +1913,16 @@ fn execute_call(
         Err(failure) => return Ok(Executed::Answered(*failure)),
     };
     let authorization = runtime.authorize(&request);
+    let safety = (approval.get() == approval::ApprovalMode::Auto
+        && !matches!(&authorization, arsy_code::agent::Authorization::Denied(_)))
+    .then(|| {
+        runtime.review_auto(
+            &request,
+            intent_digest,
+            arsy_kernel::safety::TrustState::Trusted,
+            false,
+        )
+    });
     let (grants, approval_note) = match authorize(
         terminal,
         colour,
@@ -1885,6 +1935,7 @@ fn execute_call(
             approval,
         },
         authorization,
+        safety.as_ref(),
     )? {
         Granted::Run { grants, note } => (grants, note),
         Granted::Refused(result) => return Ok(Executed::Answered(*result)),
@@ -2078,21 +2129,39 @@ fn authorize(
     colour: bool,
     asking: Asking<'_>,
     authorization: arsy_code::agent::Authorization,
+    safety: Option<&arsy_kernel::safety::SafetyReviewResult>,
 ) -> io::Result<Granted> {
     use arsy_code::agent::Authorization;
 
     let name = asking.name;
+    if let Some(review) =
+        safety.filter(|review| review.decision == arsy_kernel::safety::SafetyDecision::Deny)
+    {
+        return Ok(refused(
+            name,
+            format!("Safe Auto denied this call: {}", review.reasons.join("; ")),
+        ));
+    }
+    let force_approval = safety.is_some_and(|review| {
+        review.decision == arsy_kernel::safety::SafetyDecision::RequireApproval
+    });
     let requested = match &authorization {
-        Authorization::Allowed(grants) => {
+        Authorization::Allowed(grants) if !force_approval => {
             return Ok(Granted::Run {
                 grants: grants.clone(),
                 note: None,
             })
         }
+        Authorization::Allowed(_) => "independent safety review requires approval".into(),
         Authorization::Denied(reason) => return Ok(refused(name, reason.clone())),
         Authorization::NeedsApproval { .. } => authorization.requested(),
     };
-    match approval::decide(asking.approval.get(), name) {
+    let decision = if force_approval {
+        approval::Decision::Ask
+    } else {
+        approval::decide(asking.approval.get(), name)
+    };
+    match decision {
         approval::Decision::Approve => Ok(granted(authorization, name, None)),
         approval::Decision::Refuse => Ok(refused(
             name,
@@ -3045,6 +3114,7 @@ fn turn_record(emitter: &mut Emitter, payload: Value) {
 fn run_round_calls(
     calls: &[(String, String, Value)],
     runtime: &arsy_code::agent::ToolRuntime,
+    intent_digest: arsy_kernel::domain::StateVersion,
     terminal: &mut io::Stdout,
     colour: bool,
     keys: &std::sync::mpsc::Receiver<u8>,
@@ -3093,6 +3163,7 @@ fn run_round_calls(
                 all_repeated = false;
                 run_call(
                     runtime,
+                    intent_digest,
                     terminal,
                     colour,
                     &summary,

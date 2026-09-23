@@ -30,6 +30,7 @@ pub struct HubRow {
     pub role: String,
     pub task_state: TaskState,
     pub attempt_state: Option<AttemptState>,
+    pub pause_requested: bool,
     pub operation_class: Option<String>,
     pub elapsed_ms: u64,
     pub last_activity_ms: Option<u64>,
@@ -82,6 +83,7 @@ impl AgentHub {
                     role: attempt.map_or_else(String::new, |attempt| attempt.role.clone()),
                     task_state: task.state,
                     attempt_state: attempt.map(|attempt| attempt.state),
+                    pause_requested: attempt.is_some_and(|attempt| graph.is_paused(attempt.id)),
                     operation_class: attempt.and_then(|attempt| {
                         graph.trace_of(attempt.id).last().and_then(|entry| {
                             entry

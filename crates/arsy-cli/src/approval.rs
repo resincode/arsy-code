@@ -85,9 +85,9 @@ impl ApprovalMode {
     ///
     /// Only the modes an operator at a keyboard would choose between are in the
     /// ring. `dontAsk` exists for a run with nobody watching, and
-    /// `bypassPermissions` is `auto` under another name — putting either one a
-    /// keypress away would mean stepping past the mode you wanted into one that
-    /// behaves identically or refuses everything.
+    /// `bypassPermissions` deliberately stays out of the keyboard cycle: it
+    /// skips Safe Auto's independent review and is too risky to enable with an
+    /// accidental keypress. `dontAsk` is reserved for unattended runs.
     pub const fn cycle(self) -> Self {
         match self {
             Self::Default => Self::AcceptEdits,

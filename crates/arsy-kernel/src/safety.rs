@@ -12,6 +12,7 @@ use crate::{
     policy::{SandboxAssurance, WorkspaceCleanliness},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 pub const REVIEW_SCHEMA_VERSION: u32 = 1;
 pub const ROLE_SCHEMA_VERSION: u32 = 1;
@@ -61,9 +62,13 @@ pub struct SafetyReviewEnvelope {
 }
 
 impl SafetyReviewEnvelope {
-    pub fn cache_key(&self) -> Result<StateVersion, serde_json::Error> {
+    pub fn cache_key(&self, unattended: bool) -> Result<StateVersion, serde_json::Error> {
         use sha2::{Digest, Sha256};
-        serde_json::to_vec(self)
+        let mut input = self.clone();
+        // Expiry bounds reuse but does not change the decision. Including the
+        // freshly computed timestamp would make identical calls always miss.
+        input.expires_at_ms = 0;
+        serde_json::to_vec(&(input, unattended))
             .map(|bytes| StateVersion::from_digest(Sha256::digest(bytes).into()))
     }
 }
@@ -84,6 +89,50 @@ pub struct SafetyReviewResult {
     pub reviewer: String,
     pub latency_ms: u64,
     pub cost_micros: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SafetyAuditRecord {
+    pub envelope: SafetyReviewEnvelope,
+    pub result: SafetyReviewResult,
+}
+
+/// Exact-input, bounded safety decisions. Expired entries are never reused.
+#[derive(Clone, Debug)]
+pub struct SafetyReviewCache {
+    capacity: usize,
+    entries: VecDeque<(StateVersion, u64, SafetyReviewResult)>,
+}
+
+impl SafetyReviewCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: VecDeque::new(),
+        }
+    }
+
+    pub fn review(
+        &mut self,
+        envelope: &SafetyReviewEnvelope,
+        unattended: bool,
+        now_ms: u64,
+    ) -> Result<SafetyReviewResult, serde_json::Error> {
+        let key = envelope.cache_key(unattended)?;
+        self.entries.retain(|(_, expiry, _)| *expiry > now_ms);
+        if let Some((_, _, result)) = self.entries.iter().find(|(cached, _, _)| *cached == key) {
+            return Ok(result.clone());
+        }
+        let result = review(envelope, unattended);
+        if self.capacity > 0 && envelope.expires_at_ms > now_ms {
+            if self.entries.len() == self.capacity {
+                self.entries.pop_front();
+            }
+            self.entries
+                .push_back((key, envelope.expires_at_ms, result.clone()));
+        }
+        Ok(result)
+    }
 }
 
 /// Deterministic review runs after hard policy and before approval-mode
@@ -284,5 +333,34 @@ mod tests {
         assert!(contract.capabilities.is_empty());
         assert!(!contract.may_write);
         assert!(!contract.may_execute);
+    }
+
+    #[test]
+    fn cache_is_exact_and_expires() {
+        let mut cache = SafetyReviewCache::new(2);
+        let first = envelope();
+        assert_eq!(
+            cache.review(&first, false, 1).unwrap().decision,
+            SafetyDecision::Allow
+        );
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(
+            cache.review(&first, false, 2).unwrap().decision,
+            SafetyDecision::Allow
+        );
+        assert_eq!(cache.entries.len(), 1, "an exact hit is reused");
+
+        let mut renewed = first.clone();
+        renewed.expires_at_ms += 1;
+        cache.review(&renewed, false, 2).unwrap();
+        assert_eq!(cache.entries.len(), 1, "expiry is eviction metadata");
+
+        let mut changed = first.clone();
+        changed.policy_revision = StateVersion::from_digest([9; 32]);
+        cache.review(&changed, false, 2).unwrap();
+        assert_eq!(cache.entries.len(), 2, "policy changes invalidate the key");
+
+        cache.review(&first, false, first.expires_at_ms).unwrap();
+        assert!(cache.entries.is_empty(), "expired decisions are removed");
     }
 }

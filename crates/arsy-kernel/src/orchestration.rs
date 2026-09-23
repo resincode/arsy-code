@@ -559,6 +559,7 @@ pub struct TaskGraph {
     session: SessionId,
     actor: Principal,
     version: StreamVersion,
+    last_event: Option<crate::domain::EventId>,
     nodes: BTreeMap<TaskId, TaskNode>,
     attempts: BTreeMap<AttemptId, TaskAttempt>,
     messages: BTreeMap<MessageId, TaskMessage>,
@@ -572,6 +573,7 @@ pub struct TaskGraph {
     /// of them — the stream has the rest. Page it from the store if a reader
     /// ever needs more than the tail.
     traces: BTreeMap<AttemptId, Vec<Value>>,
+    paused: BTreeSet<AttemptId>,
     assignments: BTreeMap<AssignmentId, WorkspaceAssignment>,
     writer_results: BTreeMap<AssignmentId, WriterResult>,
     criteria: BTreeMap<CriterionId, AcceptanceCriterion>,
@@ -595,11 +597,13 @@ impl TaskGraph {
             session,
             actor,
             version: StreamVersion(0),
+            last_event: None,
             nodes: BTreeMap::new(),
             attempts: BTreeMap::new(),
             messages: BTreeMap::new(),
             inbox: BTreeMap::new(),
             traces: BTreeMap::new(),
+            paused: BTreeSet::new(),
             assignments: BTreeMap::new(),
             writer_results: BTreeMap::new(),
             criteria: BTreeMap::new(),
@@ -904,6 +908,43 @@ impl TaskGraph {
                 "reason": reason,
             }))
         })
+    }
+
+    /// Ask a live attempt to pause at its next model/tool boundary.
+    pub fn request_pause(&mut self, attempt: AttemptId) -> Result<(), GraphError> {
+        self.commit("task.attempt_pause_requested", |graph| {
+            let record = graph
+                .attempts
+                .get(&attempt)
+                .ok_or(GraphError::UnknownAttempt(attempt))?;
+            if !record.state.is_live() || record.state == AttemptState::Cancelling {
+                return Err(GraphError::FencedAttempt(attempt));
+            }
+            Ok(json!({"attempt_id": attempt, "task_id": record.task}))
+        })
+    }
+
+    /// Release a cooperatively paused attempt.
+    pub fn resume(&mut self, attempt: AttemptId) -> Result<(), GraphError> {
+        self.commit("task.attempt_resumed", |graph| {
+            let record = graph
+                .attempts
+                .get(&attempt)
+                .ok_or(GraphError::UnknownAttempt(attempt))?;
+            if !record.state.is_live() || !graph.paused.contains(&attempt) {
+                return Err(GraphError::FencedAttempt(attempt));
+            }
+            Ok(json!({"attempt_id": attempt, "task_id": record.task}))
+        })
+    }
+
+    pub fn is_paused(&self, attempt: AttemptId) -> bool {
+        self.paused.contains(&attempt)
+    }
+
+    /// Fold canonical events appended by another graph view.
+    pub fn refresh(&mut self) -> Result<(), GraphError> {
+        self.catch_up()
     }
 
     /// Retire the task's current attempt and start a fresh one.
@@ -1637,6 +1678,8 @@ impl TaskGraph {
             "task.attempt_expired" => self.replay_attempt_expired(data),
             "task.attempt_state_changed" => self.replay_attempt_state(data),
             "task.attempt_cancel_requested" => self.replay_cancel_requested(data),
+            "task.attempt_pause_requested" => self.replay_pause_requested(data),
+            "task.attempt_resumed" => self.replay_resumed(data),
             "task.attempt_superseded" => self.replay_attempt_superseded(data),
             "task.attempt_trace" => self.replay_trace(data),
             _ => return None,
@@ -1793,6 +1836,23 @@ impl TaskGraph {
             .get("reason")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        Ok(())
+    }
+
+    fn replay_pause_requested(&mut self, data: &Value) -> Result<(), GraphError> {
+        let id: AttemptId = field(data, "attempt_id")
+            .map_err(|_| GraphError::InvalidEvent("pause event has no attempt".into()))?;
+        if !self.attempts.contains_key(&id) {
+            return Err(GraphError::UnknownAttempt(id));
+        }
+        self.paused.insert(id);
+        Ok(())
+    }
+
+    fn replay_resumed(&mut self, data: &Value) -> Result<(), GraphError> {
+        let id: AttemptId = field(data, "attempt_id")
+            .map_err(|_| GraphError::InvalidEvent("resume event has no attempt".into()))?;
+        self.paused.remove(&id);
         Ok(())
     }
 
@@ -1980,7 +2040,7 @@ impl TaskGraph {
                 self.session,
                 sequence,
                 self.actor.clone(),
-                None,
+                self.last_event,
                 CorrelationId::new(),
                 SchemaVersion(1),
                 kind,
@@ -1992,7 +2052,9 @@ impl TaskGraph {
             {
                 Ok(version) => {
                     self.version = version;
-                    return self.replay(&event);
+                    self.replay(&event)?;
+                    self.last_event = Some(event.id);
+                    return Ok(());
                 }
                 Err(StoreError::Conflict { .. }) if attempt + 1 < COMMIT_ATTEMPTS => {
                     self.catch_up()?;
@@ -2020,6 +2082,7 @@ impl TaskGraph {
             let version = StreamVersion(last.sequence);
             for event in &page {
                 self.replay(event)?;
+                self.last_event = Some(event.id);
             }
             self.version = version;
         }
@@ -2649,6 +2712,29 @@ mod tests {
             record.terminal_reason.as_deref(),
             Some("operator changed their mind")
         );
+    }
+
+    #[test]
+    fn pause_and_resume_are_replayable_and_fenced_to_a_live_attempt() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let mut graph = open(&store, session);
+        let id = TaskId::new();
+        graph.add(node(id, Vec::new(), budget(10))).unwrap();
+        graph.ready().unwrap();
+        let attempt = graph.lease(id, AgentId::new(), 10).unwrap();
+
+        graph.request_pause(attempt).unwrap();
+        assert!(graph.is_paused(attempt));
+        assert!(open(&store, session).is_paused(attempt));
+
+        graph.resume(attempt).unwrap();
+        assert!(!open(&store, session).is_paused(attempt));
+        graph.request_cancel(attempt, "done").unwrap();
+        assert!(matches!(
+            graph.request_pause(attempt),
+            Err(GraphError::FencedAttempt(_))
+        ));
     }
 
     #[test]

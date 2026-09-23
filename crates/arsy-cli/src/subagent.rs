@@ -53,6 +53,7 @@ use arsy_kernel::{
     provider::{
         CanonicalModelRequest, ModelContent, ModelKey, ModelMessage, ModelRole, ToolSchema,
     },
+    safety::AgentRole,
     scheduler::{Admission, CancelToken, Scheduler, SchedulerError},
     validation::ValidationLog,
 };
@@ -181,6 +182,11 @@ pub fn schemas(delegates: bool) -> Vec<ToolSchema> {
                     "goal": {
                         "type": "string",
                         "description": "What the subagent should find out, stated so its answer is useful on its own."
+                    },
+                    "role": {
+                        "type": "string",
+                        "enum": ["explorer", "planner", "implementer", "debugger", "test_runner", "reviewer", "integrator", "safety_reviewer"],
+                        "description": "Responsibility contract for this child. Defaults to `explorer`."
                     },
                     "capabilities": {
                         "type": "array",
@@ -337,6 +343,7 @@ struct Child {
     task: TaskId,
     attempt: AttemptId,
     goal: String,
+    role: AgentRole,
     cancel: CancelToken,
     /// Taken when the child is reaped. `None` afterwards.
     worker: Option<JoinHandle<Report>>,
@@ -637,8 +644,11 @@ impl<'a> Supervisor<'a> {
         if goal.is_empty() {
             return Err("a subagent needs a goal to work towards".into());
         }
+        let role = spawn_role(arguments)?;
+        let contract = role.contract();
         let writer = match arguments.get("workspace").and_then(Value::as_str) {
-            None | Some("read_only_snapshot") => false,
+            None => contract.workspace == WorkspaceRequirement::IsolatedWriter,
+            Some("read_only_snapshot") => false,
             Some("isolated_writer") => true,
             Some(other) => {
                 return Err(format!(
@@ -646,9 +656,18 @@ impl<'a> Supervisor<'a> {
                 ))
             }
         };
-        let asked = requested(&self.delegable, arguments)?;
+        let asked = if role == AgentRole::SafetyReviewer
+            && arguments
+                .get("capabilities")
+                .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
+        {
+            Vec::new()
+        } else {
+            requested(&self.delegable, arguments)?
+        };
+        validate_role(role, writer, &asked)?;
         writing_needs_a_tree_of_its_own(writer, &asked)?;
-        self.run_child(&goal, &asked, writer, graph)
+        self.run_child(&goal, role, &asked, writer, graph)
     }
 
     fn status(&self) -> Result<String, String> {
@@ -659,6 +678,7 @@ impl<'a> Supervisor<'a> {
                 json!({
                     "task": child.task.to_string(),
                     "goal": child.goal,
+                    "role": role_name(child.role),
                     "state": self.state_of(child),
                     "answer_ready": child.worker.is_none(),
                 })
@@ -879,11 +899,84 @@ fn requested(
     }
 }
 
+fn spawn_role(arguments: &Value) -> Result<AgentRole, String> {
+    let inferred = || {
+        let capabilities = arguments
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        if arguments.get("workspace").and_then(Value::as_str) == Some("isolated_writer")
+            || capabilities.iter().any(|value| value == "fs.write")
+        {
+            "implementer"
+        } else if capabilities.iter().any(|value| value == "process.exec") {
+            "test_runner"
+        } else {
+            "explorer"
+        }
+    };
+    match arguments
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or_else(inferred)
+    {
+        "explorer" => Ok(AgentRole::Explorer),
+        "planner" => Ok(AgentRole::Planner),
+        "implementer" => Ok(AgentRole::Implementer),
+        "debugger" => Ok(AgentRole::Debugger),
+        "test_runner" => Ok(AgentRole::TestRunner),
+        "reviewer" => Ok(AgentRole::Reviewer),
+        "integrator" => Ok(AgentRole::Integrator),
+        "safety_reviewer" => Ok(AgentRole::SafetyReviewer),
+        other => Err(format!("unknown subagent role {other:?}")),
+    }
+}
+
+const fn role_name(role: AgentRole) -> &'static str {
+    match role {
+        AgentRole::Explorer => "explorer",
+        AgentRole::Planner => "planner",
+        AgentRole::Implementer => "implementer",
+        AgentRole::Debugger => "debugger",
+        AgentRole::TestRunner => "test_runner",
+        AgentRole::Reviewer => "reviewer",
+        AgentRole::Integrator => "integrator",
+        AgentRole::SafetyReviewer => "safety_reviewer",
+    }
+}
+
+fn validate_role(role: AgentRole, writer: bool, asked: &[CapabilityAction]) -> Result<(), String> {
+    let contract = role.contract();
+    if writer != (contract.workspace == WorkspaceRequirement::IsolatedWriter) {
+        return Err(format!(
+            "the {} role requires a {} workspace",
+            role_name(role),
+            if contract.workspace == WorkspaceRequirement::IsolatedWriter {
+                "isolated_writer"
+            } else {
+                "read_only_snapshot"
+            }
+        ));
+    }
+    if let Some(action) = asked
+        .iter()
+        .find(|action| !contract.capabilities.contains(action))
+    {
+        return Err(format!(
+            "the {} role contract does not permit `{}`",
+            role_name(role),
+            action.as_str()
+        ));
+    }
+    Ok(())
+}
+
 impl Supervisor<'_> {
     /// Record the child, attenuate its authority, and hand it to a worker.
     fn run_child(
         &mut self,
         goal: &str,
+        role: AgentRole,
         actions: &[CapabilityAction],
         writer: bool,
         graph: &mut TaskGraph,
@@ -984,7 +1077,7 @@ impl Supervisor<'_> {
             .start(
                 id,
                 &AttemptRequest {
-                    role: "subagent".to_owned(),
+                    role: role_name(role).to_owned(),
                     assignee: agent,
                     model: Some(arsy_kernel::orchestration::ModelDecision {
                         profile: self.resolved.endpoint.id.clone(),
@@ -1081,6 +1174,7 @@ impl Supervisor<'_> {
             model: self.model.clone(),
             mode: self.mode,
             goal: goal.to_owned(),
+            role,
             agent,
             task: id,
             attempt: admitted.attempt,
@@ -1100,6 +1194,7 @@ impl Supervisor<'_> {
             task: id,
             attempt: admitted.attempt,
             goal: goal.to_owned(),
+            role,
             cancel: admitted.cancel,
             worker: Some(handle),
             report: None,
@@ -1111,6 +1206,7 @@ impl Supervisor<'_> {
             "task": id.to_string(),
             "attempt": admitted.attempt.to_string(),
             "started": goal,
+            "role": role_name(role),
             "workspace": if writer { "isolated_writer" } else { "read_only_snapshot" },
             "note": "running; read it back with `task.wait` or `task.result`",
         })
@@ -1295,6 +1391,7 @@ struct Worker {
     model: String,
     mode: ExecutionMode,
     goal: String,
+    role: AgentRole,
     agent: AgentId,
     task: TaskId,
     attempt: AttemptId,
@@ -1477,14 +1574,18 @@ impl Worker {
                 provider: self.endpoint.clone(),
                 model: self.model.clone(),
             },
-            system: Some(child_instructions(&self.goal)),
+            system: Some(child_instructions(self.role, &self.goal, self.writer)),
             messages: vec![ModelMessage {
                 role: ModelRole::User,
                 content: vec![ModelContent::Text {
                     text: self.goal.clone(),
                 }],
             }],
-            tools: runtime.schemas(),
+            tools: if self.role == AgentRole::SafetyReviewer {
+                Vec::new()
+            } else {
+                runtime.schemas()
+            },
             max_output_tokens: self.max_output_tokens,
             effort: None,
             idempotency_key: IdempotencyKey::new(self.agent.to_string())
@@ -1518,6 +1619,21 @@ impl Worker {
                             .map(|text| format!("Your parent sent you this: {text}"))
                     })
                     .collect()
+            },
+            &mut || loop {
+                let mut graph = graph.borrow_mut();
+                if graph.refresh().is_err()
+                    || graph
+                        .attempt(attempt)
+                        .is_some_and(|attempt| attempt.state == AttemptState::Cancelling)
+                {
+                    return false;
+                }
+                if !graph.is_paused(attempt) {
+                    return true;
+                }
+                drop(graph);
+                std::thread::sleep(POLL_INTERVAL);
             },
             &self.cancel,
             tokens,
@@ -1681,13 +1797,18 @@ fn rules_from(granted: &[CapabilityGrant]) -> RuleSet {
 }
 
 /// What a child is told about its own position.
-fn child_instructions(goal: &str) -> String {
+fn child_instructions(role: AgentRole, goal: &str, writer: bool) -> String {
     format!(
-        "You are a subagent with one question to answer: {goal}\n\n\
-         You can read and search this workspace. You cannot write to it, and asking to will be \
-         refused — the agent that spawned you owns every change. Answer in a few sentences, \
-         citing the paths you read. If the answer is not in this workspace, say so rather than \
-         guessing.\n"
+        "You are a subagent in the {role} role, responsible for this bounded task: {goal}\n\n\
+         Your tools are limited by the role contract and delegated policy. {workspace} \
+         Do not claim capabilities you were not given. If the answer is not available, say so \
+         rather than guessing.\n",
+        role = role_name(role),
+        workspace = if writer {
+            "Write only in your isolated workspace and return the required JSON manifest."
+        } else {
+            "This workspace is read-only."
+        },
     )
 }
 
@@ -1748,6 +1869,22 @@ mod tests {
             .requested(&json!({"capabilities": []}))
             .unwrap_err()
             .contains("no capability"));
+    }
+
+    #[test]
+    fn role_contracts_bound_workspace_and_capabilities() {
+        assert!(validate_role(AgentRole::Explorer, false, &[CapabilityAction::FsRead]).is_ok());
+        assert!(
+            validate_role(AgentRole::Explorer, false, &[CapabilityAction::ProcessExec])
+                .unwrap_err()
+                .contains("does not permit")
+        );
+        assert!(
+            validate_role(AgentRole::Implementer, false, &[CapabilityAction::FsWrite])
+                .unwrap_err()
+                .contains("isolated_writer")
+        );
+        assert!(validate_role(AgentRole::SafetyReviewer, false, &[]).is_ok());
     }
 
     #[test]
