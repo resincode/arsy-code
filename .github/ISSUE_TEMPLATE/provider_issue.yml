@@ -1,0 +1,71 @@
+name: Model or provider issue
+description: Report a problem with a specific model, provider, or credential source
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Do not paste API keys, tokens, or the contents of a credential file.
+        Redact them from any log you attach — a public issue is not a private
+        channel, and a leaked key stays leaked after the issue is edited.
+  - type: input
+    id: provider
+    attributes:
+      label: Provider
+      placeholder: e.g. Anthropic, OpenAI, Ollama, OpenRouter, an OpenAI-compatible endpoint
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model ID
+      description: Exactly as configured, not the marketing name.
+      placeholder: e.g. claude-opus-5, gpt-4o-2024-11-20, qwen2.5-coder:32b
+    validations:
+      required: true
+  - type: dropdown
+    id: configuration
+    attributes:
+      label: Where the configuration comes from
+      options:
+        - arsy.json
+        - Claude Code configuration, read through compatibility
+        - Codex configuration, read through compatibility
+        - Environment variables
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: symptom
+    attributes:
+      label: Symptom
+      options:
+        - Authentication or credential lookup fails
+        - Request is rejected or errors before any output
+        - Streaming stalls or truncates
+        - Tool calls are malformed or never issued
+        - Token accounting or context limits are wrong
+        - Output is wrong or the model refuses unexpectedly
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you ran, what the provider did, and what you expected instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: arsy version
+      description: Output of `arsy --version`, or the commit hash you are on.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Redact credentials first. Will be formatted as code automatically.
+      render: shell
