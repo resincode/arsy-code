@@ -320,27 +320,7 @@ impl PlanExecutor {
             .enumerate()
             .map(|(index, step)| (step.id.clone(), index))
             .collect();
-        let mut order = Vec::with_capacity(state.steps.len());
-        while order.len() < state.steps.len() {
-            let before = order.len();
-            for (index, step) in state.steps.iter().enumerate() {
-                if order.contains(&index) {
-                    continue;
-                }
-                if step.depends_on.iter().all(|dependency| {
-                    by_id
-                        .get(dependency)
-                        .is_some_and(|dependency| order.contains(dependency))
-                }) {
-                    order.push(index);
-                }
-            }
-            if order.len() == before {
-                return Err(OperationError::Execution(
-                    "plan dependencies are missing or cyclic".into(),
-                ));
-            }
-        }
+        let order = dependency_order(&state.steps, &by_id)?;
         for &index in &order {
             if state.steps[index].committed_as.is_some() {
                 continue;
@@ -422,6 +402,45 @@ impl PlanExecutor {
     }
 }
 
+fn dependency_order(
+    steps: &[PlanStep],
+    by_id: &HashMap<String, usize>,
+) -> Result<Vec<usize>, OperationError> {
+    let mut marks = vec![0_u8; steps.len()];
+    let mut order = Vec::with_capacity(steps.len());
+    for index in 0..steps.len() {
+        visit_step(index, steps, by_id, &mut marks, &mut order)?;
+    }
+    Ok(order)
+}
+
+fn visit_step(
+    index: usize,
+    steps: &[PlanStep],
+    by_id: &HashMap<String, usize>,
+    marks: &mut [u8],
+    order: &mut Vec<usize>,
+) -> Result<(), OperationError> {
+    match marks[index] {
+        2 => return Ok(()),
+        1 => {
+            return Err(OperationError::Execution(
+                "plan dependencies are cyclic".into(),
+            ))
+        }
+        _ => marks[index] = 1,
+    }
+    for dependency in &steps[index].depends_on {
+        let dependency = *by_id
+            .get(dependency)
+            .ok_or_else(|| OperationError::Execution(format!("no dependency step {dependency}")))?;
+        visit_step(dependency, steps, by_id, marks, order)?;
+    }
+    marks[index] = 2;
+    order.push(index);
+    Ok(())
+}
+
 fn status_of(value: &str) -> Result<PlanStepStatus, OperationError> {
     match value {
         "pending" => Ok(PlanStepStatus::Pending),
@@ -431,6 +450,117 @@ fn status_of(value: &str) -> Result<PlanStepStatus, OperationError> {
             "`{other}` is not a plan step status; use pending, in_progress, or completed"
         ))),
     }
+}
+
+fn input_string(input: &Value, key: &str) -> String {
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn add_step(state: &mut PlanState, input: &Value) -> Result<(), OperationError> {
+    let description = input_string(input, "description");
+    if description.is_empty() {
+        return Err(OperationError::Execution(
+            "a plan step needs a description".into(),
+        ));
+    }
+    state.next_id += 1;
+    let step = PlanStep {
+        id: format!("step-{}", state.next_id),
+        description,
+        status: PlanStepStatus::Pending,
+        depends_on: input
+            .get("depends_on")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        committed_as: None,
+        committed_task: None,
+    };
+    if let Some(missing) = step
+        .depends_on
+        .iter()
+        .find(|dependency| state.position(dependency).is_none())
+    {
+        return Err(OperationError::Execution(format!(
+            "no dependency step {missing}"
+        )));
+    }
+    match input.get("after").and_then(Value::as_str) {
+        Some(after) if !after.is_empty() => {
+            let position = state
+                .position(after)
+                .ok_or_else(|| OperationError::Execution(format!("no step {after}")))?;
+            state.steps.insert(position + 1, step);
+        }
+        _ => state.steps.push(step),
+    }
+    Ok(())
+}
+
+fn update_step(state: &mut PlanState, input: &Value) -> Result<(), OperationError> {
+    let id = input_string(input, "id");
+    let position = state
+        .position(&id)
+        .ok_or_else(|| OperationError::Execution(format!("no step {id}")))?;
+    if let Some(status) = input.get("status").and_then(Value::as_str) {
+        state.steps[position].status = status_of(status)?;
+    }
+    if let Some(description) = input
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|description| !description.is_empty())
+    {
+        state.steps[position].description = description.to_owned();
+    }
+    Ok(())
+}
+
+fn remove_step(state: &mut PlanState, input: &Value) -> Result<(), OperationError> {
+    let id = input_string(input, "id");
+    let position = state
+        .position(&id)
+        .ok_or_else(|| OperationError::Execution(format!("no step {id}")))?;
+    state.steps.remove(position);
+    Ok(())
+}
+
+fn reorder_steps(state: &mut PlanState, input: &Value) -> Result<(), OperationError> {
+    let order: Vec<String> = input
+        .get("order")
+        .and_then(Value::as_array)
+        .ok_or_else(|| OperationError::Execution("`order` must be an array".into()))?
+        .iter()
+        .map(|value| value.as_str().unwrap_or_default().to_owned())
+        .collect();
+    let mut current: Vec<&str> = state.steps.iter().map(|step| step.id.as_str()).collect();
+    current.sort_unstable();
+    let mut requested: Vec<&str> = order.iter().map(String::as_str).collect();
+    requested.sort_unstable();
+    if current != requested {
+        return Err(OperationError::Execution(
+            "`order` must name exactly the current steps, once each".into(),
+        ));
+    }
+    let by_id: HashMap<_, _> = state
+        .steps
+        .drain(..)
+        .map(|step| (step.id.clone(), step))
+        .collect();
+    state.steps = order
+        .iter()
+        .map(|id| by_id.get(id).expect("checked above").clone())
+        .collect();
+    Ok(())
 }
 
 impl OperationExecutor for PlanExecutor {
@@ -444,111 +574,16 @@ impl OperationExecutor for PlanExecutor {
         _grants: &[CapabilityGrant],
     ) -> Result<OperationOutcome, OperationError> {
         let input = &request.input;
-        let string = |key: &str| {
-            input
-                .get(key)
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned()
-        };
         let mut state = self
             .state
             .lock()
             .map_err(|_| OperationError::Execution("plan state poisoned".into()))?;
 
         match self.operation {
-            PlanOperation::Add => {
-                let description = string("description");
-                if description.is_empty() {
-                    return Err(OperationError::Execution(
-                        "a plan step needs a description".into(),
-                    ));
-                }
-                state.next_id += 1;
-                let id = format!("step-{}", state.next_id);
-                let step = PlanStep {
-                    id,
-                    description,
-                    status: PlanStepStatus::Pending,
-                    depends_on: input
-                        .get("depends_on")
-                        .and_then(Value::as_array)
-                        .map(|values| {
-                            values
-                                .iter()
-                                .filter_map(Value::as_str)
-                                .map(str::to_owned)
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    committed_as: None,
-                    committed_task: None,
-                };
-                if let Some(missing) = step
-                    .depends_on
-                    .iter()
-                    .find(|dependency| state.position(dependency).is_none())
-                {
-                    return Err(OperationError::Execution(format!(
-                        "no dependency step {missing}"
-                    )));
-                }
-                match input.get("after").and_then(Value::as_str) {
-                    Some(after) if !after.is_empty() => {
-                        let position = state
-                            .position(after)
-                            .ok_or_else(|| OperationError::Execution(format!("no step {after}")))?;
-                        state.steps.insert(position + 1, step);
-                    }
-                    _ => state.steps.push(step),
-                }
-            }
-            PlanOperation::Update => {
-                let id = string("id");
-                let position = state
-                    .position(&id)
-                    .ok_or_else(|| OperationError::Execution(format!("no step {id}")))?;
-                if let Some(status) = input.get("status").and_then(Value::as_str) {
-                    state.steps[position].status = status_of(status)?;
-                }
-                if let Some(description) = input.get("description").and_then(Value::as_str) {
-                    if !description.is_empty() {
-                        state.steps[position].description = description.to_owned();
-                    }
-                }
-            }
-            PlanOperation::Remove => {
-                let id = string("id");
-                let position = state
-                    .position(&id)
-                    .ok_or_else(|| OperationError::Execution(format!("no step {id}")))?;
-                state.steps.remove(position);
-            }
-            PlanOperation::Reorder => {
-                let order: Vec<String> = input
-                    .get("order")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| OperationError::Execution("`order` must be an array".into()))?
-                    .iter()
-                    .map(|value| value.as_str().unwrap_or_default().to_owned())
-                    .collect();
-                let mut current: Vec<&str> =
-                    state.steps.iter().map(|step| step.id.as_str()).collect();
-                current.sort_unstable();
-                let mut requested: Vec<&str> = order.iter().map(String::as_str).collect();
-                requested.sort_unstable();
-                if current != requested {
-                    return Err(OperationError::Execution(
-                        "`order` must name exactly the current steps, once each".into(),
-                    ));
-                }
-                let mut reordered = Vec::with_capacity(state.steps.len());
-                for id in &order {
-                    let position = state.position(id).expect("checked above");
-                    reordered.push(state.steps[position].clone());
-                }
-                state.steps = reordered;
-            }
+            PlanOperation::Add => add_step(&mut state, input)?,
+            PlanOperation::Update => update_step(&mut state, input)?,
+            PlanOperation::Remove => remove_step(&mut state, input)?,
+            PlanOperation::Reorder => reorder_steps(&mut state, input)?,
             PlanOperation::List => {}
             PlanOperation::Commit => self.commit(&mut state)?,
         }
