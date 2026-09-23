@@ -39,71 +39,21 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
+      # postinstall resolves the release archive from the manifest version, so a
+      # launcher published under a tag it does not match would download bytes
+      # from a different release.
       - name: Verify release tag matches package version
         shell: bash
         run: |
           tag="${{ inputs.tag || github.event.workflow_run.head_branch }}"
-          package_version="$(node -p "require('./npm/package.json').version")"
-          test "$tag" = "v$package_version"
-          echo "TAG=$tag" >> "$GITHUB_ENV"
-          echo "PACKAGE_VERSION=$package_version" >> "$GITHUB_ENV"
+          test "$tag" = "v$(node -p "require('./npm/package.json').version")"
       # Trusted Publishing (OIDC): no NPM_TOKEN needed. Requires npm >= 11.5.1
       # and this exact workflow path registered as a Trusted Publisher on
       # npmjs.com for @suiflex/arsy-code.
-      #
-      # Platform packages are assembled from the canonical release archives, so
-      # the release must already exist -- hence the gate above.
       - run: npm install -g npm@latest
-      - name: Download canonical release archives
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir dist
-          gh release download "$TAG" --dir dist --pattern 'arsy-*.tar.gz' --pattern 'arsy-*.zip'
-      - name: Publish platform packages before the launcher
-        shell: bash
-        run: |
-          set -euo pipefail
-          publish_platform() {
-            package="$1" os="$2" cpu="$3" archive="$4"
-            if npm view "@suiflex/arsy-code-${package}@${PACKAGE_VERSION}" version >/dev/null 2>&1; then
-              return
-            fi
-            directory="platform-${package}"
-            mkdir -p "$directory/bin"
-            case "$archive" in
-              *.tar.gz) tar -xzf "dist/$archive" -C "$directory/bin" ;;
-              *.zip) unzip -q "dist/$archive" -d "$directory/bin" ;;
-            esac
-            jq -n --arg name "@suiflex/arsy-code-${package}" \
-              --arg version "$PACKAGE_VERSION" --arg os "$os" --arg cpu "$cpu" \
-              '{name:$name,version:$version,license:"MIT",os:[$os],cpu:[$cpu],files:["bin"],publishConfig:{access:"public"}}' \
-              > "$directory/package.json"
-            cp LICENSE "$directory/LICENSE"
-            npm publish --access public "$directory"
-          }
-          publish_platform linux-x64 linux x64 arsy-linux-x86_64.tar.gz
-          publish_platform linux-arm64 linux arm64 arsy-linux-aarch64.tar.gz
-          publish_platform darwin-x64 darwin x64 arsy-macos-x86_64.tar.gz
-          publish_platform darwin-arm64 darwin arm64 arsy-macos-aarch64.tar.gz
-          publish_platform win32-x64 win32 x64 arsy-windows-x86_64.zip
-          publish_platform win32-arm64 win32 arm64 arsy-windows-aarch64.zip
       # `files` is an allowlist rooted at the package directory, so the licence
       # has to sit inside npm/ to ship. Copying it here rather than committing
       # a second copy keeps one source of truth.
       - run: cp LICENSE npm/LICENSE
-      - name: Pin launcher dependencies to this release
-        env:
-          PACKAGE_VERSION: ${{ env.PACKAGE_VERSION }}
-        run: |
-          node - <<'NODE'
-          const fs = require("node:fs");
-          const path = "npm/package.json";
-          const manifest = JSON.parse(fs.readFileSync(path));
-          for (const name of Object.keys(manifest.optionalDependencies)) {
-            manifest.optionalDependencies[name] = process.env.PACKAGE_VERSION;
-          }
-          fs.writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`);
-          NODE
       - run: npm publish --access public
         working-directory: npm
