@@ -16,6 +16,15 @@ older npm client that omits optional dependencies falls back to the same-version
 GitHub Release archive and verifies its published SHA-256. An unsupported
 platform fails explicitly rather than installing a launcher that cannot run.
 
+Every release carries a `release-smoke-report.json`. It is written by
+`release-smoke.yml` after the npm publish completes: each supported target
+installs from the GitHub Release archive, the installer script, npm, and the
+Homebrew tap or Scoop bucket where those exist, and each install records the
+channel, tag, target, digest, signature status, and the version string the
+installed binary printed. A channel that cannot be installed and launched
+leaves no record, and the report job fails on the short count. Source presence
+is not publication proof; that file is.
+
 ## Bundled FluxGuard
 
 Every archive carries two binaries: `arsy` and `fluxguard`. The release build
