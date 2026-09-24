@@ -16,11 +16,10 @@ arsy --version
 
 ## What installing does
 
-The launcher installs the matching platform package, verifies its version, and
-copies `arsy` and `fluxguard` beside each other. If an older npm client omits
-optional platform packages, postinstall falls back to the same-version GitHub
-Release archive and verifies its published SHA-256. It fails loudly rather than
-leaving behind a launcher that cannot run.
+Postinstall downloads the same-version GitHub Release archive for your
+platform, verifies its published SHA-256, and unpacks `arsy` and `fluxguard`
+beside each other. It fails loudly rather than leaving behind a launcher that
+cannot run.
 
 | Platform | Architectures |
 |---|---|

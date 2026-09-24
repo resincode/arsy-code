@@ -24,14 +24,6 @@
   "scripts": {
     "postinstall": "node scripts/install.js"
   },
-  "optionalDependencies": {
-    "@suiflex/arsy-code-darwin-arm64": "*",
-    "@suiflex/arsy-code-darwin-x64": "*",
-    "@suiflex/arsy-code-linux-arm64": "*",
-    "@suiflex/arsy-code-linux-x64": "*",
-    "@suiflex/arsy-code-win32-arm64": "*",
-    "@suiflex/arsy-code-win32-x64": "*"
-  },
   "publishConfig": {
     "access": "public"
   }

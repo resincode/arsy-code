@@ -8,13 +8,13 @@ The supported convenience channels are a SuiFlex Homebrew tap for macOS/Linux, a
 
 `install.sh` and `install.ps1` are a checksum-only channel: they verify the archive's SHA-256 digest against its `.sha256` sidecar, but not the Sigstore signature described below. Release automation signs `SHA256SUMS`, so a caller that wants provenance verifies that file itself rather than relying on the scripts.
 
-The npm launcher declares one optional package for each supported platform.
-Release automation publishes those packages from the canonical release
-archives before publishing the launcher and pins them to the same version. Its
-postinstall copies `arsy` and `fluxguard` from the matching platform package. An
-older npm client that omits optional dependencies falls back to the same-version
-GitHub Release archive and verifies its published SHA-256. An unsupported
-platform fails explicitly rather than installing a launcher that cannot run.
+The npm package is a launcher and nothing else. Its postinstall downloads the
+same-version GitHub Release archive for the running platform, checks it against
+the published `.sha256` sidecar, and unpacks `arsy` and `fluxguard` side by side
+into `vendor/`. An unsupported platform, a digest mismatch, or an archive
+missing either binary fails the install rather than leaving behind a launcher
+that cannot run. There are no per-platform npm packages: one registry name
+resolves to one immutable release artifact.
 
 ## Bundled FluxGuard
 
