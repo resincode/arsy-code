@@ -21,10 +21,17 @@ name: Release smoke
 # release. Adding a target costs one job; adding a PR trigger would cost all of
 # it on every push, which is why there isn't one.
 
+# npm-publish calls this with the tag it published. A `workflow_run` trigger
+# cannot: `github.event.workflow_run.head_branch` names the branch the upstream
+# run was on, and npm-publish is itself triggered by `workflow_run`, so it runs
+# on `main` and reports `main` -- not the tag.
 on:
-  workflow_run:
-    workflows: ["npm-publish"]
-    types: [completed]
+  workflow_call:
+    inputs:
+      tag:
+        description: Published release tag to smoke-test (e.g. v0.4.0)
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:
@@ -36,11 +43,10 @@ permissions:
   contents: read
 
 env:
-  TAG: ${{ inputs.tag || github.event.workflow_run.head_branch }}
+  TAG: ${{ inputs.tag }}
 
 jobs:
   channels:
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -87,6 +93,11 @@ jobs:
       # One helper instead of the same jq line in five steps. A channel that
       # cannot launch never reaches its `record`, so a missing entry in the
       # report is itself a failure -- the report job counts them.
+      #
+      # It also refuses to record a launch that is not this tag. A tap or a
+      # bucket that still serves the previous version installs and runs
+      # perfectly well; without this it would have been counted as proof of a
+      # release it does not carry.
       - name: Install the channel recorder
         shell: bash
         run: |
@@ -94,6 +105,13 @@ jobs:
           cat > record.sh <<'SH'
           #!/bin/sh
           set -eu
+          case "$2" in
+            "arsy ${TAG#v} "*) ;;
+            *)
+              echo "channel $1 on $TARGET launched '$2', expected ${TAG#v}" >&2
+              exit 1
+              ;;
+          esac
           jq -cn --arg channel "$1" --arg launch "$2" --arg tag "$TAG" \
             --arg target "$TARGET" --arg digest "$DIGEST" \
             '{schema:1,channel:$channel,tag:$tag,target:$target,digest:$digest,signature:true,launch:$launch}' \
@@ -161,13 +179,17 @@ jobs:
           launcher="$(npm root -g)/@suiflex/arsy-code/bin/arsy.js"
           ./record.sh npm "$(node "$launcher" --version)"
 
+      # The Ubuntu image installs Homebrew under /home/linuxbrew but leaves it
+      # off PATH, so `brew` has to be resolved rather than assumed.
       - name: Homebrew tap
         if: matrix.homebrew
         shell: bash
         run: |
           set -euo pipefail
-          brew install suiflex/tap/arsy-code
-          prefix="$(brew --prefix arsy-code)"
+          brew="$(command -v brew || echo /home/linuxbrew/.linuxbrew/bin/brew)"
+          test -x "$brew"
+          "$brew" install suiflex/tap/arsy-code
+          prefix="$("$brew" --prefix arsy-code)"
           test -x "$prefix/bin/fluxguard"
           ./record.sh homebrew "$("$prefix/bin/arsy" --version)"
 
