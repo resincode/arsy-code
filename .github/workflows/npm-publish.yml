@@ -80,3 +80,13 @@ jobs:
       - run: cp LICENSE npm/LICENSE
       - run: npm publish --access public
         working-directory: npm
+
+  # The tag is known here and nowhere downstream: a `workflow_run` trigger on
+  # this workflow would see `main`, because this workflow itself runs on main.
+  smoke:
+    needs: publish
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-smoke.yml
+    with:
+      tag: ${{ inputs.tag || github.event.workflow_run.head_branch }}

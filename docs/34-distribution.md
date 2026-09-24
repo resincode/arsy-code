@@ -16,6 +16,15 @@ missing either binary fails the install rather than leaving behind a launcher
 that cannot run. There are no per-platform npm packages: one registry name
 resolves to one immutable release artifact.
 
+Every release carries a `release-smoke-report.json`. It is written by
+`release-smoke.yml` after the npm publish completes: each supported target
+installs from the GitHub Release archive, the installer script, npm, and the
+Homebrew tap or Scoop bucket where those exist, and each install records the
+channel, tag, target, digest, signature status, and the version string the
+installed binary printed. A channel that cannot be installed and launched
+leaves no record, and the report job fails on the short count. Source presence
+is not publication proof; that file is.
+
 ## Bundled FluxGuard
 
 Every archive carries two binaries: `arsy` and `fluxguard`. The release build

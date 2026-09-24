@@ -732,19 +732,27 @@ memory, and silent high-trust memory are excluded.
 
 ## Phase 9 — Launch readiness and platform maturity
 
-Launch readiness is **P1 operational work**. Before a channel is called
-operational:
+Launch readiness is **P1 operational work**. A channel is called operational
+only once a run has proven it, and every item below names the evidence rather
+than the intention:
 
-- restore and validate the relevant workflow files;
-- update release Rust 1.85 to the workspace's 1.98 or derive one source;
-- build/test the target matrix and sandbox conformance;
-- attach the installers referenced by release URLs;
-- align SBOM documentation with CycloneDX or intentionally add SPDX;
-- create a canonical checksum manifest from final bytes;
-- implement Sigstore signing/bundles and verify workflow identity cleanly;
-- publish platform npm packages before the launcher and clean-install each;
-- wire Homebrew/Scoop only to the same immutable digests;
-- record a real release smoke test.
+- every workflow is enabled and derives its toolchain from
+  `.github/actions/setup-workspace-rust`, so no file pins a conflicting Rust;
+- `release.yml` builds and archives the six Tier 1 targets, and `sandbox.yml`
+  runs the escape suite on Linux, macOS, and Windows;
+- `install.sh` and `install.ps1` ship as release assets, which is where the
+  documented URLs point;
+- the SBOM is CycloneDX, one document per crate;
+- `SHA256SUMS` is built from the final bytes and is the digest the Homebrew
+  tap and the Scoop bucket render into their manifests;
+- `SHA256SUMS` is signed keyless with Sigstore, and a separate clean job
+  re-verifies it against the exact `release.yml@refs/tags/<tag>` identity;
+- the npm package is a launcher that resolves one immutable release archive
+  and verifies its published digest;
+- `release-smoke.yml` installs every channel on every claimed target after the
+  npm publish completes and attaches `release-smoke-report.json` to the
+  release, recording channel, tag, target, digest, signature, and what each
+  install actually launched.
 
 The update command remains non-operational until it checks a trusted signed
 manifest. Automatic installation remains deferred because it adds persistent

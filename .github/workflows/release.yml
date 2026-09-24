@@ -291,8 +291,11 @@ jobs:
   #
   # Checksums come from this run's artifacts rather than from `gh release download`: they
   # are already built and hashed here, so there is nothing to re-fetch and no race against
-  # release-asset propagation. The build jobs write the bare hex digest with no file name,
-  # so the value is read directly.
+  # release-asset propagation. They are read from `SHA256SUMS` rather than the per-archive
+  # sidecars, because `SHA256SUMS` is the file cosign signs -- a formula or manifest
+  # pinning a digest from anywhere else could not be said to consume the canonical one.
+  # A missing line means a missing archive, and `sha()` fails there rather than rendering
+  # an empty digest.
 
   publish-homebrew:
     needs: publish
@@ -314,18 +317,32 @@ jobs:
           set -euo pipefail
           version="${TAG#v}"
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
-          sha() { tr -d '[:space:]' < "dist/arsy-$1.tar.gz.sha256"; }
+          # `var=$(sha ...)` is a simple assignment, so a missing line aborts the
+          # step under `set -e`; inside a `sed` argument it would only have
+          # rendered an empty digest.
+          sha() {
+            awk -v name="arsy-$1" '$2 == name { found = 1; print $1 } END { exit !found }' \
+              dist/SHA256SUMS
+          }
+          mac_arm="$(sha macos-aarch64.tar.gz)"
+          mac_x64="$(sha macos-x86_64.tar.gz)"
+          linux_arm="$(sha linux-aarch64.tar.gz)"
+          linux_x64="$(sha linux-x86_64.tar.gz)"
 
           sed -e "s|@VERSION@|${version}|g" \
               -e "s|@BASE@|${base}|g" \
-              -e "s|@MAC_ARM_SHA@|$(sha macos-aarch64)|g" \
-              -e "s|@MAC_X64_SHA@|$(sha macos-x86_64)|g" \
-              -e "s|@LINUX_ARM_SHA@|$(sha linux-aarch64)|g" \
-              -e "s|@LINUX_X64_SHA@|$(sha linux-x86_64)|g" \
+              -e "s|@MAC_ARM_SHA@|${mac_arm}|g" \
+              -e "s|@MAC_X64_SHA@|${mac_x64}|g" \
+              -e "s|@LINUX_ARM_SHA@|${linux_arm}|g" \
+              -e "s|@LINUX_X64_SHA@|${linux_x64}|g" \
               packaging/arsy-code.rb.tmpl > arsy-code.rb
           # A surviving placeholder means an artifact was missing. Fail here rather than
-          # publishing a formula that cannot install.
-          ! grep -q '@[A-Z_]*@' arsy-code.rb
+          # publishing a formula that cannot install. `! grep ...` would not: errexit
+          # does not apply to a command whose status is inverted.
+          if grep -q '@[A-Z_]*@' arsy-code.rb; then
+            echo "unrendered placeholder in arsy-code.rb" >&2
+            exit 1
+          fi
 
           git clone "https://x-access-token:${GH_TOKEN}@github.com/suiflex/homebrew-tap.git" tap
           mkdir -p tap/Formula
@@ -357,14 +374,25 @@ jobs:
           set -euo pipefail
           version="${TAG#v}"
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
-          sha() { tr -d '[:space:]' < "dist/arsy-$1.zip.sha256"; }
+          # `var=$(sha ...)` is a simple assignment, so a missing line aborts the
+          # step under `set -e`; inside a `sed` argument it would only have
+          # rendered an empty digest.
+          sha() {
+            awk -v name="arsy-$1" '$2 == name { found = 1; print $1 } END { exit !found }' \
+              dist/SHA256SUMS
+          }
+          win_x64="$(sha windows-x86_64.zip)"
+          win_arm64="$(sha windows-aarch64.zip)"
 
           sed -e "s|@VERSION@|${version}|g" \
               -e "s|@BASE@|${base}|g" \
-              -e "s|@WIN_X64_SHA@|$(sha windows-x86_64)|g" \
-              -e "s|@WIN_ARM64_SHA@|$(sha windows-aarch64)|g" \
+              -e "s|@WIN_X64_SHA@|${win_x64}|g" \
+              -e "s|@WIN_ARM64_SHA@|${win_arm64}|g" \
               packaging/arsy-code.json.tmpl > arsy-code.json
-          ! grep -q '@[A-Z_]*@' arsy-code.json
+          if grep -q '@[A-Z_]*@' arsy-code.json; then
+            echo "unrendered placeholder in arsy-code.json" >&2
+            exit 1
+          fi
           jq empty arsy-code.json
 
           git clone "https://x-access-token:${GH_TOKEN}@github.com/suiflex/scoop-bucket.git" bucket

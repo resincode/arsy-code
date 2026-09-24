@@ -1,0 +1,36 @@
+name: Documentation issue
+description: Report something wrong, missing, or confusing in the documentation
+labels: [documentation]
+body:
+  - type: input
+    id: location
+    attributes:
+      label: Page or file
+      description: The path under `docs/`, the README section, or the URL.
+      placeholder: e.g. docs/34-distribution.md, or the Installation section of README.md
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of problem
+      options:
+        - Wrong — it describes behaviour the code does not have
+        - Missing — something is undocumented
+        - Confusing — correct but hard to follow
+        - Broken link or example
+        - Outdated — it described the old behaviour correctly
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is wrong
+      description: Quote the passage if it is short, and say what you expected it to tell you.
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested wording
+      description: Optional. A concrete replacement is easier to review than a description of one.
