@@ -39,14 +39,37 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
-      # postinstall resolves the release archive from the manifest version, so a
-      # launcher published under a tag it does not match would download bytes
-      # from a different release.
-      - name: Verify release tag matches package version
+      # An npm version is immutable, so everything that makes the published
+      # launcher resolvable is checked before publishing rather than after.
+      # postinstall derives the archive URL from the manifest version and the
+      # tag, so the tag has to match the manifest and the release has to carry
+      # every archive and sidecar postinstall will ask for -- otherwise a
+      # permanent npm version installs from bytes that are not there.
+      - name: Verify the release backs this launcher
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           tag="${{ inputs.tag || github.event.workflow_run.head_branch }}"
           test "$tag" = "v$(node -p "require('./npm/package.json').version")"
+
+          assets="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name')"
+          missing=0
+          for archive in \
+            arsy-linux-x86_64.tar.gz arsy-linux-aarch64.tar.gz \
+            arsy-macos-x86_64.tar.gz arsy-macos-aarch64.tar.gz \
+            arsy-windows-x86_64.zip arsy-windows-aarch64.zip
+          do
+            for asset in "$archive" "$archive.sha256"; do
+              printf '%s\n' "$assets" | grep -qxF "$asset" || {
+                echo "release $tag is missing $asset" >&2
+                missing=1
+              }
+            done
+          done
+          test "$missing" = "0"
       # Trusted Publishing (OIDC): no NPM_TOKEN needed. Requires npm >= 11.5.1
       # and this exact workflow path registered as a Trusted Publisher on
       # npmjs.com for @suiflex/arsy-code.
