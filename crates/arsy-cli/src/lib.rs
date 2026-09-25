@@ -35,6 +35,7 @@ mod memory;
 #[cfg(feature = "tui")]
 mod picker;
 mod policy;
+mod probelm;
 mod progress;
 pub mod provider;
 mod review;
