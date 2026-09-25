@@ -203,6 +203,15 @@ impl HealthProbe for ModelInsight {
     }
 }
 
+/// ARSY-PRB-1000: probelm could not answer. The turn goes on without it.
+pub(crate) fn unavailable(note: &str) -> crate::Diagnostic {
+    crate::Diagnostic::warning(
+        "ARSY-PRB-1000",
+        note,
+        "check it with `arsy mcp test probelm`, or turn it off with `arsy mcp disable probelm`",
+    )
+}
+
 /// Read what probelm knows, refreshing the cache when it is stale.
 ///
 /// `allow_probe` gates `probe_models`: only a caller that can record the
@@ -276,7 +285,7 @@ pub(crate) fn gather_with(
                 if need_specs {
                     cache.specs.attempted_at_ms = now_ms;
                     match call(&mut connection, "list_models", json!({}))
-                        .and_then(|value| parse::<WireModels>(value))
+                        .and_then(parse::<WireModels>)
                     {
                         Ok(listed) => {
                             cache.specs.models = listed.models.into_iter().map(spec_of).collect();
@@ -304,7 +313,7 @@ pub(crate) fn gather_with(
                             "probe_models",
                             json!({"models": ids, "jobs": PROBE_JOBS}),
                         )
-                        .and_then(|value| parse::<WireProbe>(value))
+                        .and_then(parse::<WireProbe>)
                         {
                             Ok(probed) => {
                                 transitions =

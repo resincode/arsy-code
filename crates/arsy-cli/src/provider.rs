@@ -70,6 +70,8 @@ pub struct Resolved {
     /// Present when routing chose the endpoint rather than configuration
     /// naming it, so a caller can report which criterion decided.
     pub route: Option<routing::Decision>,
+    /// The chosen model's context window, when probelm reported one.
+    pub context_window: Option<u64>,
 }
 
 /// Fill the selected model's limit from the provider when config has none.
@@ -123,8 +125,12 @@ pub(crate) fn ensure_context_window(resolved: &mut Resolved, model: &str) -> Res
 /// the config names, then the dialect's conventional variable. The first
 /// one that holds a value wins, so exporting a key for one shell is enough to
 /// override a stored one without editing anything.
-pub fn resolve(config: &Config, requested: Option<&str>) -> Result<Resolved, Diagnostic> {
-    let (endpoint, route) = resolve_with_route(config, requested)?;
+pub fn resolve(
+    config: &Config,
+    requested: Option<&str>,
+    insight: &crate::probelm::ModelInsight,
+) -> Result<Resolved, Diagnostic> {
+    let (endpoint, route) = resolve_with_route(config, requested, insight)?;
     build(endpoint, route)
 }
 
@@ -136,6 +142,7 @@ pub fn resolve(config: &Config, requested: Option<&str>) -> Result<Resolved, Dia
 pub fn resolve_with_route(
     config: &Config,
     requested: Option<&str>,
+    insight: &crate::probelm::ModelInsight,
 ) -> Result<(Endpoint, Option<routing::Decision>), Diagnostic> {
     if let Some(id) = requested
         .or_else(|| config.provider_default())
@@ -178,7 +185,7 @@ pub fn resolve_with_route(
     // Every unnamed choice goes through routing, including the single-endpoint
     // one: that is where `model.allowed` is applied, and an endpoint whose only
     // model a ceiling excludes must not be selected just because it is alone.
-    let decision = route(config);
+    let decision = route(config, insight);
     let Some(key) = decision.key() else {
         let routing::Decision::Refused { reason, excluded } = &decision else {
             unreachable!("only a refusal has no key")
@@ -204,7 +211,9 @@ pub fn resolve_with_route(
 
 /// Rank the allowed endpoints. One candidate per endpoint, keyed by the model
 /// it would use, because an endpoint is what carries the URL and the credential.
-fn route(config: &Config) -> routing::Decision {
+/// What probelm reported fills the window, the modalities, and the health
+/// tie-break; a model it did not report is ranked as before.
+fn route(config: &Config, insight: &crate::probelm::ModelInsight) -> routing::Decision {
     // The ceilings are passed to the router rather than applied here, so an
     // endpoint policy excluded is reported as excluded instead of vanishing.
     let candidates: Vec<routing::Candidate> = config
@@ -215,10 +224,17 @@ fn route(config: &Config) -> routing::Decision {
                 .clone()
                 .or_else(|| config.model_default().map(str::to_owned))
                 .or_else(|| config.compat_model(endpoint).map(str::to_owned))?;
+            let spec = insight.spec(&model);
             let context_window = endpoint
                 .context_windows
                 .get(&model)
-                .map(|tokens| u64::from(*tokens));
+                .map(|tokens| u64::from(*tokens))
+                .or_else(|| spec.and_then(|spec| spec.context_window));
+            let modalities = if spec.is_some_and(|spec| spec.vision) {
+                std::collections::BTreeSet::from(["image".to_owned()])
+            } else {
+                std::collections::BTreeSet::new()
+            };
             Some(routing::Candidate {
                 key: arsy_kernel::provider::ModelKey {
                     provider: endpoint.id.clone(),
@@ -230,7 +246,7 @@ fn route(config: &Config) -> routing::Decision {
                 residency: None,
                 cost_micros_per_1k: None,
                 context_window,
-                modalities: std::collections::BTreeSet::new(),
+                modalities,
                 provider_features: std::collections::BTreeSet::new(),
             })
         })
@@ -250,7 +266,7 @@ fn route(config: &Config) -> routing::Decision {
         // decided by policy and by the deterministic tie-break rather than by
         // measurements this run has not taken.
         &routing::Observations::new(),
-        &arsy_kernel::pulse::ProbeObservations::new(),
+        insight,
         &routing::Preference {
             route: true,
             ..routing::Preference::default()
@@ -290,6 +306,7 @@ fn build(endpoint: Endpoint, route: Option<routing::Decision>) -> Result<Resolve
             endpoint,
             source: CredentialSource::None,
             route,
+            context_window: None,
         });
     }
     let (secret, source) = credential(&endpoint, &from_env)?;
@@ -338,6 +355,7 @@ fn build(endpoint: Endpoint, route: Option<routing::Decision>) -> Result<Resolve
         endpoint,
         source,
         route,
+        context_window: None,
     })
 }
 
@@ -1020,6 +1038,7 @@ fn extract_models(data: &serde_json::Value, id_key: &str) -> Option<DiscoveredMo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::probelm::ModelInsight;
     use arsy_kernel::config::Layer;
 
     #[cfg(feature = "tui")]
@@ -1236,7 +1255,9 @@ credential = "secret://file/local.key"
     fn an_unconfigured_or_misnamed_provider_is_a_diagnostic_not_a_fallback() {
         let empty = config("schema_version = 1\n");
         assert_eq!(
-            resolve(&empty, None).err().map(|error| error.code),
+            resolve(&empty, None, &ModelInsight::default())
+                .err()
+                .map(|error| error.code),
             Some(ARSY_PRV_1000.to_owned())
         );
 
@@ -1247,7 +1268,10 @@ schema_version = 1
 kind = "openai"
 "#,
         );
-        let message = resolve(&one, Some("typo")).err().unwrap().message;
+        let message = resolve(&one, Some("typo"), &ModelInsight::default())
+            .err()
+            .unwrap()
+            .message;
         assert!(
             message.contains("`typo`"),
             "a misspelled provider must not silently resolve to another one: {message}"
@@ -1368,7 +1392,8 @@ kind = "anthropic"
 model = "a1"
 "#,
         );
-        let (endpoint, decision) = resolve_with_route(&several, None).unwrap();
+        let (endpoint, decision) =
+            resolve_with_route(&several, None, &ModelInsight::default()).unwrap();
         assert_eq!(
             endpoint.id, "alpha",
             "the tie-break is stable, not arbitrary"
@@ -1381,7 +1406,8 @@ model = "a1"
         );
 
         // Naming one explicitly bypasses routing entirely.
-        let (endpoint, decision) = resolve_with_route(&several, Some("zeta")).unwrap();
+        let (endpoint, decision) =
+            resolve_with_route(&several, Some("zeta"), &ModelInsight::default()).unwrap();
         assert_eq!(endpoint.id, "zeta");
         assert!(
             decision.is_none(),
@@ -1406,7 +1432,8 @@ kind = "anthropic"
 model = "a1"
 "#,
         );
-        let (endpoint, decision) = resolve_with_route(&capped, None).unwrap();
+        let (endpoint, decision) =
+            resolve_with_route(&capped, None, &ModelInsight::default()).unwrap();
         assert_eq!(endpoint.id, "zeta");
         let decision = decision.expect("an unnamed choice is always routed");
         assert_eq!(
@@ -1418,7 +1445,7 @@ model = "a1"
         // A named provider that does not exist is still an error: routing must
         // never quietly substitute another one.
         assert_eq!(
-            resolve_with_route(&capped, Some("alpha"))
+            resolve_with_route(&capped, Some("alpha"), &ModelInsight::default())
                 .err()
                 .map(|error| error.code),
             Some(ARSY_PRV_1000.to_owned())
@@ -1440,7 +1467,8 @@ model = "z1"
 allowed = ["nothing-like-it"]
 "#,
         );
-        let error = resolve_with_route(&impossible, None).expect_err("nothing is routable");
+        let error = resolve_with_route(&impossible, None, &ModelInsight::default())
+            .expect_err("nothing is routable");
         assert!(
             error.message.contains("no provider could be routed to"),
             "{}",

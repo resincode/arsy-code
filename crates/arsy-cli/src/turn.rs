@@ -3831,7 +3831,11 @@ fn native_status_with_refresh(
     if !is_stale_oauth_token(error, resolved.source) {
         return Ok(outcome);
     }
-    let Ok(mut refreshed) = provider::resolve(config, Some(&resolved.endpoint.id)) else {
+    let Ok(mut refreshed) = provider::resolve(
+        config,
+        Some(&resolved.endpoint.id),
+        &crate::probelm::ModelInsight::default(),
+    ) else {
         return Ok(outcome);
     };
     refreshed
@@ -3842,6 +3846,7 @@ fn native_status_with_refresh(
         .endpoint
         .input_limits
         .extend(resolved.endpoint.input_limits.clone());
+    refreshed.context_window = resolved.context_window;
     *resolved = refreshed;
     native_status(
         resolved,
