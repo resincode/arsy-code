@@ -47,7 +47,9 @@ install, so it is offered rather than started.
 
 `probelm` is launched as `probelm mcp serve --config <home>/.config/probelm/config.json`,
 by absolute path: a bare `config.json` would be read from the working
-directory, which a repository controls. Without a home directory it stays off.
+directory, which a repository controls. probelm exits at once without the
+gateway key that file holds, so a shipped probelm starts out on only when the
+file exists; without it, or without a home directory, it stays off.
 ARSY reads two of its tools before routing, and caches both answers in
 `<ARSY_CONFIG_HOME>/probelm-cache.json` so one-shot runs share them:
 
