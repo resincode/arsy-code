@@ -200,6 +200,7 @@ fn route(config: &Config) -> routing::Decision {
         // decided by policy and by the deterministic tie-break rather than by
         // measurements this run has not taken.
         &routing::Observations::new(),
+        &arsy_kernel::pulse::ProbeObservations::new(),
         &routing::Preference {
             route: true,
             ..routing::Preference::default()
