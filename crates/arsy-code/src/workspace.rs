@@ -919,6 +919,142 @@ impl From<crate::edit::EditError> for WorkspaceError {
 mod tests {
     use super::*;
 
+    fn legacy_workspace() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let arsy = root.path().join(".arsy");
+        fs::create_dir_all(arsy.join("artifacts/ab")).unwrap();
+        fs::write(arsy.join("artifacts/ab/blob"), "evidence").unwrap();
+        fs::write(arsy.join("repo-map.json"), "{}").unwrap();
+        fs::write(arsy.join("sessions.sqlite3"), "db").unwrap();
+        fs::write(arsy.join("sessions.sqlite3-wal"), "wal").unwrap();
+        fs::write(arsy.join("sessions.sqlite3-shm"), "shm").unwrap();
+        fs::create_dir_all(arsy.join("views/agent")).unwrap();
+        fs::create_dir_all(arsy.join("eval/trial")).unwrap();
+        fs::write(arsy.join("arsy.json"), "{}").unwrap();
+        root
+    }
+
+    #[test]
+    fn migrate_moves_old_layout_into_state() {
+        let root = legacy_workspace();
+        migrate_state(root.path());
+        let read = |path: &str| fs::read_to_string(root.path().join(path)).unwrap();
+        assert_eq!(read(".arsy/state/artifacts/ab/blob"), "evidence");
+        assert_eq!(read(REPO_MAP), "{}");
+        assert_eq!(read(SESSION_STORE), "db");
+        assert_eq!(read(".arsy/state/sessions.sqlite3-wal"), "wal");
+        assert_eq!(read(".arsy/state/sessions.sqlite3-shm"), "shm");
+        for gone in [
+            "artifacts",
+            "repo-map.json",
+            "sessions.sqlite3",
+            "sessions.sqlite3-wal",
+        ] {
+            assert!(
+                !root.path().join(".arsy").join(gone).exists(),
+                "{gone} moved"
+            );
+        }
+        assert_eq!(read(".arsy/arsy.json"), "{}", "configuration stays");
+        assert_eq!(read(".arsy/state/.gitignore"), "*\n");
+    }
+
+    #[test]
+    fn migrate_leaves_views_and_eval() {
+        let root = legacy_workspace();
+        migrate_state(root.path());
+        assert!(root.path().join(".arsy/views/agent").is_dir());
+        assert!(root.path().join(".arsy/eval/trial").is_dir());
+        assert!(!root.path().join(VIEWS).exists());
+    }
+
+    #[test]
+    fn migrate_never_overwrites_existing_state() {
+        let root = legacy_workspace();
+        fs::create_dir_all(root.path().join(RUNTIME_STATE)).unwrap();
+        fs::write(root.path().join(SESSION_STORE), "new db").unwrap();
+        fs::write(root.path().join(REPO_MAP), "new map").unwrap();
+
+        migrate_state(root.path());
+
+        let read = |path: &str| fs::read_to_string(root.path().join(path)).unwrap();
+        assert_eq!(read(SESSION_STORE), "new db");
+        assert_eq!(read(REPO_MAP), "new map");
+        assert_eq!(
+            read(".arsy/sessions.sqlite3"),
+            "db",
+            "the old store stays put"
+        );
+        assert_eq!(read(".arsy/sessions.sqlite3-wal"), "wal", "with its log");
+        assert!(!root
+            .path()
+            .join(".arsy/state/sessions.sqlite3-wal")
+            .exists());
+    }
+
+    #[test]
+    fn migrate_moves_sqlite_sidecars_together_or_not_at_all() {
+        // A stale sidecar at the destination stops the move after the WAL has
+        // already gone across; the WAL has to come back with the rest.
+        let root = legacy_workspace();
+        fs::create_dir_all(root.path().join(RUNTIME_STATE)).unwrap();
+        let old = root.path().join(".arsy/sessions.sqlite3");
+        let new = root.path().join(".arsy/state/sessions.sqlite3");
+        fs::write(
+            root.path().join(".arsy/state/sessions.sqlite3-shm"),
+            "stale",
+        )
+        .unwrap();
+
+        assert!(move_session_store(&old, &new).is_err());
+
+        let read = |path: &str| fs::read_to_string(root.path().join(path)).unwrap();
+        assert_eq!(read(".arsy/sessions.sqlite3"), "db");
+        assert_eq!(
+            read(".arsy/sessions.sqlite3-wal"),
+            "wal",
+            "the moved log came back"
+        );
+        assert_eq!(read(".arsy/sessions.sqlite3-shm"), "shm");
+        assert!(!new.exists());
+        assert!(!root
+            .path()
+            .join(".arsy/state/sessions.sqlite3-wal")
+            .exists());
+    }
+
+    #[test]
+    fn a_workspace_without_old_state_gets_no_state_directory() {
+        let root = tempfile::tempdir().unwrap();
+        migrate_state(root.path());
+        assert!(!root.path().join(".arsy").exists());
+    }
+
+    #[test]
+    fn the_state_directory_ignores_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let status = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        status(&["init", "-q"]);
+        let state = ensure_state_dir(root.path(), true).unwrap();
+        fs::write(state.join("sessions.sqlite3"), "db").unwrap();
+        assert_eq!(
+            status(&["status", "--porcelain", "--untracked-files=all"]),
+            ""
+        );
+
+        let quiet = tempfile::tempdir().unwrap();
+        let state = ensure_state_dir(quiet.path(), false).unwrap();
+        assert!(!state.join(".gitignore").exists());
+    }
+
     /// Everything ARSY writes on its own sits under one directory, so an
     /// operator can delete or ignore it without touching configuration.
     #[test]

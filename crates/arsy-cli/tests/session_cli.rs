@@ -118,6 +118,38 @@ fn a_recorded_session_lists_shows_and_exports() {
     assert_eq!(code, 2);
 }
 
+/// A workspace an earlier release used keeps its history across the upgrade:
+/// the store it left directly under `.arsy/` is moved, not replaced.
+#[test]
+fn a_store_in_the_old_layout_is_moved_and_still_listed() {
+    let workspace = tempfile::tempdir().unwrap();
+    let (session, _) = recorded(workspace.path());
+    let state = workspace.path().join(arsy_code::workspace::RUNTIME_STATE);
+    for name in [
+        "sessions.sqlite3",
+        "sessions.sqlite3-wal",
+        "sessions.sqlite3-shm",
+    ] {
+        if state.join(name).exists() {
+            std::fs::rename(state.join(name), workspace.path().join(".arsy").join(name)).unwrap();
+        }
+    }
+    assert!(!workspace
+        .path()
+        .join(arsy_code::workspace::SESSION_STORE)
+        .exists());
+
+    let (code, listed) = arsy(workspace.path(), &["session", "list"]);
+
+    assert_eq!(code, 0);
+    assert_eq!(listed["sessions"][0]["session"], session.to_string());
+    assert!(workspace
+        .path()
+        .join(arsy_code::workspace::SESSION_STORE)
+        .is_file());
+    assert!(!workspace.path().join(".arsy/sessions.sqlite3").exists());
+}
+
 #[test]
 fn rewinding_and_forking_branch_without_touching_the_parent() {
     let workspace = tempfile::tempdir().unwrap();
