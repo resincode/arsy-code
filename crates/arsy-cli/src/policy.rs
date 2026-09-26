@@ -50,8 +50,11 @@ pub fn explain(
     // The artifact store is not written by an explanation; the registry needs
     // one because its executors produce evidence when they actually run.
     let artifacts = std::sync::Arc::new(
-        arsy_kernel::artifact::FileArtifactStore::open(root.join(".arsy/artifacts"), 0)
-            .map_err(|error| crate::storage_failed(error.to_string()))?,
+        arsy_kernel::artifact::FileArtifactStore::open(
+            root.join(arsy_code::workspace::ARTIFACTS),
+            0,
+        )
+        .map_err(|error| crate::storage_failed(error.to_string()))?,
     );
     // An explanation, not a turn: nothing here shares a session or task, so a
     // fresh scope is the correct isolation for whatever plan/validation state

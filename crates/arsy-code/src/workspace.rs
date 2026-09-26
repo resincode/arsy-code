@@ -558,6 +558,20 @@ const EXCLUDE_HARNESS_STATE: &str = ":(exclude).arsy/**";
 /// The same directory, as a path prefix.
 pub const HARNESS_STATE: &str = ".arsy";
 
+/// Where everything ARSY writes on its own lives, apart from the files an
+/// operator edits: deleting it loses history, never configuration.
+pub const RUNTIME_STATE: &str = ".arsy";
+/// The session event store.
+pub const SESSION_STORE: &str = ".arsy/sessions.sqlite3";
+/// Content-addressed artifacts: evidence, tool output, completion proofs.
+pub const ARTIFACTS: &str = ".arsy/artifacts";
+/// The git worktrees subagents run in.
+pub const VIEWS: &str = ".arsy/views";
+/// The trees `arsy eval` measures in.
+pub const EVAL: &str = ".arsy/eval";
+/// The repository map a turn is given as context.
+pub const REPO_MAP: &str = ".arsy/repo-map.json";
+
 fn apply_patch(view: &Path, patch: &str) -> Result<(), WorkspaceError> {
     let file = view.join(".arsy-carried.patch");
     fs::write(&file, patch)?;
@@ -809,6 +823,18 @@ impl From<crate::edit::EditError> for WorkspaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Everything ARSY writes on its own sits under one directory, so an
+    /// operator can delete or ignore it without touching configuration.
+    #[test]
+    fn every_runtime_path_is_under_the_runtime_state() {
+        for path in [SESSION_STORE, ARTIFACTS, VIEWS, EVAL, REPO_MAP] {
+            assert!(
+                Path::new(path).starts_with(RUNTIME_STATE),
+                "{path} is outside {RUNTIME_STATE}"
+            );
+        }
+    }
 
     #[test]
     fn copied_writers_are_unique_and_expired_uncommitted_views_are_reclaimed() {

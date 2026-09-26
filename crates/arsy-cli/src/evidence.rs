@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use std::{collections::HashSet, path::Path};
 
 /// Artifacts live beside the session store they are evidence for.
-const ARTIFACT_PATH: &str = ".arsy/artifacts";
+const ARTIFACT_PATH: &str = arsy_code::workspace::ARTIFACTS;
 
 /// Bytes `artifact show` renders when the caller does not set `--max-bytes`.
 /// Large enough for a command transcript, small enough not to flood a terminal.

@@ -477,9 +477,11 @@ impl<'a> Supervisor<'a> {
         else {
             return;
         };
-        let artifacts =
-            arsy_kernel::artifact::FileArtifactStore::open(self.root.join(".arsy/artifacts"), 0)
-                .ok();
+        let artifacts = arsy_kernel::artifact::FileArtifactStore::open(
+            self.root.join(arsy_code::workspace::ARTIFACTS),
+            0,
+        )
+        .ok();
         let proof = Prover::new(
             graph,
             validations.records(),
@@ -1166,7 +1168,7 @@ impl Supervisor<'_> {
             lease: lease.clone(),
             writer,
             assignment,
-            artifacts_root: self.root.join(".arsy/artifacts"),
+            artifacts_root: self.root.join(arsy_code::workspace::ARTIFACTS),
             config: self.config.clone(),
             provider: Arc::clone(&self.resolved.provider),
             endpoint: self.resolved.endpoint.id.clone(),
@@ -1722,7 +1724,7 @@ fn required_output(writer: bool) -> String {
 
 /// Where isolated views live, inside the workspace so they share its disk and
 /// its cleanup.
-const VIEW_DIRECTORY: &str = ".arsy/views";
+const VIEW_DIRECTORY: &str = arsy_code::workspace::VIEWS;
 
 /// How long a writer holds its tree before recovery may reclaim it.
 const WRITER_LEASE_MS: u64 = 30 * 60 * 1_000;

@@ -50,7 +50,7 @@ use std::{
 };
 
 /// Where the map lives, relative to the workspace root.
-pub const MAP_PATH: &str = ".arsy/repo-map.json";
+pub const MAP_PATH: &str = crate::workspace::REPO_MAP;
 
 /// What a projection may contribute to a turn.
 ///

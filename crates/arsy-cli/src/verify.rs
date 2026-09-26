@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 
 /// Artifacts live beside the session store they are evidence for, as
 /// `arsy artifact` also assumes.
-const ARTIFACT_PATH: &str = ".arsy/artifacts";
+const ARTIFACT_PATH: &str = arsy_code::workspace::ARTIFACTS;
 
 pub fn parse(arguments: &crate::ParsedArguments) -> Result<Command, Diagnostic> {
     let session = crate::only_argument(arguments.positional.clone(), "verify", "<SESSION>")?

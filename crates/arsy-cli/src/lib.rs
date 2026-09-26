@@ -104,7 +104,7 @@ use std::{
 };
 
 /// Every session of one workspace shares this store.
-const STORE_PATH: &str = ".arsy/sessions.sqlite3";
+const STORE_PATH: &str = arsy_code::workspace::SESSION_STORE;
 
 /// No provider credential is available, so the turn cannot dispatch.
 pub const ARSY_PRV_1000: &str = "ARSY-PRV-1000";
@@ -3304,7 +3304,7 @@ fn actor() -> Principal {
 /// The workspace's artifact store: where every operation's result, every
 /// exported excerpt, and every memory's claim is kept.
 fn artifact_store(root: &Path) -> Result<arsy_kernel::artifact::FileArtifactStore, Diagnostic> {
-    arsy_kernel::artifact::FileArtifactStore::open(root.join(".arsy/artifacts"), 0)
+    arsy_kernel::artifact::FileArtifactStore::open(root.join(arsy_code::workspace::ARTIFACTS), 0)
         .map_err(|error| storage_failed(error.to_string()))
 }
 
