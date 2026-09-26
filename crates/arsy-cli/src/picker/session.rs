@@ -6,6 +6,13 @@ use crate::*;
 use arsy_kernel::domain::SessionId;
 use serde_json::Value;
 use std::path::Path;
+
+/// The title the store holds for one session, which the listing below
+/// leaves out while that session has recorded no turn.
+pub(crate) fn stored_session_title(workspace: &Path, session: SessionId) -> Option<String> {
+    open_store(workspace).ok()?.session_title(session).ok()?
+}
+
 pub(crate) fn load_workspace_sessions(workspace: &Path) -> Vec<tui::SessionChoice> {
     let Ok(store) = open_store(workspace) else {
         return Vec::new();

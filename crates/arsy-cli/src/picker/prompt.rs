@@ -13,6 +13,7 @@ use super::remembered::{
 #[cfg(feature = "tui")]
 use super::session::{
     configured_providers, load_workspace_sessions, reconstruct_session_conversation,
+    stored_session_title,
 };
 #[cfg(feature = "tui")]
 use super::wizard::{
@@ -628,7 +629,10 @@ pub(crate) fn run_session_dialog(
         // action left standing.
         dialog.mode = tui::SessionDialogMode::Select;
         dialog.rename_buffer.clear();
-        dialog.reload(load_workspace_sessions(restoring.workspace));
+        // The title of the row being injected, which is the dialog's own
+        // active session rather than whatever the process moved on to.
+        let active_title = stored_session_title(restoring.workspace, dialog.active_session);
+        dialog.reload(load_workspace_sessions(restoring.workspace), active_title);
     }
     close_dialog(stdout, drawn, &changes, "")?;
     Ok(())
@@ -884,6 +888,7 @@ pub(crate) fn run_dialog(
             tui::SessionDialogState::new(
                 load_workspace_sessions(restoring.workspace),
                 restoring.state.session_id(),
+                stored_session_title(restoring.workspace, restoring.state.session_id()),
             ),
             restoring,
             stdout,
@@ -1018,6 +1023,7 @@ fn session_command<'a>(
         None => Ok(Some(Prompt::Session(tui::SessionDialogState::new(
             load_workspace_sessions(restoring.workspace),
             restoring.state.session_id(),
+            stored_session_title(restoring.workspace, restoring.state.session_id()),
         )))),
         Some("list") => {
             *sessions = load_workspace_sessions(restoring.workspace);

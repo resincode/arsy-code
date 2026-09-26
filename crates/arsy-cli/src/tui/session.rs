@@ -103,10 +103,17 @@ pub struct SessionDialogState {
 }
 
 impl SessionDialogState {
-    pub fn new(sessions: Vec<SessionChoice>, active_session: SessionId) -> Self {
+    /// `active_title` is what the store holds for the running session. The
+    /// list below cannot carry it when that session has recorded nothing yet,
+    /// so the caller reads it separately.
+    pub fn new(
+        sessions: Vec<SessionChoice>,
+        active_session: SessionId,
+        active_title: Option<String>,
+    ) -> Self {
         Self {
             selected: 0,
-            sessions: Self::including_active(sessions, active_session),
+            sessions: Self::including_active(sessions, active_session, active_title),
             mode: SessionDialogMode::Select,
             rename_buffer: String::new(),
             active_session,
@@ -119,16 +126,21 @@ impl SessionDialogState {
     /// operator still deciding — is nowhere in the store, but it is the one
     /// the operator is working in: rename and delete act on rows, so the row
     /// has to exist rather than be drawn by the renderer alone.
+    ///
+    /// A title can be saved before the first turn is, so the injected row takes
+    /// the stored one rather than none: otherwise a rename on a fresh session
+    /// is written and then drawn as if it never happened.
     fn including_active(
         sessions: Vec<SessionChoice>,
         active_session: SessionId,
+        active_title: Option<String>,
     ) -> Vec<SessionChoice> {
         if sessions.iter().any(|s| s.id == active_session) {
             return sessions;
         }
         let mut listed = vec![SessionChoice {
             id: active_session,
-            title: None,
+            title: active_title,
             events: 0,
             last_seen: "this session".to_owned(),
         }];
@@ -137,8 +149,8 @@ impl SessionDialogState {
     }
 
     /// Replace the list, keeping the active session in it.
-    pub fn reload(&mut self, sessions: Vec<SessionChoice>) {
-        self.sessions = Self::including_active(sessions, self.active_session);
+    pub fn reload(&mut self, sessions: Vec<SessionChoice>, active_title: Option<String>) {
+        self.sessions = Self::including_active(sessions, self.active_session, active_title);
         self.selected = 0;
     }
 
@@ -464,7 +476,7 @@ mod tests {
         // The active session is the list's first row, so `new` injects
         // nothing and the rows are exactly the ones the test passed.
         let active = sessions.first().map(|s| s.id).unwrap_or_default();
-        SessionDialogState::new(sessions, active)
+        SessionDialogState::new(sessions, active, None)
     }
 
     #[test]
@@ -629,11 +641,27 @@ mod tests {
         assert_eq!(dialog.mode, SessionDialogMode::Select);
     }
 
+    /// A fresh session is not in the store's list until it records a turn, but
+    /// its title is saved the moment it is renamed. The row must show it.
+    #[test]
+    fn a_session_with_no_turns_shows_the_title_it_was_given() {
+        let mut dialog = SessionDialogState::new(Vec::new(), SessionId::new(), None);
+        assert_eq!(dialog.sessions[0].title, None);
+
+        dialog.reload(Vec::new(), Some("feature work".to_owned()));
+
+        assert_eq!(dialog.sessions[0].title.as_deref(), Some("feature work"));
+        assert!(
+            dialog.render(80, false).contains("feature work"),
+            "the saved title is drawn"
+        );
+    }
+
     #[test]
     fn a_store_without_this_session_leaves_one_row() {
         // The list always holds the running session, even when the store has
         // recorded nothing: it is the row rename and delete act on.
-        let mut dialog = SessionDialogState::new(Vec::new(), SessionId::new());
+        let mut dialog = SessionDialogState::new(Vec::new(), SessionId::new(), None);
         assert_eq!(dialog.sessions.len(), 1);
         assert_eq!(dialog.sessions[0].id, dialog.active_session);
 
