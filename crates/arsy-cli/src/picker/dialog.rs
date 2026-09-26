@@ -153,28 +153,25 @@ pub(crate) fn run_hook_dialog(
     Ok(())
 }
 
-/// Apply one edited setting's new value, printing what happened. `None` when
-/// the key is unknown to this build, `Some(reason)` when the value was
-/// rejected, `Ok` state when it was written.
+/// Apply one edited setting's new value to the file `scope` names. `None`
+/// when it was written, `Some(reason)` when it was refused and nothing changed.
 #[cfg(feature = "tui")]
 pub(crate) fn apply_edited_setting(
+    root: &Path,
+    scope: tui::SettingsScope,
     row: &tui::SettingRow,
     line: &str,
-) -> Result<Option<String>, String> {
-    let Some(setting) = arsy_kernel::config::setting(&row.key) else {
-        return Ok(Some(format!(
-            "`{}` is not a setting this build can write",
-            row.key
-        )));
-    };
-    if let Err(reason) = setting.kind.check(line) {
-        return Ok(Some(reason));
+) -> Option<String> {
+    crate::settings::set(root, file_scope(scope), &row.key, line).err()
+}
+
+/// The dialog's two scopes as the configuration writer names them.
+#[cfg(feature = "tui")]
+pub(crate) const fn file_scope(scope: tui::SettingsScope) -> mcp::Scope {
+    match scope {
+        tui::SettingsScope::User => mcp::Scope::User,
+        tui::SettingsScope::Project => mcp::Scope::Workspace,
     }
-    write_config(|config| {
-        let (path, leaf) = setting_path(&row.key)?;
-        config_edit::set(config, &path, leaf, setting.kind.to_json(line))
-    })
-    .map(|_| None)
 }
 /// One ecosystem's declared skills, as the dialog offers them.
 ///
@@ -355,6 +352,15 @@ pub(crate) fn setting_rows(invocation: &Invocation) -> Result<Vec<tui::SettingRo
                     .collect(),
                 kind,
                 set: view.set,
+                origin: view
+                    .origin
+                    .as_ref()
+                    .map(|origin| match origin.layer {
+                        arsy_kernel::config::Layer::Workspace
+                        | arsy_kernel::config::Layer::Nested => "project".to_owned(),
+                        layer => layer.as_str().to_owned(),
+                    })
+                    .unwrap_or_default(),
             }
         })
         .collect())
@@ -370,6 +376,7 @@ pub(crate) fn run_settings_dialog(
     theme: &mut String,
     roles: &std::collections::BTreeMap<String, String>,
 ) -> Result<(), Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
     let mut rows = setting_rows(invocation)?;
     let mut dialog = tui::SettingsDialogState::new(rows);
     let mut changes: Vec<String> = Vec::new();
@@ -389,19 +396,22 @@ pub(crate) fn run_settings_dialog(
             Keyed::Acted(tui::SettingsAction::Close) => break,
             Keyed::Acted(tui::SettingsAction::Reset(index)) => {
                 let row = dialog.rows[index].clone();
-                let removed = match setting_path(&row.key) {
-                    Ok((path, _leaf)) => write_config(|config| config_edit::remove(config, &path)),
-                    Err(reason) => Err(reason),
-                };
-                match removed {
+                let scope = dialog.scope;
+                match crate::settings::unset(&root, file_scope(scope), &row.key) {
                     Ok(_) => {
-                        changes.push(format!("`{}` back to its default.", row.key));
+                        changes.push(format!(
+                            "`{}` removed from the {} settings.",
+                            row.key,
+                            scope.label()
+                        ));
                         dialog.notice = Some(format!(
-                            "`{}` removed; it stands at its default {}.",
-                            row.key, row.default
+                            "`{}` removed from the {} settings; another layer or the default {} decides it.",
+                            row.key,
+                            scope.label(),
+                            row.default
                         ));
                     }
-                    Err(reason) => dialog.notice = Some(reason),
+                    Err(reason) => dialog.notice = Some(tui::safe_text(&reason)),
                 }
                 rows = setting_rows(invocation)?;
                 dialog.reload(rows);
@@ -409,9 +419,15 @@ pub(crate) fn run_settings_dialog(
             }
             Keyed::Acted(tui::SettingsAction::Apply(index, pending)) => {
                 let row = dialog.rows[index].clone();
-                let notice = match apply_edited_setting(&row, &pending) {
-                    Ok(None) => format!("`{}` set to {}.", row.key, tui::safe_text(&pending)),
-                    Ok(Some(reason)) | Err(reason) => tui::safe_text(&reason),
+                let scope = dialog.scope;
+                let notice = match apply_edited_setting(&root, scope, &row, &pending) {
+                    None => format!(
+                        "`{}` set to {} in the {} settings.",
+                        row.key,
+                        tui::safe_text(&pending),
+                        scope.label()
+                    ),
+                    Some(reason) => tui::safe_text(&reason),
                 };
                 dialog.notice = Some(notice);
                 // Two settings cannot wait for a restart, because they change
@@ -511,15 +527,6 @@ pub(crate) fn apply_live_setting(
         }
         _ => None,
     }
-}
-
-/// The dotted key as the path its object sits at and the leaf that names it.
-#[cfg(feature = "tui")]
-pub(crate) fn setting_path(key: &str) -> Result<(Vec<&str>, &str), String> {
-    let (path, leaf) = key
-        .rsplit_once('.')
-        .ok_or_else(|| format!("`{key}` is not a dotted key this build can write"))?;
-    Ok((path.split('.').collect(), leaf))
 }
 
 /// The configuration resolved for this workspace, for a dialog that needs to

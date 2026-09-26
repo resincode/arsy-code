@@ -41,6 +41,7 @@ mod review;
 mod run;
 mod serve;
 mod session;
+mod settings;
 mod subagent;
 mod telemetry;
 mod transcript;
@@ -3776,9 +3777,16 @@ mod tests {
             choices: Vec::new(),
             kind: tui::SettingKind::Choice,
             set: false,
+            origin: String::new(),
         };
+        let workspace = tempfile::tempdir().unwrap();
 
-        let applied = picker::dialog::apply_edited_setting(&row, "classic");
+        let applied = picker::dialog::apply_edited_setting(
+            workspace.path(),
+            tui::SettingsScope::User,
+            &row,
+            "classic",
+        );
         let written = std::fs::read_to_string(&path).unwrap();
 
         let reset =
@@ -3788,7 +3796,7 @@ mod tests {
             Some(value) => std::env::set_var(arsy_kernel::config::CONFIG_HOME_VAR, value),
             None => std::env::remove_var(arsy_kernel::config::CONFIG_HOME_VAR),
         }
-        assert_eq!(applied, Ok(None));
+        assert_eq!(applied, None);
         assert!(written.contains("classic"), "not written: {written}");
         assert!(reset.is_ok());
         assert!(
