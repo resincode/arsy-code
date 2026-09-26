@@ -3369,10 +3369,15 @@ fn workspace_root(requested: &Path) -> Result<PathBuf, Diagnostic> {
 }
 
 fn open_store(workspace: &Path) -> Result<Arc<SqliteEventStore>, Diagnostic> {
-    // A configuration that does not load still gets its store: the loader's
-    // own error is reported by whatever reads it next, not by the store.
-    let ignore_itself =
-        load_config(workspace, workspace, None).map_or(true, |config| config.state_gitignore());
+    // The setting only matters while `.gitignore` is missing, so the layers —
+    // which include reading Claude's and Codex's files — are loaded then and
+    // not on every open. A configuration that does not load still gets its
+    // store: the loader's own error is reported by whatever reads it next.
+    let ignore_file = workspace
+        .join(arsy_code::workspace::RUNTIME_STATE)
+        .join(".gitignore");
+    let ignore_itself = !ignore_file.exists()
+        && load_config(workspace, workspace, None).map_or(true, |config| config.state_gitignore());
     arsy_code::workspace::ensure_state_dir(workspace, ignore_itself)
         .map_err(|error| storage_failed(error.to_string()))?;
     let path = workspace.join(STORE_PATH);
