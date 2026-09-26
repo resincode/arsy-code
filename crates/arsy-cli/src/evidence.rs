@@ -32,9 +32,21 @@ const MAX_EXPORT_BYTES: u64 = 64 * 1024 * 1024;
 /// is refused rather than decoded: that shape is a decompression bomb.
 const MAX_EXPANSION_RATIO: u64 = 100;
 
-/// Default `--retention`: how long an artifact nothing references is kept
-/// before `gc --apply` may remove it.
-const DEFAULT_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+/// The retention a store is opened with when it is only read: nothing is
+/// collected on that path, so the value only has to be a sane one.
+const DEFAULT_RETENTION_MS: u64 =
+    arsy_kernel::config::DEFAULT_ARTIFACT_RETENTION_DAYS as u64 * 24 * 60 * 60 * 1000;
+
+/// `storage.artifact_retention_days`, the retention `gc` uses when no
+/// `--retention` is given. A configuration that does not load falls back to
+/// the built-in default rather than stopping a collection that only reports.
+fn configured_retention_ms(invocation: &Invocation, root: &std::path::Path) -> u64 {
+    let days = crate::load_config(root, root, invocation.config.as_deref()).map_or(
+        arsy_kernel::config::DEFAULT_ARTIFACT_RETENTION_DAYS,
+        |config| config.artifact_retention_days(),
+    );
+    days as u64 * 24 * 60 * 60 * 1000
+}
 
 pub fn parse_artifact(arguments: &crate::ParsedArguments) -> Result<Command, Diagnostic> {
     let mut positional = arguments.positional.clone();
@@ -74,10 +86,11 @@ pub fn parse_gc(arguments: &crate::ParsedArguments) -> Result<Command, Diagnosti
     }
     Ok(Command::Gc {
         apply: arguments.apply,
-        retention_ms: match &arguments.retention {
-            Some(value) => duration_ms(value)?,
-            None => DEFAULT_RETENTION_MS,
-        },
+        retention_ms: arguments
+            .retention
+            .as_deref()
+            .map(duration_ms)
+            .transpose()?,
     })
 }
 
@@ -337,10 +350,11 @@ fn referenced_ids(history: &[EventEnvelope]) -> Vec<ArtifactId> {
 pub fn collect(
     invocation: &Invocation,
     apply: bool,
-    retention_ms: u64,
+    retention_ms: Option<u64>,
     emitter: &mut Emitter,
 ) -> Result<i32, Diagnostic> {
     let root = crate::workspace_root(&invocation.workspace)?;
+    let retention_ms = retention_ms.unwrap_or_else(|| configured_retention_ms(invocation, &root));
     let store = open(&root, retention_ms)?;
     let reachable = reachable_artifacts(&root)?;
     let now = arsy_kernel::artifact::unix_time_ms();
@@ -482,7 +496,10 @@ mod tests {
             panic!("gc parses to Gc");
         };
         assert!(!apply, "gc must never delete without --apply");
-        assert_eq!(retention_ms, DEFAULT_RETENTION_MS);
+        assert_eq!(
+            retention_ms, None,
+            "storage.artifact_retention_days decides"
+        );
 
         let id = ArtifactId::new().to_string();
         assert!(crate::parse(["artifact".to_owned(), "export".to_owned(), id.clone()]).is_err());

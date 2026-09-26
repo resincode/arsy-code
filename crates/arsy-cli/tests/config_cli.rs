@@ -98,3 +98,39 @@ fn a_value_the_registry_refuses_changes_nothing() {
     assert_ne!(code, 0);
     assert!(!workspace.path().join(".arsy/arsy.json").exists());
 }
+
+/// With `storage.state_gitignore` off, the state directory is created but
+/// leaves the repository's ignore rules to the operator.
+#[test]
+fn state_gitignore_off_writes_no_ignore_file() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (code, _) = arsy(
+        workspace.path(),
+        home.path(),
+        &[
+            "config",
+            "set",
+            "storage.state_gitignore",
+            "false",
+            "--scope",
+            "workspace",
+        ],
+    );
+    assert_eq!(code, 0);
+
+    let (code, _) = arsy(workspace.path(), home.path(), &["session", "list"]);
+    assert_eq!(code, 0);
+    let state = workspace.path().join(".arsy/state");
+    assert!(state.is_dir());
+    assert!(!state.join(".gitignore").exists());
+
+    let fresh = tempfile::tempdir().unwrap();
+    let (code, _) = arsy(fresh.path(), home.path(), &["session", "list"]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        std::fs::read_to_string(fresh.path().join(".arsy/state/.gitignore")).unwrap(),
+        "*\n",
+        "on by default"
+    );
+}

@@ -612,7 +612,9 @@ const LEGACY_SESSION_STORE: &str = ".arsy/sessions.sqlite3";
 pub fn migrate_state(root: &Path) {
     let has_legacy = LEGACY_STATE.iter().any(|(old, _)| root.join(old).exists())
         || root.join(LEGACY_SESSION_STORE).exists();
-    if !has_legacy || ensure_state_dir(root, true).is_err() {
+    // The directory only: whether it ignores itself is configuration, which
+    // the store decides when it opens, a moment later.
+    if !has_legacy || ensure_state_dir(root, false).is_err() {
         return;
     }
     for (old, new) in LEGACY_STATE {
@@ -956,7 +958,9 @@ mod tests {
             );
         }
         assert_eq!(read(".arsy/arsy.json"), "{}", "configuration stays");
-        assert_eq!(read(".arsy/state/.gitignore"), "*\n");
+        // Whether it ignores itself is configuration, which the store applies
+        // when it opens; the move only makes the directory.
+        assert!(!root.path().join(".arsy/state/.gitignore").exists());
     }
 
     #[test]

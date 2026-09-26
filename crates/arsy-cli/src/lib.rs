@@ -360,7 +360,8 @@ pub enum Command {
     },
     Gc {
         apply: bool,
-        retention_ms: u64,
+        /// `--retention`, or `None` for `storage.artifact_retention_days`.
+        retention_ms: Option<u64>,
     },
     MemoryList {
         scope: Option<String>,
@@ -3341,7 +3342,11 @@ fn workspace_root(requested: &Path) -> Result<PathBuf, Diagnostic> {
 }
 
 fn open_store(workspace: &Path) -> Result<Arc<SqliteEventStore>, Diagnostic> {
-    arsy_code::workspace::ensure_state_dir(workspace, true)
+    // A configuration that does not load still gets its store: the loader's
+    // own error is reported by whatever reads it next, not by the store.
+    let ignore_itself =
+        load_config(workspace, workspace, None).map_or(true, |config| config.state_gitignore());
+    arsy_code::workspace::ensure_state_dir(workspace, ignore_itself)
         .map_err(|error| storage_failed(error.to_string()))?;
     let path = workspace.join(STORE_PATH);
     SqliteEventStore::open(&path, Durability::Normal)
