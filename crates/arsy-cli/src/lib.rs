@@ -694,7 +694,9 @@ fn collect_arguments<I: IntoIterator<Item = String>>(
             }
             continue;
         }
-        if apply_value_flag(&argument, &mut parsed, &mut arguments)? {
+        if apply_value_flag(&argument, &mut parsed, &mut arguments)?
+            || apply_management_flag(&argument, &mut parsed, &mut arguments)?
+        {
             continue;
         }
         if argument.starts_with("--") {
@@ -729,6 +731,22 @@ fn apply_switch(argument: &str, parsed: &mut ParsedArguments) -> bool {
         _ => return false,
     }
     true
+}
+
+/// The flags `arsy storage` and `arsy hook add` take, apart from the shared
+/// table above so each stays a list short enough to read.
+fn apply_management_flag(
+    argument: &str,
+    parsed: &mut ParsedArguments,
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<bool, Diagnostic> {
+    let slot = match argument {
+        "--confirm" => &mut parsed.confirm,
+        "--matcher" => &mut parsed.matcher,
+        _ => return Ok(false),
+    };
+    *slot = Some(value(arguments, argument)?);
+    Ok(true)
 }
 
 fn apply_value_flag(
@@ -767,7 +785,6 @@ fn apply_value_flag(
         "--to" => parsed.to = Some(value(arguments, argument)?),
         "--at" => parsed.at = Some(value(arguments, argument)?),
         "--retention" => parsed.retention = Some(value(arguments, argument)?),
-        "--confirm" => parsed.confirm = Some(value(arguments, argument)?),
         "--backup" => parsed.backup = Some(PathBuf::from(value(arguments, argument)?)),
         "--tier" => parsed.tier = Some(value(arguments, argument)?),
         "--base" => parsed.base = Some(value(arguments, argument)?),
@@ -781,7 +798,6 @@ fn apply_value_flag(
         "--transport" => parsed.transport = Some(value(arguments, argument)?),
         "--protocol" => parsed.protocol = Some(value(arguments, argument)?),
         "--command" => parsed.command = Some(value(arguments, argument)?),
-        "--matcher" => parsed.matcher = Some(value(arguments, argument)?),
         "--url" => parsed.url = Some(value(arguments, argument)?),
         "--scope" => parsed.scope = Some(value(arguments, argument)?),
         "--timeout" => {
