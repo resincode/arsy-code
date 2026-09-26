@@ -170,14 +170,35 @@ impl CredentialStore for WithdrawnOsStore {
 pub struct FileCredentialStore;
 
 impl FileCredentialStore {
-    /// Where a handle name points. A bare name lives beside the user
-    /// configuration so a handle stays portable between machines.
+    /// Where a handle name points. A bare name lives in the `secrets`
+    /// directory of the configuration home, so a handle stays portable
+    /// between machines.
+    ///
+    /// That directory is made owner-only here rather than by each writer, so
+    /// no path that hands out a credential location can leave it readable. A
+    /// name that would walk out of it is returned unresolved for the caller's
+    /// own name check to refuse, and never moves anything.
     pub fn path(name: &str) -> Option<PathBuf> {
         let path = Path::new(name);
         if path.is_absolute() {
             return Some(path.to_path_buf());
         }
-        Some(crate::config::user_config()?.with_file_name(name))
+        if Self::check_name(name).is_err() {
+            return Some(crate::config::config_home()?.join(name));
+        }
+        let home = crate::config::config_home()?;
+        Self::owner_only_directory(&home.join(crate::config::SECRETS_DIRECTORY));
+        crate::config::home_file(crate::config::SECRETS_DIRECTORY, name)
+    }
+
+    /// Create the secrets directory when missing and restrict it to its owner.
+    fn owner_only_directory(directory: &Path) {
+        let _ = std::fs::create_dir_all(directory);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700));
+        }
     }
 
     fn handle(name: &str) -> SecretHandle {

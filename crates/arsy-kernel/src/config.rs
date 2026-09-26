@@ -3357,6 +3357,35 @@ pub fn user_config() -> Option<PathBuf> {
     Some(config_home()?.join(CONFIG_FILE))
 }
 
+/// Credentials, under the configuration home: owner-only, and written only
+/// through the credential commands.
+pub const SECRETS_DIRECTORY: &str = "secrets";
+/// Anything rebuilt on demand; safe to delete.
+pub const CACHE_DIRECTORY: &str = "cache";
+/// What the operator last picked in the terminal: model, effort, theme.
+pub const STATE_DIRECTORY: &str = "state";
+
+/// A file ARSY keeps for itself under the configuration home, in one of the
+/// directories above, rather than beside `arsy.json`.
+///
+/// Releases before that split kept these files directly in the home. The first
+/// time one is asked for, a file still at the old place is renamed into the
+/// new one, and never over a file already there. A failed move leaves the old
+/// file where it was and the new path is returned regardless: what is missing
+/// there reads as missing, which is what it would be without the move.
+pub fn home_file(directory: &str, name: &str) -> Option<PathBuf> {
+    let home = config_home()?;
+    let target = home.join(directory).join(name);
+    let legacy = home.join(name);
+    if !target.exists() && legacy.is_file() {
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::rename(&legacy, &target);
+    }
+    Some(target)
+}
+
 /// The directory the operator's own ARSY state lives in: `~/.arsy`, or whatever
 /// `ARSY_CONFIG_HOME` names.
 ///
