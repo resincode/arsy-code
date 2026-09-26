@@ -132,6 +132,8 @@ Usage:
   arsy eval <SUITE> [--strict]  run an evaluation fixture; --strict needs its revision
   arsy compat explain <KIND> explain claude, codex, omp, or agents imports
   arsy config explain [KEY]  show effective configuration and where it came from
+  arsy config set <KEY> <VALUE> [--scope <user|workspace>]  write one setting
+  arsy config unset <KEY> [--scope <user|workspace>]  remove one setting
   arsy session list [--limit <N>]      list recorded sessions in this workspace
   arsy session show <ID> [--turns] [--evidence]   show one session's projection
   arsy session export <ID> [--out <PATH>]         export canonical events as JSONL
@@ -304,6 +306,17 @@ pub enum Command {
     /// `arsy config explain [KEY]`: effective values and where each came from.
     ConfigExplain {
         key: Option<String>,
+    },
+    /// `arsy config set <KEY> <VALUE> [--scope user|workspace]`.
+    ConfigSet {
+        key: String,
+        value: String,
+        scope: mcp::Scope,
+    },
+    /// `arsy config unset <KEY> [--scope user|workspace]`.
+    ConfigUnset {
+        key: String,
+        scope: mcp::Scope,
     },
     /// `arsy verify <SESSION>`: rebuild the completion proof and report it.
     Verify {
@@ -576,7 +589,7 @@ fn parse_owned(name: &str, mut parsed: ParsedArguments) -> Result<Command, Diagn
             ecosystem: compatibility_kind(parsed.positional)?,
         },
         "auth" => parse_auth(parsed.positional, parsed.handle, parsed.force)?,
-        "config" => parse_config(parsed.positional)?,
+        "config" => parse_config(parsed.positional, parsed.scope.as_deref())?,
         "hook" => integrations::parse("hook", parsed.positional, parsed.source, parsed.event)?,
         other => return Err(unknown_command(other)),
     })
@@ -865,13 +878,24 @@ fn inspection_args(line: &str) -> Option<Vec<String>> {
 
 /// `config explain [KEY]`. Only `explain` exists; the rest of the documented
 /// `config` surface belongs to a later phase.
-fn parse_config(positional: Vec<String>) -> Result<Command, Diagnostic> {
+fn parse_config(positional: Vec<String>, scope: Option<&str>) -> Result<Command, Diagnostic> {
     match positional.first().map(String::as_str) {
         Some("explain") if positional.len() <= 2 => Ok(Command::ConfigExplain {
             key: positional.into_iter().nth(1),
         }),
         Some("explain") => Err(usage("config explain accepts only [KEY]")),
-        _ => Err(usage("config requires explain")),
+        Some("set") if positional.len() == 3 => Ok(Command::ConfigSet {
+            key: positional[1].clone(),
+            value: positional[2].clone(),
+            scope: mcp::Scope::parse(scope)?,
+        }),
+        Some("set") => Err(usage("config set requires <KEY> <VALUE>")),
+        Some("unset") if positional.len() == 2 => Ok(Command::ConfigUnset {
+            key: positional[1].clone(),
+            scope: mcp::Scope::parse(scope)?,
+        }),
+        Some("unset") => Err(usage("config unset requires <KEY>")),
+        _ => Err(usage("config requires explain, set, or unset")),
     }
 }
 
@@ -1367,6 +1391,10 @@ fn execute_inspect(
             emitter,
         ),
         Command::ConfigExplain { key } => config_explain(invocation, key.as_deref(), emitter),
+        Command::ConfigSet { key, value, scope } => {
+            config_write(invocation, key, Some(value), *scope, emitter)
+        }
+        Command::ConfigUnset { key, scope } => config_write(invocation, key, None, *scope, emitter),
         Command::Review { base, strict } => review::run(invocation, base, *strict, emitter),
         Command::PolicyExplain {
             operation,
@@ -1553,6 +1581,44 @@ fn config_explain(
         report
     } else {
         human_config(&report, key)
+    });
+    Ok(0)
+}
+
+/// `arsy config set` and `unset`: one setting, written to one layer's file.
+fn config_write(
+    invocation: &Invocation,
+    key: &str,
+    value: Option<&str>,
+    scope: mcp::Scope,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
+    let written = match value {
+        Some(value) => settings::set(&root, scope, key, value),
+        None => settings::unset(&root, scope, key),
+    };
+    let file = written.map_err(|reason| {
+        Diagnostic::error(
+            ARSY_CFG_1000,
+            reason,
+            "`arsy config explain` lists every key and the values it accepts",
+        )
+    })?;
+    let message = match value {
+        Some(value) => format!("`{key}` set to {value} in {}.", file.display()),
+        None => format!("`{key}` removed from {}.", file.display()),
+    };
+    emitter.result(if emitter.output == Output::Json {
+        json!({
+            "key": key,
+            "value": value,
+            "scope": scope.as_str(),
+            "file": file,
+            "message": message,
+        })
+    } else {
+        json!({"configuration": message})
     });
     Ok(0)
 }
