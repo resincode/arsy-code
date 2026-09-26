@@ -29,6 +29,7 @@ mod connector;
 mod eval;
 mod evidence;
 mod extensions;
+mod guard;
 mod integrations;
 mod mcp;
 mod memory;
@@ -172,6 +173,8 @@ Usage:
   arsy mcp remove|enable|disable <NAME> [--scope <user|workspace>]
   arsy mcp test <NAME> [--timeout <SECONDS>]  connect, negotiate, disconnect
   arsy hook list [--event <NAME>]      list lifecycle hooks and what runs
+  arsy hook add --event <EVENT> [--matcher <PATTERN>] --command <CMD> [--timeout <SECONDS>] [--scope <user|workspace>]
+  arsy hook remove <EVENT> <POSITION> [--scope <user|workspace>]  remove one from ARSY's guard.json
   arsy auth set <PROVIDER>   store a credential in the OS credential store
   arsy auth login <PROVIDER> sign in to a provider through its OAuth client
   arsy auth list             list credential handles (never values)
@@ -310,6 +313,10 @@ pub enum Command {
     /// `arsy config explain [KEY]`: effective values and where each came from.
     ConfigExplain {
         key: Option<String>,
+    },
+    /// `arsy hook add|remove`: edit ARSY's own `guard.json`.
+    Hook {
+        request: guard::Request,
     },
     /// `arsy storage [clean <TARGET> | reset-history --confirm <NAME>]`.
     Storage {
@@ -600,7 +607,10 @@ fn parse_owned(name: &str, mut parsed: ParsedArguments) -> Result<Command, Diagn
         },
         "auth" => parse_auth(parsed.positional, parsed.handle, parsed.force)?,
         "config" => parse_config(parsed.positional, parsed.scope.as_deref())?,
-        "hook" => integrations::parse("hook", parsed.positional, parsed.source, parsed.event)?,
+        "hook" => match guard::parse(&parsed) {
+            Some(command) => command?,
+            None => integrations::parse("hook", parsed.positional, parsed.source, parsed.event)?,
+        },
         other => return Err(unknown_command(other)),
     })
 }
@@ -655,6 +665,8 @@ struct ParsedArguments {
     transport: Option<String>,
     protocol: Option<String>,
     command: Option<String>,
+    /// `arsy hook add --matcher`: which subjects a hook applies to.
+    matcher: Option<String>,
     url: Option<String>,
     scope: Option<String>,
     timeout: Option<u64>,
@@ -769,6 +781,7 @@ fn apply_value_flag(
         "--transport" => parsed.transport = Some(value(arguments, argument)?),
         "--protocol" => parsed.protocol = Some(value(arguments, argument)?),
         "--command" => parsed.command = Some(value(arguments, argument)?),
+        "--matcher" => parsed.matcher = Some(value(arguments, argument)?),
         "--url" => parsed.url = Some(value(arguments, argument)?),
         "--scope" => parsed.scope = Some(value(arguments, argument)?),
         "--timeout" => {
@@ -1405,6 +1418,7 @@ fn execute_inspect(
         ),
         Command::ConfigExplain { key } => config_explain(invocation, key.as_deref(), emitter),
         Command::Storage { request } => storage::run(invocation, request, emitter),
+        Command::Hook { request } => guard::run(invocation, request, emitter),
         Command::ConfigSet { key, value, scope } => {
             config_write(invocation, key, Some(value), *scope, emitter)
         }
