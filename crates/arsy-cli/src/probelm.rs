@@ -249,12 +249,52 @@ pub(crate) fn gather_with(
     };
     let cache_path = cache_home.map(|home| home.join(CACHE_FILE));
     let mut cache = cache_path.as_deref().map(read_cache).unwrap_or_default();
-    let mut note = None;
-    let mut dirty = false;
-    let mut transitions = Vec::new();
-
     let opted = config.health_probe_endpoints();
-    let targets: Vec<ModelKey> = config
+    let targets = probe_targets(config);
+    let need_specs = cache.specs.models.is_empty()
+        || now_ms >= cache.specs.attempted_at_ms.saturating_add(SPECS_TTL_MS);
+    let need_health = allow_probe
+        && cache_home.is_some()
+        && !targets.is_empty()
+        && now_ms >= cache.health.attempted_at_ms.saturating_add(HEALTH_TTL_MS);
+    if !(need_specs || need_health) {
+        return insight_from(cache, &targets, opted, Vec::new(), None);
+    }
+
+    let (mut note, transitions) = match Connection::open(server, None, channels) {
+        Err(error) => {
+            cache.specs.attempted_at_ms = now_ms;
+            if need_health {
+                cache.health.attempted_at_ms = now_ms;
+            }
+            (Some(format!("probelm is unavailable: {error}")), Vec::new())
+        }
+        Ok(mut connection) => {
+            let specs_note = need_specs
+                .then(|| refresh_specs(&mut cache, &mut connection, now_ms))
+                .flatten();
+            let (health_note, transitions) = if need_health {
+                refresh_health(&mut cache, &mut connection, &targets, now_ms)
+            } else {
+                (None, Vec::new())
+            };
+            let _ = connection.close();
+            (health_note.or(specs_note), transitions)
+        }
+    };
+    if let Some(path) = &cache_path {
+        cache.schema_version = CACHE_SCHEMA;
+        if let Err(error) = write_cache(path, &cache) {
+            note.get_or_insert_with(|| format!("the probelm cache could not be written: {error}"));
+        }
+    }
+    insight_from(cache, &targets, opted, transitions, note)
+}
+
+/// One key per model of every endpoint the operator opted in to probing.
+fn probe_targets(config: &Config) -> Vec<ModelKey> {
+    let opted = config.health_probe_endpoints();
+    config
         .all_endpoints()
         .filter(|endpoint| opted.contains(&endpoint.id))
         .flat_map(|endpoint| {
@@ -263,85 +303,68 @@ pub(crate) fn gather_with(
                 model: model.clone(),
             })
         })
+        .collect()
+}
+
+/// `list_models` into the cache. Returns why it failed, keeping the old specs.
+fn refresh_specs(cache: &mut Cache, connection: &mut Connection, now_ms: u64) -> Option<String> {
+    cache.specs.attempted_at_ms = now_ms;
+    match call(connection, "list_models", json!({})).and_then(parse::<WireModels>) {
+        Ok(listed) => {
+            cache.specs.models = listed.models.into_iter().map(spec_of).collect();
+            cache.specs.fetched_at_ms = Some(now_ms);
+            None
+        }
+        Err(error) => Some(format!("probelm list_models failed: {error}")),
+    }
+}
+
+/// `probe_models` for every target probelm lists, folded into the cache.
+/// A target it does not list is skipped, and with none the window is left
+/// alone so the next run tries again once specs are known.
+fn refresh_health(
+    cache: &mut Cache,
+    connection: &mut Connection,
+    targets: &[ModelKey],
+    now_ms: u64,
+) -> (Option<String>, Vec<HealthChanged>) {
+    let matched_ids: Vec<(ModelKey, String)> = targets
+        .iter()
+        .filter_map(|key| {
+            matched(&cache.specs.models, &key.model).map(|spec| (key.clone(), spec.id.clone()))
+        })
         .collect();
-    let need_specs = cache.specs.models.is_empty()
-        || now_ms >= cache.specs.attempted_at_ms.saturating_add(SPECS_TTL_MS);
-    let need_health = allow_probe
-        && cache_home.is_some()
-        && !targets.is_empty()
-        && now_ms >= cache.health.attempted_at_ms.saturating_add(HEALTH_TTL_MS);
-
-    if need_specs || need_health {
-        dirty = true;
-        match Connection::open(server, None, channels) {
-            Err(error) => {
-                note = Some(format!("probelm is unavailable: {error}"));
-                cache.specs.attempted_at_ms = now_ms;
-                if need_health {
-                    cache.health.attempted_at_ms = now_ms;
-                }
-            }
-            Ok(mut connection) => {
-                if need_specs {
-                    cache.specs.attempted_at_ms = now_ms;
-                    match call(&mut connection, "list_models", json!({}))
-                        .and_then(parse::<WireModels>)
-                    {
-                        Ok(listed) => {
-                            cache.specs.models = listed.models.into_iter().map(spec_of).collect();
-                            cache.specs.fetched_at_ms = Some(now_ms);
-                        }
-                        Err(error) => note = Some(format!("probelm list_models failed: {error}")),
-                    }
-                }
-                if need_health {
-                    let matched_ids: Vec<(ModelKey, String)> = targets
-                        .iter()
-                        .filter_map(|key| {
-                            matched(&cache.specs.models, &key.model)
-                                .map(|spec| (key.clone(), spec.id.clone()))
-                        })
-                        .collect();
-                    if !matched_ids.is_empty() {
-                        let mut ids: Vec<&str> =
-                            matched_ids.iter().map(|(_, id)| id.as_str()).collect();
-                        ids.sort_unstable();
-                        ids.dedup();
-                        cache.health.attempted_at_ms = now_ms;
-                        match call(
-                            &mut connection,
-                            "probe_models",
-                            json!({"models": ids, "jobs": PROBE_JOBS}),
-                        )
-                        .and_then(parse::<WireProbe>)
-                        {
-                            Ok(probed) => {
-                                transitions =
-                                    apply_probe(&mut cache, &matched_ids, &probed, now_ms);
-                            }
-                            Err(error) => {
-                                note = Some(format!("probelm probe_models failed: {error}"));
-                            }
-                        }
-                    }
-                }
-                let _ = connection.close();
-            }
-        }
+    if matched_ids.is_empty() {
+        return (None, Vec::new());
     }
-
-    if dirty {
-        if let Some(path) = &cache_path {
-            cache.schema_version = CACHE_SCHEMA;
-            if let Err(error) = write_cache(path, &cache) {
-                note.get_or_insert_with(|| {
-                    format!("the probelm cache could not be written: {error}")
-                });
-            }
-        }
+    let mut ids: Vec<&str> = matched_ids.iter().map(|(_, id)| id.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    cache.health.attempted_at_ms = now_ms;
+    match call(
+        connection,
+        "probe_models",
+        json!({"models": ids, "jobs": PROBE_JOBS}),
+    )
+    .and_then(parse::<WireProbe>)
+    {
+        Ok(probed) => (None, apply_probe(cache, &matched_ids, &probed, now_ms)),
+        Err(error) => (
+            Some(format!("probelm probe_models failed: {error}")),
+            Vec::new(),
+        ),
     }
+}
 
-    let mut health = ProbeObservations::new();
+/// The insight a cache supports. Health for an endpoint no longer opted in
+/// is dropped, so it never penalizes a route.
+fn insight_from(
+    cache: Cache,
+    targets: &[ModelKey],
+    opted: &std::collections::BTreeSet<String>,
+    transitions: Vec<HealthChanged>,
+    note: Option<String>,
+) -> ModelInsight {
     let health_entries: Vec<HealthEntry> = cache
         .health
         .models
@@ -352,6 +375,7 @@ pub(crate) fn gather_with(
                 .any(|key| key.provider == entry.provider && key.model == entry.model)
         })
         .collect();
+    let mut health = ProbeObservations::new();
     for entry in &health_entries {
         health.observe(
             entry_key(entry),
