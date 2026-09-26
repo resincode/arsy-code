@@ -42,6 +42,19 @@ pub enum LifecycleEvent {
     BeforeCompaction,
 }
 
+/// Every event name a Claude-shaped hook file may use that this engine runs,
+/// in the order a person meets them in a turn. `from_external` maps each.
+pub const EXTERNAL_EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "PreCompact",
+    "Stop",
+    "SessionEnd",
+];
+
 impl LifecycleEvent {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -1060,6 +1073,13 @@ pub fn describe(rule: &HookRule) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_offered_event_is_one_the_engine_runs() {
+        for name in EXTERNAL_EVENTS {
+            assert!(LifecycleEvent::from_external(name).is_some(), "{name}");
+        }
+    }
 
     fn home_with(files: &[(&str, &str)]) -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
