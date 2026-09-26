@@ -94,6 +94,17 @@ pub fn parse_gc(arguments: &crate::ParsedArguments) -> Result<Command, Diagnosti
     })
 }
 
+/// Remove what `arsy gc --apply` would, with the configured retention, and
+/// return how many references and stored objects went. The `/storage`
+/// dialog's artifact cleanup.
+pub(crate) fn sweep(invocation: &Invocation, root: &Path) -> Result<(u64, u64), Diagnostic> {
+    let store = open(root, configured_retention_ms(invocation, root))?;
+    let reachable = reachable_artifacts(root)?;
+    let removed = ArtifactStore::gc(&store, &reachable, arsy_kernel::artifact::unix_time_ms())
+        .map_err(|error| storage_failed(error.to_string()))?;
+    Ok((removed.references_removed, removed.objects_removed))
+}
+
 /// `artifact://<uuid>` or the bare UUID, which is what a JSON record carries.
 fn artifact_id(value: &str) -> Result<ArtifactId, Diagnostic> {
     let bare = value

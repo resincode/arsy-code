@@ -42,6 +42,7 @@ mod run;
 mod serve;
 mod session;
 mod settings;
+mod storage;
 mod subagent;
 mod telemetry;
 mod transcript;
@@ -134,6 +135,9 @@ Usage:
   arsy config explain [KEY]  show effective configuration and where it came from
   arsy config set <KEY> <VALUE> [--scope <user|workspace>]  write one setting
   arsy config unset <KEY> [--scope <user|workspace>]  remove one setting
+  arsy storage               list where ARSY keeps files and how big each is
+  arsy storage clean <cache|repo-map|views|artifacts>  remove what ARSY rebuilds
+  arsy storage reset-history --confirm <WORKSPACE NAME>  delete this workspace's sessions
   arsy session list [--limit <N>]      list recorded sessions in this workspace
   arsy session show <ID> [--turns] [--evidence]   show one session's projection
   arsy session export <ID> [--out <PATH>]         export canonical events as JSONL
@@ -306,6 +310,10 @@ pub enum Command {
     /// `arsy config explain [KEY]`: effective values and where each came from.
     ConfigExplain {
         key: Option<String>,
+    },
+    /// `arsy storage [clean <TARGET> | reset-history --confirm <NAME>]`.
+    Storage {
+        request: storage::Request,
     },
     /// `arsy config set <KEY> <VALUE> [--scope user|workspace]`.
     ConfigSet {
@@ -555,6 +563,7 @@ const SUBSYSTEMS: &[(&str, SubsystemParser)] = &[
     ("provider", provider::parse_list),
     ("model", provider::parse_models),
     ("mcp", mcp::parse),
+    ("storage", storage::parse),
 ];
 
 fn parse_subsystem(name: &str, parsed: &ParsedArguments) -> Option<Result<Command, Diagnostic>> {
@@ -624,6 +633,8 @@ struct ParsedArguments {
     to: Option<String>,
     at: Option<String>,
     retention: Option<String>,
+    /// `arsy storage reset-history --confirm`: the workspace name, typed.
+    confirm: Option<String>,
     /// `arsy code symbol --tier`: which tier answers.
     tier: Option<String>,
     /// `arsy migrate --backup`: where the pre-migration copy goes.
@@ -744,6 +755,7 @@ fn apply_value_flag(
         "--to" => parsed.to = Some(value(arguments, argument)?),
         "--at" => parsed.at = Some(value(arguments, argument)?),
         "--retention" => parsed.retention = Some(value(arguments, argument)?),
+        "--confirm" => parsed.confirm = Some(value(arguments, argument)?),
         "--backup" => parsed.backup = Some(PathBuf::from(value(arguments, argument)?)),
         "--tier" => parsed.tier = Some(value(arguments, argument)?),
         "--base" => parsed.base = Some(value(arguments, argument)?),
@@ -1392,6 +1404,7 @@ fn execute_inspect(
             emitter,
         ),
         Command::ConfigExplain { key } => config_explain(invocation, key.as_deref(), emitter),
+        Command::Storage { request } => storage::run(invocation, request, emitter),
         Command::ConfigSet { key, value, scope } => {
             config_write(invocation, key, Some(value), *scope, emitter)
         }
