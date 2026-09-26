@@ -196,8 +196,8 @@ fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Where subagent views and eval trees are, including the places an earlier
-/// release put them, which the state migration leaves for this cleanup.
+/// Where subagent views and eval trees are: the current two, then the two an
+/// earlier release used, which the state migration leaves for this cleanup.
 fn view_directories(root: &Path) -> [PathBuf; 4] {
     [
         root.join(workspace::VIEWS),
@@ -253,42 +253,34 @@ fn remove(path: &Path) -> Result<(), String> {
 /// Remove every view and eval tree nothing has touched for a while, through
 /// git so the repository forgets the worktree too.
 fn prune_views(root: &Path) -> Result<String, String> {
-    let now = std::time::SystemTime::now();
+    let directories = view_directories(root);
+    let views: Vec<std::fs::DirEntry> = directories
+        .iter()
+        .filter_map(|directory| std::fs::read_dir(directory).ok())
+        .flat_map(|children| children.flatten())
+        .collect();
     let (mut removed, mut kept) = (0, 0);
-    for directory in view_directories(root) {
-        let Ok(children) = std::fs::read_dir(&directory) else {
+    for view in views {
+        if !is_idle(&view) {
+            kept += 1;
             continue;
-        };
-        for child in children.flatten() {
-            let path = child.path();
-            let idle = child
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .ok()
-                .and_then(|modified| now.duration_since(modified).ok())
-                .is_some_and(|age| age.as_millis() >= VIEW_IDLE_MS);
-            if !idle {
-                kept += 1;
-                continue;
-            }
-            let through_git = Process::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(["worktree", "remove", "--force"])
-                .arg(&path)
-                .output()
-                .is_ok_and(|output| output.status.success());
-            if !through_git {
-                remove(&path)?;
-            }
-            removed += 1;
         }
-        // An emptied directory from an earlier release goes with its views.
-        if directory.starts_with(root.join(".arsy/views"))
-            || directory.starts_with(root.join(".arsy/eval"))
-        {
-            let _ = std::fs::remove_dir(&directory);
+        let path = view.path();
+        let through_git = Process::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["worktree", "remove", "--force"])
+            .arg(&path)
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !through_git {
+            remove(&path)?;
         }
+        removed += 1;
+    }
+    // An emptied directory from an earlier release goes with its views.
+    for legacy in &directories[2..] {
+        let _ = std::fs::remove_dir(legacy);
     }
     let _ = Process::new("git")
         .arg("-C")
@@ -301,6 +293,15 @@ fn prune_views(root: &Path) -> Result<String, String> {
             "Removed {removed} view(s); kept {kept} used in the last 30 minutes, which another ARSY may still be running in."
         ),
     })
+}
+
+/// Whether nothing has touched a view for [`VIEW_IDLE_MS`].
+fn is_idle(view: &std::fs::DirEntry) -> bool {
+    view.metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age.as_millis() >= VIEW_IDLE_MS)
 }
 
 /// The name a history reset must be confirmed with: the workspace directory's.
