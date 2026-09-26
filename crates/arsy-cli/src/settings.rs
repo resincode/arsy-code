@@ -50,18 +50,7 @@ fn edit(
     change: impl FnOnce(&str) -> Result<String, String>,
 ) -> Result<PathBuf, String> {
     let file = scope.path(root).map_err(|diagnostic| diagnostic.message)?;
-    let original = match std::fs::read_to_string(&file) {
-        Ok(original) => Some(original),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(format!("{} could not be read: {error}", file.display())),
-    };
-    let updated = change(original.as_deref().unwrap_or(""))?;
-    if let Some(parent) = file.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("{} could not be created: {error}", parent.display()))?;
-    }
-    replace_file(&file, updated.as_bytes())
-        .map_err(|error| format!("{} could not be written: {error}", file.display()))?;
+    let original = rewrite(&file, change)?;
     if let Err(diagnostic) = load_config(root, root, None) {
         let _ = match &original {
             Some(original) => replace_file(&file, original.as_bytes()),
@@ -74,6 +63,31 @@ fn edit(
         ));
     }
     Ok(file)
+}
+
+/// Rewrite one JSON file ARSY owns through `change`, creating it and its
+/// directory when missing, and hand back what it held before (`None` when it
+/// did not exist) so a caller can put it back.
+///
+/// The write is atomic, so a reader sees the old file or the new one. The
+/// settings and guard writers share it.
+pub(crate) fn rewrite(
+    file: &Path,
+    change: impl FnOnce(&str) -> Result<String, String>,
+) -> Result<Option<String>, String> {
+    let original = match std::fs::read_to_string(file) {
+        Ok(original) => Some(original),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("{} could not be read: {error}", file.display())),
+    };
+    let updated = change(original.as_deref().unwrap_or(""))?;
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("{} could not be created: {error}", parent.display()))?;
+    }
+    replace_file(file, updated.as_bytes())
+        .map_err(|error| format!("{} could not be written: {error}", file.display()))?;
+    Ok(original)
 }
 
 #[cfg(test)]

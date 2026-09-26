@@ -4,7 +4,6 @@
 //! Only ARSY's file is ever written. Claude's and Codex's files are read as
 //! lower layers and stay theirs.
 
-use crate::config_load::replace_file;
 use crate::{config_edit, mcp::Scope, usage, Command, Diagnostic, Emitter, Invocation, Output};
 use arsy_code::hook::{LifecycleEvent, EXTERNAL_EVENTS};
 use serde_json::json;
@@ -41,21 +40,6 @@ fn check_event(event: &str) -> Result<(), String> {
     }
 }
 
-fn edit(file: &Path, change: impl FnOnce(&str) -> Result<String, String>) -> Result<(), String> {
-    let original = match std::fs::read_to_string(file) {
-        Ok(original) => original,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(format!("{} could not be read: {error}", file.display())),
-    };
-    let updated = change(&original)?;
-    if let Some(parent) = file.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("{} could not be created: {error}", parent.display()))?;
-    }
-    replace_file(file, updated.as_bytes())
-        .map_err(|error| format!("{} could not be written: {error}", file.display()))
-}
-
 /// Append a `command` hook to the scope's `guard.json`, and return the file.
 pub fn add(
     root: &Path,
@@ -67,7 +51,7 @@ pub fn add(
 ) -> Result<PathBuf, String> {
     check_event(event)?;
     let file = path(root, scope)?;
-    edit(&file, |guard| {
+    crate::settings::rewrite(&file, |guard| {
         config_edit::add_hook(guard, event, matcher, command, timeout)
     })?;
     Ok(file)
@@ -78,14 +62,14 @@ pub fn add(
 pub fn remove(root: &Path, scope: Scope, event: &str, position: usize) -> Result<PathBuf, String> {
     check_event(event)?;
     let file = path(root, scope)?;
-    edit(&file, |guard| {
+    crate::settings::rewrite(&file, |guard| {
         config_edit::remove_hook(guard, event, position)
     })?;
     // `hook.disabled` is written to the operator's own arsy.json by `/hooks`.
     if let Some(config) = arsy_kernel::config::user_config() {
         if config.exists() {
             let source = file.display().to_string();
-            edit(&config, |settings| {
+            crate::settings::rewrite(&config, |settings| {
                 config_edit::shift_disabled(settings, &source, event, position)
             })?;
         }
