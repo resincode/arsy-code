@@ -1403,6 +1403,73 @@ fn the_user_guard_follows_the_arsy_config_home() {
     );
 }
 
+/// A hook added with `arsy hook add` is one the engine runs, and `arsy hook
+/// remove` takes it away again: the commands edit the file the engine reads.
+#[test]
+fn a_hook_added_from_the_cli_denies_and_its_removal_allows() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("notes.txt"), "the answer is 42\n").unwrap();
+    let guard: Value =
+        serde_json::from_str(&denying_guard(home.path(), "added from the cli")).unwrap();
+    let command = guard["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (code, records) = arsy_with_home(
+        workspace.path(),
+        home.path(),
+        home.path(),
+        &[
+            "hook",
+            "add",
+            "--event",
+            "PreToolUse",
+            "--matcher",
+            "fs.read",
+            "--command",
+            &command,
+        ],
+    );
+    assert_eq!(code, 0, "{records:#?}");
+    assert!(home.path().join("guard.json").is_file());
+
+    let provider = FakeProvider::serving(vec![asks_to_read("notes.txt"), answers("I could not.")]);
+    configure(home.path(), provider.port);
+    let (code, records) = arsy_with_home(
+        workspace.path(),
+        home.path(),
+        home.path(),
+        &["run", "what does notes.txt say?"],
+    );
+    assert_eq!(code, 0, "{:#?}", result(&records));
+    let _first = provider.request();
+    let denied = provider.request().to_string();
+    assert!(denied.contains("added from the cli"), "{denied}");
+
+    let (code, records) = arsy_with_home(
+        workspace.path(),
+        home.path(),
+        home.path(),
+        &["hook", "remove", "PreToolUse", "0"],
+    );
+    assert_eq!(code, 0, "{records:#?}");
+
+    let provider = FakeProvider::serving(vec![asks_to_read("notes.txt"), answers("42.")]);
+    configure(home.path(), provider.port);
+    let (code, records) = arsy_with_home(
+        workspace.path(),
+        home.path(),
+        home.path(),
+        &["run", "what does notes.txt say?"],
+    );
+    assert_eq!(code, 0, "{:#?}", result(&records));
+    let _first = provider.request();
+    let allowed = provider.request().to_string();
+    assert!(allowed.contains("the answer is 42"), "{allowed}");
+}
+
 /// The same file in the repository rather than the operator's home does
 /// nothing until the operator vouches for that directory.
 #[test]
