@@ -3757,6 +3757,46 @@ mod tests {
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
+    /// What `/settings` applies reaches the file, and a reset takes it back
+    /// out: the dialog reporting a change is not the same as making one.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_settings_edit_is_written_and_a_reset_removes_it() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|held| held.into_inner());
+        let directory = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os(arsy_kernel::config::CONFIG_HOME_VAR);
+        std::env::set_var(arsy_kernel::config::CONFIG_HOME_VAR, directory.path());
+        let path = directory.path().join(arsy_kernel::config::CONFIG_FILE);
+        std::fs::write(&path, "{}\n").unwrap();
+        let row = tui::SettingRow {
+            key: "ui.style".to_owned(),
+            value: "modern".to_owned(),
+            default: "modern".to_owned(),
+            description: String::new(),
+            choices: Vec::new(),
+            kind: tui::SettingKind::Choice,
+            set: false,
+        };
+
+        let applied = picker::dialog::apply_edited_setting(&row, "classic");
+        let written = std::fs::read_to_string(&path).unwrap();
+
+        let reset =
+            picker::wizard::write_config(|config| config_edit::remove(config, &["ui", "style"]));
+        let after_reset = std::fs::read_to_string(&path).unwrap();
+        match previous {
+            Some(value) => std::env::set_var(arsy_kernel::config::CONFIG_HOME_VAR, value),
+            None => std::env::remove_var(arsy_kernel::config::CONFIG_HOME_VAR),
+        }
+        assert_eq!(applied, Ok(None));
+        assert!(written.contains("classic"), "not written: {written}");
+        assert!(reset.is_ok());
+        assert!(
+            !after_reset.contains("classic"),
+            "not removed: {after_reset}"
+        );
+    }
+
     #[test]
     fn a_first_run_creates_the_settings_file() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|held| held.into_inner());
