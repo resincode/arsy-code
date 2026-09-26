@@ -86,6 +86,8 @@ pub(crate) fn hook_choices(
                 enabled: !config
                     .hook_disabled()
                     .contains(entry["declaration"].as_str()?),
+                removable: crate::guard::parse_declaration(entry["declaration"].as_str()?)
+                    .is_some_and(|(file, _, _)| crate::guard::scope_of(root, &file).is_some()),
             })
         })
         .collect())
@@ -120,6 +122,52 @@ pub(crate) fn run_hook_dialog(
                 break;
             }
             Keyed::Acted(tui::HookAction::Toggle(index)) => index,
+            Keyed::Acted(tui::HookAction::Add {
+                scope,
+                event,
+                matcher,
+                command,
+            }) => {
+                let matcher = (!matcher.is_empty()).then_some(matcher.as_str());
+                let added =
+                    crate::guard::add(&root, file_scope(scope), &event, matcher, &command, None);
+                dialog.notice = Some(tui::safe_text(&match added {
+                    Ok(file) => {
+                        changed += 1;
+                        let trust = if scope == tui::SettingsScope::Project {
+                            " It runs once this directory is trusted."
+                        } else {
+                            ""
+                        };
+                        format!("Added a {event} hook to {}.{trust}", file.display())
+                    }
+                    Err(reason) => reason,
+                }));
+                rows = hook_choices(&root, invocation)?;
+                dialog.reload(rows);
+                continue;
+            }
+            Keyed::Acted(tui::HookAction::Remove(index)) => {
+                let declaration = dialog.choices[index].declaration.clone();
+                let removed = crate::guard::parse_declaration(&declaration)
+                    .and_then(|(file, event, position)| {
+                        crate::guard::scope_of(&root, &file).map(|scope| (scope, event, position))
+                    })
+                    .ok_or_else(|| "only a hook in ARSY's own guard.json can be removed".to_owned())
+                    .and_then(|(scope, event, position)| {
+                        crate::guard::remove(&root, scope, &event, position)
+                    });
+                dialog.notice = Some(tui::safe_text(&match removed {
+                    Ok(file) => {
+                        changed += 1;
+                        format!("Removed the hook from {}.", file.display())
+                    }
+                    Err(reason) => reason,
+                }));
+                rows = hook_choices(&root, invocation)?;
+                dialog.reload(rows);
+                continue;
+            }
         };
         let choice = dialog.choices[action].clone();
         let enabled = !choice.enabled;

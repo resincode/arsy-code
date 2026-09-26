@@ -22,6 +22,14 @@ pub fn path(root: &Path, scope: Scope) -> Result<PathBuf, String> {
     }
 }
 
+/// Which scope's file `file` is, when it is one of ARSY's two.
+#[cfg(feature = "tui")]
+pub fn scope_of(root: &Path, file: &Path) -> Option<Scope> {
+    [Scope::User, Scope::Workspace]
+        .into_iter()
+        .find(|scope| path(root, *scope).is_ok_and(|own| own == file))
+}
+
 fn check_event(event: &str) -> Result<(), String> {
     if LifecycleEvent::from_external(event).is_some() {
         Ok(())
@@ -83,6 +91,20 @@ pub fn remove(root: &Path, scope: Scope, event: &str, position: usize) -> Result
         }
     }
     Ok(file)
+}
+
+/// `path#Event[position].handler`, the key the engine gives a declaration,
+/// taken apart.
+#[cfg(feature = "tui")]
+pub fn parse_declaration(declaration: &str) -> Option<(PathBuf, String, usize)> {
+    let (file, rest) = declaration.rsplit_once('#')?;
+    let (event, rest) = rest.split_once('[')?;
+    let (position, _) = rest.split_once(']')?;
+    Some((
+        PathBuf::from(file),
+        event.to_owned(),
+        position.parse().ok()?,
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -190,11 +212,27 @@ pub fn run(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_declaration_key_comes_apart() {
+        assert_eq!(
+            parse_declaration("/w/.arsy/guard.json#PreToolUse[2].0"),
+            Some((
+                PathBuf::from("/w/.arsy/guard.json"),
+                "PreToolUse".to_owned(),
+                2
+            ))
+        );
+        assert_eq!(parse_declaration("/w/.codex/config.toml#notify"), None);
+    }
+
     #[test]
     fn a_project_hook_lands_in_the_project_guard_and_can_be_removed() {
         let root = tempfile::tempdir().unwrap();
         let file = add(root.path(), Scope::Workspace, "Stop", None, "done.sh", None).unwrap();
         assert_eq!(file, root.path().join(".arsy/guard.json"));
+        #[cfg(feature = "tui")]
+        assert_eq!(scope_of(root.path(), &file), Some(Scope::Workspace));
 
         remove(root.path(), Scope::Workspace, "Stop", 0).unwrap();
         let written: serde_json::Value =
