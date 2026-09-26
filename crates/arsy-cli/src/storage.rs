@@ -175,12 +175,14 @@ pub fn inventory(root: &Path) -> Vec<Entry> {
 
 /// Bytes and files under `path`, following no symlink.
 fn measure(path: &Path) -> (u64, u64) {
+    // forgeguard: allow FG-SEC-007 -- inventory paths are fixed names under the config home or the workspace; symlinks are not followed
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return (0, 0);
     };
     if !metadata.is_dir() {
         return (metadata.len(), 1);
     }
+    // forgeguard: allow FG-SEC-007 -- reached only for a directory symlink_metadata confirmed is not a link
     let Ok(children) = std::fs::read_dir(path) else {
         return (0, 0);
     };
@@ -241,8 +243,11 @@ pub fn clean(invocation: &Invocation, root: &Path, target: Target) -> Result<Str
 }
 
 fn remove(path: &Path) -> Result<(), String> {
+    // forgeguard: allow FG-SEC-007 -- fixed names, or entries of the fixed view directories, under the config home or the workspace
     let removed = match std::fs::symlink_metadata(path) {
+        // forgeguard: allow FG-SEC-007 -- symlink_metadata said this is a real directory, not a link to one
         Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path),
+        // forgeguard: allow FG-SEC-007 -- removes the entry itself; a symlink is unlinked, never followed
         Ok(_) => std::fs::remove_file(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
@@ -256,6 +261,7 @@ fn prune_views(root: &Path) -> Result<String, String> {
     let directories = view_directories(root);
     let views: Vec<std::fs::DirEntry> = directories
         .iter()
+        // forgeguard: allow FG-SEC-007 -- the four fixed view directories under the workspace's .arsy
         .filter_map(|directory| std::fs::read_dir(directory).ok())
         .flat_map(|children| children.flatten())
         .collect();

@@ -193,10 +193,12 @@ impl FileCredentialStore {
 
     /// Create the secrets directory when missing and restrict it to its owner.
     fn owner_only_directory(directory: &Path) {
+        // forgeguard: allow FG-SEC-007 -- the fixed secrets directory under the operator's config home
         let _ = std::fs::create_dir_all(directory);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            // forgeguard: allow FG-SEC-007 -- the fixed secrets directory under the operator's config home
             let _ = std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700));
         }
     }

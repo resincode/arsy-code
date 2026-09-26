@@ -3372,6 +3372,7 @@ fn read_stdin() -> Result<String, Diagnostic> {
 }
 
 fn workspace_root(requested: &Path) -> Result<PathBuf, Diagnostic> {
+    // forgeguard: allow FG-SEC-007 -- the operator's own --workspace argument, canonicalized before any use
     let root = std::fs::canonicalize(requested).map_err(|error| {
         usage(format!(
             "workspace {} is unusable: {error}",

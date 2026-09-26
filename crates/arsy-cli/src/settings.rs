@@ -54,6 +54,7 @@ fn edit(
     if let Err(diagnostic) = load_config(root, root, None) {
         let _ = match &original {
             Some(original) => replace_file(&file, original.as_bytes()),
+            // forgeguard: allow FG-SEC-007 -- the scope's arsy.json under the config home or the workspace, a fixed name
             None => std::fs::remove_file(&file),
         };
         return Err(format!(
@@ -75,6 +76,7 @@ pub(crate) fn rewrite(
     file: &Path,
     change: impl FnOnce(&str) -> Result<String, String>,
 ) -> Result<Option<String>, String> {
+    // forgeguard: allow FG-SEC-007 -- only ever arsy.json or guard.json under the config home or the workspace
     let original = match std::fs::read_to_string(file) {
         Ok(original) => Some(original),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -82,6 +84,7 @@ pub(crate) fn rewrite(
     };
     let updated = change(original.as_deref().unwrap_or(""))?;
     if let Some(parent) = file.parent() {
+        // forgeguard: allow FG-SEC-007 -- the parent of arsy.json or guard.json under the config home or the workspace
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("{} could not be created: {error}", parent.display()))?;
     }
@@ -95,6 +98,7 @@ mod tests {
     use super::*;
 
     fn read(path: &Path) -> serde_json::Value {
+        // forgeguard: allow FG-SEC-007 -- test helper reading a file the test itself wrote in a tempdir
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
     }
 

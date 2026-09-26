@@ -940,6 +940,7 @@ mod tests {
     fn migrate_moves_old_layout_into_state() {
         let root = legacy_workspace();
         migrate_state(root.path());
+        // forgeguard: allow FG-SEC-007 -- test helper reading a file the test itself wrote in a tempdir
         let read = |path: &str| fs::read_to_string(root.path().join(path)).unwrap();
         assert_eq!(read(".arsy/state/artifacts/ab/blob"), "evidence");
         assert_eq!(read(REPO_MAP), "{}");
@@ -981,6 +982,7 @@ mod tests {
 
         migrate_state(root.path());
 
+        // forgeguard: allow FG-SEC-007 -- test helper reading a file the test itself wrote in a tempdir
         let read = |path: &str| fs::read_to_string(root.path().join(path)).unwrap();
         assert_eq!(read(SESSION_STORE), "new db");
         assert_eq!(read(REPO_MAP), "new map");
@@ -1012,6 +1014,7 @@ mod tests {
 
         assert!(move_session_store(&old, &new).is_err());
 
+        // forgeguard: allow FG-SEC-007 -- test helper reading a file the test itself wrote in a tempdir
         let read = |path: &str| fs::read_to_string(root.path().join(path)).unwrap();
         assert_eq!(read(".arsy/sessions.sqlite3"), "db");
         assert_eq!(

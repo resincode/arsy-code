@@ -3468,8 +3468,10 @@ pub fn home_file(directory: &str, name: &str) -> Option<PathBuf> {
     let legacy = home.join(name);
     if !target.exists() && legacy.is_file() {
         if let Some(parent) = target.parent() {
+            // forgeguard: allow FG-SEC-007 -- a fixed directory name under the operator's config home
             let _ = std::fs::create_dir_all(parent);
         }
+        // forgeguard: allow FG-SEC-007 -- both ends are the operator's config home joined with a name check_name or the caller fixed
         let _ = std::fs::rename(&legacy, &target);
     }
     Some(target)
