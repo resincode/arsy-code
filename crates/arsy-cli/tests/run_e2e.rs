@@ -1303,10 +1303,11 @@ fn a_hook_denies_a_tool_call_and_the_model_is_told_why() {
     let workspace = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     std::fs::write(workspace.path().join("notes.txt"), "the answer is 42\n").unwrap();
-    std::fs::create_dir_all(home.path().join(".arsy")).unwrap();
+    // `arsy_with_home` points `ARSY_CONFIG_HOME` here, so this is the
+    // operator's `~/.arsy/guard.json`.
     std::fs::write(
-        home.path().join(".arsy/guard.json"),
-        denying_guard(&home.path().join(".arsy"), "notes are off limits"),
+        home.path().join("guard.json"),
+        denying_guard(home.path(), "notes are off limits"),
     )
     .unwrap();
 

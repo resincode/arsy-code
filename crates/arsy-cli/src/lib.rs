@@ -2805,9 +2805,7 @@ fn compat_homes() -> arsy_compat::CompatHomes {
 fn hook_engine(root: &Path, config: &arsy_kernel::config::Config) -> arsy_code::hook::Loaded {
     arsy_code::hook::load(&arsy_code::hook::Discovery {
         homes: compat_homes(),
-        arsy_home: std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(PathBuf::from),
+        arsy_config_home: arsy_kernel::config::config_home(),
         claude: config.compat_enabled("claude"),
         codex: config.compat_enabled("codex"),
         disabled: config.hook_disabled().clone(),

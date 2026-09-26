@@ -603,8 +603,9 @@ pub struct Discovery {
     /// Where Claude Code and Codex keep the operator's files. Those files
     /// carry the operator's own authority.
     pub homes: arsy_compat::CompatHomes,
-    /// The operator's home, for `~/.arsy/guard.json`.
-    pub arsy_home: Option<PathBuf>,
+    /// ARSY's own configuration directory — `~/.arsy`, or wherever
+    /// `ARSY_CONFIG_HOME` points — for its `guard.json`.
+    pub arsy_config_home: Option<PathBuf>,
     /// `compat.claude.enabled` and `compat.codex.enabled`.
     pub claude: bool,
     pub codex: bool,
@@ -715,9 +716,9 @@ fn user_sources(discovery: &Discovery) -> Vec<(PathBuf, Kind)> {
             .filter(|_| discovery.codex)
             .map(|directory| (directory.join("config.toml"), Kind::CodexNotify)),
         discovery
-            .arsy_home
+            .arsy_config_home
             .as_ref()
-            .map(|home| (home.join(".arsy/guard.json"), Kind::ArsyGuard)),
+            .map(|home| (home.join("guard.json"), Kind::ArsyGuard)),
     ]
     .into_iter()
     .flatten()
@@ -1087,7 +1088,7 @@ mod tests {
                 claude_json: None,
                 codex_dir: Some(home.join(".codex")),
             },
-            arsy_home: Some(home.to_path_buf()),
+            arsy_config_home: Some(home.join(".arsy")),
             claude: true,
             codex: true,
             root: root.to_path_buf(),
