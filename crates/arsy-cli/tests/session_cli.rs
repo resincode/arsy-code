@@ -16,7 +16,7 @@ use std::{path::Path, process::Command, sync::Arc};
 
 /// Record one completed turn and one running turn, and hand back the session.
 fn recorded(workspace: &Path) -> (SessionId, Vec<String>) {
-    let path = workspace.join(".arsy/sessions.sqlite3");
+    let path = workspace.join(arsy_code::workspace::SESSION_STORE);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let store: Arc<dyn EventStore> =
         Arc::new(SqliteEventStore::open(&path, Durability::Normal).unwrap());
@@ -193,7 +193,8 @@ fn an_artifact_shows_bounded_exports_whole_and_is_collected_when_unreachable() {
 
     let workspace = tempfile::tempdir().unwrap();
     recorded(workspace.path());
-    let store = FileArtifactStore::open(workspace.path().join(".arsy/artifacts"), 0).unwrap();
+    let store =
+        FileArtifactStore::open(workspace.path().join(arsy_code::workspace::ARTIFACTS), 0).unwrap();
     let body = "line one\nline two\n".repeat(64);
     let stored = store
         .put(

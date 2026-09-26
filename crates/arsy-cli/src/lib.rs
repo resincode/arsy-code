@@ -3270,10 +3270,9 @@ fn workspace_root(requested: &Path) -> Result<PathBuf, Diagnostic> {
 }
 
 fn open_store(workspace: &Path) -> Result<Arc<SqliteEventStore>, Diagnostic> {
+    arsy_code::workspace::ensure_state_dir(workspace, true)
+        .map_err(|error| storage_failed(error.to_string()))?;
     let path = workspace.join(STORE_PATH);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| storage_failed(error.to_string()))?;
-    }
     SqliteEventStore::open(&path, Durability::Normal)
         .map(Arc::new)
         .map_err(|error| storage_failed(format!("{path:?}: {error}")))

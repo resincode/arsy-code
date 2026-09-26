@@ -344,7 +344,7 @@ def main():
             # for one that only inspected. What an inspection must not do is
             # record a turn into it.
             import sqlite3 as _sql
-            events = _sql.connect(root / ".arsy/sessions.sqlite3").execute(
+            events = _sql.connect(root / ".arsy/state/sessions.sqlite3").execute(
                 "SELECT COUNT(*) FROM events"
             ).fetchone()[0]
             assert events == 0, f"inspection recorded {events} events"

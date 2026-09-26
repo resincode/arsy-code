@@ -1066,7 +1066,7 @@ fn two_writers_change_separate_components_and_an_integrator_applies_both() {
 
     // The views the writers worked in are gone, and nothing they wrote
     // reached the workspace except through the integrator.
-    let views = workspace.path().join(".arsy/views");
+    let views = workspace.path().join(arsy_code::workspace::VIEWS);
     let remaining: Vec<_> = std::fs::read_dir(&views)
         .map(|entries| entries.filter_map(Result::ok).collect())
         .unwrap_or_default();
@@ -1245,7 +1245,7 @@ fn a_claim_that_looks_like_a_credential_is_never_written_to_the_artifact_store()
     let provider = FakeProvider::serving(vec![answers("noted.")]);
     configure(home.path(), provider.port);
 
-    let artifacts = workspace.path().join(".arsy/artifacts");
+    let artifacts = workspace.path().join(arsy_code::workspace::ARTIFACTS);
     let count = || -> usize { walk(&artifacts).len() };
 
     // A claim that is fine is stored, so the comparison below is against a

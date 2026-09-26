@@ -560,17 +560,30 @@ pub const HARNESS_STATE: &str = ".arsy";
 
 /// Where everything ARSY writes on its own lives, apart from the files an
 /// operator edits: deleting it loses history, never configuration.
-pub const RUNTIME_STATE: &str = ".arsy";
+pub const RUNTIME_STATE: &str = ".arsy/state";
 /// The session event store.
-pub const SESSION_STORE: &str = ".arsy/sessions.sqlite3";
+pub const SESSION_STORE: &str = ".arsy/state/sessions.sqlite3";
 /// Content-addressed artifacts: evidence, tool output, completion proofs.
-pub const ARTIFACTS: &str = ".arsy/artifacts";
+pub const ARTIFACTS: &str = ".arsy/state/artifacts";
 /// The git worktrees subagents run in.
-pub const VIEWS: &str = ".arsy/views";
+pub const VIEWS: &str = ".arsy/state/views";
 /// The trees `arsy eval` measures in.
-pub const EVAL: &str = ".arsy/eval";
+pub const EVAL: &str = ".arsy/state/eval";
 /// The repository map a turn is given as context.
-pub const REPO_MAP: &str = ".arsy/repo-map.json";
+pub const REPO_MAP: &str = ".arsy/state/repo-map.json";
+
+/// Create the runtime directory, and when `ignore_itself` is set, the
+/// `.gitignore` that keeps it out of the repository without the operator
+/// adding anything. An existing `.gitignore` is left as it is.
+pub fn ensure_state_dir(root: &Path, ignore_itself: bool) -> io::Result<PathBuf> {
+    let state = root.join(RUNTIME_STATE);
+    fs::create_dir_all(&state)?;
+    let ignore = state.join(".gitignore");
+    if ignore_itself && !ignore.exists() {
+        fs::write(&ignore, "*\n")?;
+    }
+    Ok(state)
+}
 
 fn apply_patch(view: &Path, patch: &str) -> Result<(), WorkspaceError> {
     let file = view.join(".arsy-carried.patch");

@@ -468,8 +468,9 @@ mod tests {
     #[test]
     fn an_unreadable_map_starts_empty_rather_than_failing() {
         let (directory, workspace) = workspace(&[("src/lib.rs", "pub fn run() {}\n")]);
-        std::fs::create_dir_all(directory.path().join(".arsy")).unwrap();
-        std::fs::write(directory.path().join(MAP_PATH), b"{not json").unwrap();
+        let map_path = directory.path().join(MAP_PATH);
+        std::fs::create_dir_all(map_path.parent().unwrap()).unwrap();
+        std::fs::write(&map_path, b"{not json").unwrap();
 
         let mut map = RepositoryMap::open(directory.path());
         assert_eq!(map.file_count(), 0);
