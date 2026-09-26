@@ -1339,6 +1339,70 @@ fn a_hook_denies_a_tool_call_and_the_model_is_told_why() {
     );
 }
 
+/// `ARSY_CONFIG_HOME` moves the operator's guard with the rest of their ARSY
+/// files: a `guard.json` left in `$HOME/.arsy` is not the one in force.
+#[test]
+fn the_user_guard_follows_the_arsy_config_home() {
+    let workspace = tempfile::tempdir().unwrap();
+    let config_home = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("notes.txt"), "the answer is 42\n").unwrap();
+    std::fs::create_dir_all(home.path().join(".arsy")).unwrap();
+    std::fs::write(
+        home.path().join(".arsy/guard.json"),
+        denying_guard(&home.path().join(".arsy"), "the stale home said no"),
+    )
+    .unwrap();
+
+    let provider = FakeProvider::serving(vec![asks_to_read("notes.txt"), answers("42.")]);
+    configure(config_home.path(), provider.port);
+
+    let (code, records) = arsy_with_home(
+        workspace.path(),
+        config_home.path(),
+        home.path(),
+        &["run", "what does notes.txt say?"],
+    );
+    assert_eq!(code, 0, "{:#?}", result(&records));
+    let _first = provider.request();
+    let unguarded = provider.request().to_string();
+    assert!(
+        !unguarded.contains("the stale home said no"),
+        "the guard outside the config home did not run: {unguarded}"
+    );
+    assert!(
+        unguarded.contains("the answer is 42"),
+        "so the read happened: {unguarded}"
+    );
+
+    // The same guard inside the configuration home is in force.
+    std::fs::write(
+        config_home.path().join("guard.json"),
+        denying_guard(config_home.path(), "the config home said no"),
+    )
+    .unwrap();
+    let provider = FakeProvider::serving(vec![asks_to_read("notes.txt"), answers("I could not.")]);
+    configure(config_home.path(), provider.port);
+
+    let (code, records) = arsy_with_home(
+        workspace.path(),
+        config_home.path(),
+        home.path(),
+        &["run", "what does notes.txt say?"],
+    );
+    assert_eq!(code, 0, "{:#?}", result(&records));
+    let _first = provider.request();
+    let guarded = provider.request().to_string();
+    assert!(
+        guarded.contains("the config home said no"),
+        "the guard in the config home ran: {guarded}"
+    );
+    assert!(
+        !guarded.contains("the answer is 42"),
+        "the file was never read: {guarded}"
+    );
+}
+
 /// The same file in the repository rather than the operator's home does
 /// nothing until the operator vouches for that directory.
 #[test]
