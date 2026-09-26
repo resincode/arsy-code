@@ -1061,10 +1061,18 @@ pub(crate) fn rename_session(
         return writeln!(stdout, "Usage: {usage}").map_err(terminal_failed);
     }
     let session = restoring.state.session_id();
-    if let Ok(store) = open_store(restoring.workspace) {
-        let _ = store.set_session_title(session, title);
-    }
-    writeln!(stdout, "Renamed session {session} to \"{title}\".").map_err(terminal_failed)
+    // Reported as the dialog reports it: a title that was not written is not
+    // a rename, and saying it was is what makes a later listing look broken.
+    let written = open_store(restoring.workspace).and_then(|store| {
+        store
+            .set_session_title(session, title)
+            .map_err(storage_failed)
+    });
+    let message = match written {
+        Ok(()) => format!("Renamed session {session} to \"{title}\"."),
+        Err(error) => format!("`{title}` was not written: {}", error.message),
+    };
+    writeln!(stdout, "{}", tui::safe_text(&message)).map_err(terminal_failed)
 }
 
 /// Delete a session, starting a fresh one when it was the open one.
