@@ -3476,9 +3476,10 @@ fn mcp_log_rows(logs: Vec<(String, String)>, level: &str) -> Vec<String> {
 fn session_connector() -> &'static connector::McpConnector {
     static CONNECTOR: std::sync::OnceLock<connector::McpConnector> = std::sync::OnceLock::new();
     CONNECTOR.get_or_init(|| {
-        connector::McpConnector::new(
-            arsy_kernel::config::config_home().map(|home| home.join("mcp-tools.json")),
-        )
+        connector::McpConnector::new(arsy_kernel::config::home_file(
+            arsy_kernel::config::CACHE_DIRECTORY,
+            "mcp-tools.json",
+        ))
     })
 }
 

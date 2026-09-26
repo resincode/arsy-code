@@ -218,7 +218,7 @@ def main():
             terminal.expect("MODEL & EFFORT")
             terminal.send(b"\x03")
             assert child.poll() is None, "leaving the model dialog ended the session"
-            assert not (root / ".arsy/model").exists()
+            assert not (root / ".arsy/state/model").exists()
 
             # The effort picker is arrowed and taken like the command menu. It
             # opens marked at the current setting, which is unset here, and the
@@ -230,7 +230,7 @@ def main():
             terminal.expect("\u203a low")
             terminal.send(b"\r\r")
             terminal.expect("Effort: low")
-            assert (root / ".arsy/effort").exists(), "an accepted effort was not remembered"
+            assert (root / ".arsy/state/effort").exists(), "an accepted effort was not remembered"
 
             # Leaving the picker cancels the picker, not the session: a command
             # that was never run before proves the task prompt came back.
@@ -250,7 +250,7 @@ def main():
             terminal.expect("› ocean")
             terminal.send(b"\r\r")
             terminal.expect("Theme: ocean")
-            assert (root / ".arsy/theme").exists(), "the theme choice was not remembered"
+            assert (root / ".arsy/state/theme").exists(), "the theme choice was not remembered"
             terminal.send(b"/theme\r")
             terminal.expect("› ocean")
             terminal.send(b"\x03")
