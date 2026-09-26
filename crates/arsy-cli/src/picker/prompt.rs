@@ -552,7 +552,7 @@ pub(crate) fn offer_rows(prompt: &Prompt, composer: &mut tui::Composer, picker: 
 #[cfg(feature = "tui")]
 pub(crate) fn run_session_dialog(
     mut dialog: tui::SessionDialogState,
-    restoring: Restoring<'_>,
+    mut restoring: Restoring<'_>,
     stdout: &mut io::Stdout,
     colour: bool,
     keys: &std::sync::mpsc::Receiver<u8>,
@@ -580,15 +580,7 @@ pub(crate) fn run_session_dialog(
             Keyed::Redraw => continue,
             Keyed::Acted(action) => action,
         };
-        let borrowed = Restoring {
-            workspace: restoring.workspace,
-            state: restoring.state,
-            conversation: restoring.conversation,
-            transcript: restoring.transcript,
-            history: restoring.history,
-            approval: restoring.approval,
-            queued: restoring.queued,
-        };
+        let borrowed = restoring.reborrow();
         match action {
             tui::SessionAction::Resume(id) => {
                 close_dialog(stdout, drawn, &[], "")?;
@@ -1222,6 +1214,23 @@ pub(crate) struct Restoring<'a> {
     pub(crate) history: &'a mut arsy_code::agent::budget::History,
     pub(crate) approval: &'a approval::ApprovalCell,
     pub(crate) queued: &'a mut std::collections::VecDeque<String>,
+}
+
+#[cfg(feature = "tui")]
+impl Restoring<'_> {
+    /// The same session state, lent again for one action inside a loop that
+    /// keeps its own handle.
+    pub(crate) fn reborrow(&mut self) -> Restoring<'_> {
+        Restoring {
+            workspace: self.workspace,
+            state: &mut *self.state,
+            conversation: &mut *self.conversation,
+            transcript: &mut *self.transcript,
+            history: &mut *self.history,
+            approval: self.approval,
+            queued: &mut *self.queued,
+        }
+    }
 }
 
 /// Open a recorded session, answering how many messages it carried.

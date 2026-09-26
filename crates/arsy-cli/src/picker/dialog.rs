@@ -524,7 +524,7 @@ fn storage_rows(root: &Path) -> Vec<tui::StorageRow> {
 #[cfg(feature = "tui")]
 pub(crate) fn run_storage_dialog(
     invocation: &Invocation,
-    restoring: Restoring<'_>,
+    mut restoring: Restoring<'_>,
     stdout: &mut io::Stdout,
     colour: bool,
     keys: &std::sync::mpsc::Receiver<u8>,
@@ -559,15 +559,7 @@ pub(crate) fn run_storage_dialog(
             },
             tui::StorageAction::ResetHistory(_, typed) => {
                 crate::storage::reset_history(&root, &typed).map(|message| {
-                    let started = super::prompt::start_session(Restoring {
-                        workspace: restoring.workspace,
-                        state: restoring.state,
-                        conversation: restoring.conversation,
-                        transcript: restoring.transcript,
-                        history: restoring.history,
-                        approval: restoring.approval,
-                        queued: restoring.queued,
-                    });
+                    let started = super::prompt::start_session(restoring.reborrow());
                     format!("{message} Started fresh session {started}.")
                 })
             }
