@@ -450,6 +450,34 @@ pub(crate) fn write_schema_version(
         .map_err(storage)
 }
 
+/// Whether another connection is writing to the store at `path` right now.
+///
+/// Asked before the store's files are deleted, so a reset never pulls a
+/// database out from under a turn that is mid-write. A missing file is not in
+/// use.
+// ponytail: detects a writer holding a transaction, not an idle process with
+// the store open; that process recreates the store on its next write. A
+// workspace lock file is the upgrade if that ever matters.
+pub fn is_being_written(path: &Path) -> Result<bool, StoreError> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let connection = Connection::open(path).map_err(storage)?;
+    connection.busy_timeout(Duration::ZERO).map_err(storage)?;
+    match connection.execute_batch("BEGIN IMMEDIATE; ROLLBACK;") {
+        Ok(()) => Ok(false),
+        Err(rusqlite::Error::SqliteFailure(failure, _))
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            Ok(true)
+        }
+        Err(error) => Err(storage(error)),
+    }
+}
+
 fn configure(connection: &Connection, durability: Durability) -> Result<(), StoreError> {
     connection
         .busy_timeout(Duration::from_secs(5))
@@ -529,6 +557,25 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    #[test]
+    fn a_store_is_in_use_only_while_something_writes_to_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        assert!(
+            !is_being_written(&path).unwrap(),
+            "a missing store is not in use"
+        );
+
+        let _store = SqliteEventStore::open(&path, Durability::Normal).unwrap();
+        assert!(!is_being_written(&path).unwrap(), "open but idle");
+
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        assert!(is_being_written(&path).unwrap(), "mid-transaction");
+        writer.execute_batch("ROLLBACK;").unwrap();
+        assert!(!is_being_written(&path).unwrap());
     }
 
     #[test]
