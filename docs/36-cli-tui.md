@@ -55,8 +55,9 @@ and whether each declaration is loaded, alongside every file the engine read.
 Hooks come from whichever ecosystem the operator already uses, found where
 `CLAUDE_CONFIG_DIR` and `CODEX_HOME` put them. `~/.claude/settings.json`
 supplies Claude-shaped command hooks; `~/.codex/config.toml` supplies Codex's one
-lifecycle callback, `notify`, as `after_turn`; and `~/.arsy/guard.json` is the
-same Claude shape under ARSY's own name, for an operator using neither. Only
+lifecycle callback, `notify`, as `after_turn`; and `~/.arsy/guard.json` (in
+`ARSY_CONFIG_HOME` when that is set) is the same Claude shape under ARSY's own
+name, for an operator using neither. Only
 `type: "command"` runs — a `prompt`, `agent`, or `http` handler is reported
 against its file and skipped.
 
