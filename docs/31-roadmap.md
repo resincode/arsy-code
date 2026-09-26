@@ -122,7 +122,7 @@ claims must pin new revisions independently.
 
 | Capability | Status | Source-backed current behavior |
 |---|---|---|
-| Repository discovery and map | **SHIPPED** | Bounded discovery identifies manifests; `repo.map` writes a hash-incremental `.arsy/repo-map.json`. Generic incremental repository mapping should not be rebuilt. |
+| Repository discovery and map | **SHIPPED** | Bounded discovery identifies manifests; `repo.map` writes a hash-incremental `.arsy/state/repo-map.json`. Generic incremental repository mapping should not be rebuilt. |
 | Code intelligence | **PARTIAL** | Model tools route through configured LSP, a Rust tree-sitter/graph implementation, then text fallback. LSP rename is transactional. The native graph currently models Rust definitions/imports rather than a broad call/reference graph. |
 | DAP | **PARTIAL** | `debug.run` performs one bounded DAP run and records protocol/stack/local evidence. It is not a persistent interactive debugging session. |
 | MCP, hooks, and WASM plugins | **PARTIAL** | Native MCP operations, hook execution, and capability-limited WASM plugin operations exist. Hook execution is not consistent across scripted, interactive, and child turns. Imported declarations are not automatically loaded. |

@@ -142,7 +142,7 @@ syscall-level one cap-std performs, which is what catches a symlink whose name
 looks local. Nothing else in the crate opens a workspace path.
 
 `resource::walk` is the one traversal: `.gitignore` filters plus a skip of
-`.arsy`, so a listing, a text search, and a file find agree about what the
+`.arsy` (configuration and `.arsy/state/` alike), so a listing, a text search, and a file find agree about what the
 workspace contains.
 
 ## What is not here yet
