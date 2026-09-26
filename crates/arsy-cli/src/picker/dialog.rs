@@ -129,7 +129,6 @@ pub(crate) fn run_hook_dialog(
         let change = write_config(|config| {
             if enabled {
                 config_edit::remove(config, &["hook", "disabled", &choice.declaration])
-                    .map(|_updated| config.to_owned())
             } else {
                 config_edit::set(
                     config,
@@ -137,7 +136,6 @@ pub(crate) fn run_hook_dialog(
                     &choice.declaration,
                     serde_json::Value::Bool(true),
                 )
-                .map(|_updated| config.to_owned())
             }
         });
         dialog.notice = Some(match change {
@@ -175,7 +173,6 @@ pub(crate) fn apply_edited_setting(
     write_config(|config| {
         let (path, leaf) = setting_path(&row.key)?;
         config_edit::set(config, &path, leaf, setting.kind.to_json(line))
-            .map(|_updated| config.to_owned())
     })
     .map(|_| None)
 }
@@ -294,7 +291,6 @@ pub(crate) fn run_skill_dialog(
                         &choice.key,
                         serde_json::Value::Bool(!offering),
                     )
-                    .map(|_updated| config.to_owned())
                 }) {
                     Ok(()) => {
                         let state = if offering { "offered" } else { "switched off" };
@@ -394,9 +390,7 @@ pub(crate) fn run_settings_dialog(
             Keyed::Acted(tui::SettingsAction::Reset(index)) => {
                 let row = dialog.rows[index].clone();
                 let removed = match setting_path(&row.key) {
-                    Ok((path, _leaf)) => write_config(|config| {
-                        config_edit::remove(config, &path).map(|_updated| config.to_owned())
-                    }),
+                    Ok((path, _leaf)) => write_config(|config| config_edit::remove(config, &path)),
                     Err(reason) => Err(reason),
                 };
                 match removed {
