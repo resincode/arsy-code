@@ -190,34 +190,14 @@ impl HookDialogState {
     }
 
     pub fn handle_key(&mut self, key: Key) -> Option<HookAction> {
-        match &mut self.mode {
-            HookDialogMode::List => {}
-            HookDialogMode::Adding(draft) => {
-                let (action, done) = draft_key(draft, key);
-                if let Some(reason) = action.as_ref().err() {
-                    self.notice = Some((*reason).to_owned());
-                }
-                if done {
-                    self.mode = HookDialogMode::List;
-                }
-                return action.ok().flatten();
-            }
-            HookDialogMode::ConfirmRemove(index) => {
-                let index = *index;
-                return match key {
-                    Key::Enter | Key::Newline | Key::Char('y' | 'Y') => {
-                        self.mode = HookDialogMode::List;
-                        Some(HookAction::Remove(index))
-                    }
-                    Key::Char('n' | 'N') | Key::Interrupt => {
-                        self.mode = HookDialogMode::List;
-                        None
-                    }
-                    Key::Eof => Some(HookAction::Close),
-                    _ => None,
-                };
-            }
+        match &self.mode {
+            HookDialogMode::List => self.list_key(key),
+            HookDialogMode::Adding(_) => self.adding_key(key),
+            HookDialogMode::ConfirmRemove(index) => self.confirm_remove_key(*index, key),
         }
+    }
+
+    fn list_key(&mut self, key: Key) -> Option<HookAction> {
         match key {
             Key::Char('a' | 'A') => {
                 self.notice = None;
@@ -225,18 +205,7 @@ impl HookDialogState {
                 None
             }
             Key::Char('x' | 'X') => {
-                match self.choices.get(self.selected) {
-                    Some(choice) if choice.removable => {
-                        self.mode = HookDialogMode::ConfirmRemove(self.selected);
-                    }
-                    Some(_) => {
-                        self.notice = Some(
-                            "only a hook in ARSY's own guard.json can be removed here; switch this one off instead"
-                                .to_owned(),
-                        );
-                    }
-                    None => {}
-                }
+                self.begin_remove();
                 None
             }
             Key::Up => {
@@ -253,6 +222,51 @@ impl HookDialogState {
                 .is_some()
                 .then_some(HookAction::Toggle(self.selected)),
             Key::Interrupt | Key::Eof => Some(HookAction::Close),
+            _ => None,
+        }
+    }
+
+    /// Ask before removing the marked hook, or say why it cannot be.
+    fn begin_remove(&mut self) {
+        match self.choices.get(self.selected) {
+            Some(choice) if choice.removable => {
+                self.mode = HookDialogMode::ConfirmRemove(self.selected);
+            }
+            Some(_) => {
+                self.notice = Some(
+                    "only a hook in ARSY's own guard.json can be removed here; switch this one off instead"
+                        .to_owned(),
+                );
+            }
+            None => {}
+        }
+    }
+
+    fn adding_key(&mut self, key: Key) -> Option<HookAction> {
+        let HookDialogMode::Adding(draft) = &mut self.mode else {
+            return None;
+        };
+        let (action, done) = draft_key(draft, key);
+        if let Err(reason) = &action {
+            self.notice = Some((*reason).to_owned());
+        }
+        if done {
+            self.mode = HookDialogMode::List;
+        }
+        action.ok().flatten()
+    }
+
+    fn confirm_remove_key(&mut self, index: usize, key: Key) -> Option<HookAction> {
+        match key {
+            Key::Enter | Key::Newline | Key::Char('y' | 'Y') => {
+                self.mode = HookDialogMode::List;
+                Some(HookAction::Remove(index))
+            }
+            Key::Char('n' | 'N') | Key::Interrupt => {
+                self.mode = HookDialogMode::List;
+                None
+            }
+            Key::Eof => Some(HookAction::Close),
             _ => None,
         }
     }
@@ -274,45 +288,53 @@ impl HookDialogState {
 /// One key while a hook is being described: the action it produced, if any,
 /// and whether the form is finished. An `Err` is a notice, not a failure.
 fn draft_key(draft: &mut HookDraft, key: Key) -> (Result<Option<HookAction>, &'static str>, bool) {
-    let events = arsy_code::hook::EXTERNAL_EVENTS.len();
     match key {
         Key::Tab | Key::Down => draft.field = (draft.field + 1) % 4,
         Key::Up => draft.field = (draft.field + 3) % 4,
-        Key::Left | Key::Right if draft.field == 0 => {
+        Key::Enter | Key::Newline => return submit_draft(draft),
+        Key::Interrupt => return (Ok(None), true),
+        Key::Eof => return (Ok(Some(HookAction::Close)), true),
+        other => edit_draft_field(draft, other),
+    }
+    (Ok(None), false)
+}
+
+/// Change the field the cursor is on: the arrows choose the file and the
+/// event, and typing edits the matcher and the command.
+fn edit_draft_field(draft: &mut HookDraft, key: Key) {
+    let events = arsy_code::hook::EXTERNAL_EVENTS.len();
+    match (draft.field, key) {
+        (0, Key::Left | Key::Right) => {
             draft.scope = match draft.scope {
                 SettingsScope::User => SettingsScope::Project,
                 SettingsScope::Project => SettingsScope::User,
             };
         }
-        Key::Left if draft.field == 1 => draft.event = (draft.event + events - 1) % events,
-        Key::Right if draft.field == 1 => draft.event = (draft.event + 1) % events,
-        Key::Char(character) if draft.field == 2 => draft.matcher.push(character),
-        Key::Char(character) if draft.field == 3 => draft.command.push(character),
-        Key::Backspace if draft.field == 2 => {
+        (1, Key::Left) => draft.event = (draft.event + events - 1) % events,
+        (1, Key::Right) => draft.event = (draft.event + 1) % events,
+        (2, Key::Char(character)) => draft.matcher.push(character),
+        (3, Key::Char(character)) => draft.command.push(character),
+        (2, Key::Backspace) => {
             draft.matcher.pop();
         }
-        Key::Backspace if draft.field == 3 => {
+        (3, Key::Backspace) => {
             draft.command.pop();
         }
-        Key::Enter | Key::Newline => {
-            if draft.command.trim().is_empty() {
-                return (Err("a hook needs a command to run"), false);
-            }
-            return (
-                Ok(Some(HookAction::Add {
-                    scope: draft.scope,
-                    event: arsy_code::hook::EXTERNAL_EVENTS[draft.event].to_owned(),
-                    matcher: draft.matcher.trim().to_owned(),
-                    command: draft.command.trim().to_owned(),
-                })),
-                true,
-            );
-        }
-        Key::Interrupt => return (Ok(None), true),
-        Key::Eof => return (Ok(Some(HookAction::Close)), true),
         _ => {}
     }
-    (Ok(None), false)
+}
+
+fn submit_draft(draft: &HookDraft) -> (Result<Option<HookAction>, &'static str>, bool) {
+    if draft.command.trim().is_empty() {
+        return (Err("a hook needs a command to run"), false);
+    }
+    let action = HookAction::Add {
+        scope: draft.scope,
+        event: arsy_code::hook::EXTERNAL_EVENTS[draft.event].to_owned(),
+        matcher: draft.matcher.trim().to_owned(),
+        command: draft.command.trim().to_owned(),
+    };
+    (Ok(Some(action)), true)
 }
 
 /// The add form: one row per field, the one with the cursor marked.
