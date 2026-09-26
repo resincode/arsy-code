@@ -585,6 +585,88 @@ pub fn ensure_state_dir(root: &Path, ignore_itself: bool) -> io::Result<PathBuf>
     Ok(state)
 }
 
+/// Where each piece of runtime state lived before `.arsy/state/`.
+const LEGACY_STATE: [(&str, &str); 2] = [
+    (".arsy/repo-map.json", REPO_MAP),
+    (".arsy/artifacts", ARTIFACTS),
+];
+/// The old session store; its WAL sidecars move with it.
+const LEGACY_SESSION_STORE: &str = ".arsy/sessions.sqlite3";
+
+/// Move runtime state an older ARSY left directly under `.arsy/` into
+/// `.arsy/state/`, once.
+///
+/// A rename, never a copy, and never over something already there: a
+/// destination that exists means the move happened or a newer ARSY started
+/// fresh, and either way the file at the destination is the one in use. The
+/// session store moves together with its `-wal` and `-shm` sidecars, which
+/// hold committed transactions not yet folded into the main file; if any of
+/// the three cannot move, the ones that did are put back.
+///
+/// `views/` and `eval/` are git worktrees and stay where they are: renaming
+/// one would leave git pointing at a directory that no longer exists.
+///
+/// Failures are silent, as the user configuration bootstrap's are: a
+/// workspace whose old state cannot move runs with fresh state rather than
+/// not at all.
+pub fn migrate_state(root: &Path) {
+    let has_legacy = LEGACY_STATE.iter().any(|(old, _)| root.join(old).exists())
+        || root.join(LEGACY_SESSION_STORE).exists();
+    if !has_legacy || ensure_state_dir(root, true).is_err() {
+        return;
+    }
+    for (old, new) in LEGACY_STATE {
+        let (old, new) = (root.join(old), root.join(new));
+        if old.exists() && !new.exists() {
+            let _ = fs::rename(&old, &new);
+        }
+    }
+    let _ = move_session_store(&root.join(LEGACY_SESSION_STORE), &root.join(SESSION_STORE));
+}
+
+/// Move an SQLite database and its WAL sidecars as one.
+fn move_session_store(old: &Path, new: &Path) -> io::Result<()> {
+    if !old.exists() || new.exists() {
+        return Ok(());
+    }
+    let sidecar = |path: &Path, suffix: &str| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    // Sidecars first, the main file last: until the main file moves, the old
+    // location is still the database, and a crash between steps leaves at
+    // worst an orphaned sidecar at the destination rather than a database
+    // missing its log.
+    let pairs: Vec<(PathBuf, PathBuf)> = ["-wal", "-shm", ""]
+        .iter()
+        .map(|suffix| (sidecar(old, suffix), sidecar(new, suffix)))
+        .filter(|(from, _)| from.exists())
+        .collect();
+    let mut moved = Vec::new();
+    for (from, to) in &pairs {
+        if to.exists() {
+            restore(&moved);
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} already exists", to.display()),
+            ));
+        }
+        if let Err(error) = fs::rename(from, to) {
+            restore(&moved);
+            return Err(error);
+        }
+        moved.push((from.clone(), to.clone()));
+    }
+    Ok(())
+}
+
+fn restore(moved: &[(PathBuf, PathBuf)]) {
+    for (from, to) in moved.iter().rev() {
+        let _ = fs::rename(to, from);
+    }
+}
+
 fn apply_patch(view: &Path, patch: &str) -> Result<(), WorkspaceError> {
     let file = view.join(".arsy-carried.patch");
     fs::write(&file, patch)?;

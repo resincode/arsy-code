@@ -3261,12 +3261,16 @@ fn read_stdin() -> Result<String, Diagnostic> {
 }
 
 fn workspace_root(requested: &Path) -> Result<PathBuf, Diagnostic> {
-    std::fs::canonicalize(requested).map_err(|error| {
+    let root = std::fs::canonicalize(requested).map_err(|error| {
         usage(format!(
             "workspace {} is unusable: {error}",
             requested.display()
         ))
-    })
+    })?;
+    // Every command resolves its workspace here, so this is the one place an
+    // older layout is noticed before anything opens it.
+    arsy_code::workspace::migrate_state(&root);
+    Ok(root)
 }
 
 fn open_store(workspace: &Path) -> Result<Arc<SqliteEventStore>, Diagnostic> {
