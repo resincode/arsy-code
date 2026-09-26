@@ -447,6 +447,98 @@ pub(crate) fn run_settings_dialog(
     Ok(())
 }
 
+/// Every location `storage::inventory` measured, as the dialog draws it.
+#[cfg(feature = "tui")]
+fn storage_rows(root: &Path) -> Vec<tui::StorageRow> {
+    crate::storage::inventory(root)
+        .into_iter()
+        .map(|entry| tui::StorageRow {
+            label: entry.label.to_owned(),
+            scope: entry.scope.to_owned(),
+            path: tui::safe_text(&entry.path.display().to_string()),
+            size: if entry.exists {
+                crate::storage::human_bytes(entry.bytes)
+            } else {
+                "—".to_owned()
+            },
+            action: entry.action.map(|action| match action {
+                crate::storage::Action::Clean(_) => "clean".to_owned(),
+                crate::storage::Action::ResetHistory => "reset".to_owned(),
+            }),
+            resets_history: entry.action == Some(crate::storage::Action::ResetHistory),
+        })
+        .collect()
+}
+
+/// Drive `/storage`: list every location, run the cleanup a row offers, and
+/// after a history reset carry on in a fresh session, since the one running
+/// no longer has a store behind it.
+#[cfg(feature = "tui")]
+pub(crate) fn run_storage_dialog(
+    invocation: &Invocation,
+    restoring: Restoring<'_>,
+    stdout: &mut io::Stdout,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> Result<(), Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
+    let entries = crate::storage::inventory(&root);
+    let mut dialog =
+        tui::StorageDialogState::new(storage_rows(&root), crate::storage::workspace_name(&root));
+    let mut changes: Vec<String> = Vec::new();
+    let mut drawn = 0;
+    loop {
+        drawn = repaint_dialog(
+            stdout,
+            colour,
+            drawn,
+            &dialog.render(tui::terminal_width(), colour),
+        )?;
+        let action = match next_dialog_key(&mut dialog, keys, decoder, |dialog: &mut _, key| {
+            dialog.handle_key(key)
+        }) {
+            Keyed::Ended | Keyed::Acted(tui::StorageAction::Close) => break,
+            Keyed::Redraw => continue,
+            Keyed::Acted(action) => action,
+        };
+        let outcome = match action {
+            tui::StorageAction::Clean(index) => match entries.get(index).and_then(|e| e.action) {
+                Some(crate::storage::Action::Clean(target)) => {
+                    crate::storage::clean(invocation, &root, target)
+                }
+                _ => Err("nothing to clean here".to_owned()),
+            },
+            tui::StorageAction::ResetHistory(_, typed) => {
+                crate::storage::reset_history(&root, &typed).map(|message| {
+                    let started = super::prompt::start_session(Restoring {
+                        workspace: restoring.workspace,
+                        state: restoring.state,
+                        conversation: restoring.conversation,
+                        transcript: restoring.transcript,
+                        history: restoring.history,
+                        approval: restoring.approval,
+                        queued: restoring.queued,
+                    });
+                    format!("{message} Started fresh session {started}.")
+                })
+            }
+            tui::StorageAction::Close => break,
+        };
+        let notice = match outcome {
+            Ok(message) => {
+                changes.push(message.clone());
+                message
+            }
+            Err(reason) => reason,
+        };
+        dialog.reload(storage_rows(&root));
+        dialog.notice = Some(tui::safe_text(&notice));
+    }
+    close_dialog(stdout, drawn, &changes, "")?;
+    Ok(())
+}
+
 #[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_model_dialog(

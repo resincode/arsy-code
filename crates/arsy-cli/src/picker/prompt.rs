@@ -4,7 +4,7 @@
 #[cfg(feature = "tui")]
 use super::dialog::{
     close_dialog, next_dialog_key, repaint_dialog, run_hook_dialog, run_mcp_dialog,
-    run_model_dialog, run_settings_dialog, run_skill_dialog, Keyed,
+    run_model_dialog, run_settings_dialog, run_skill_dialog, run_storage_dialog, Keyed,
 };
 #[cfg(feature = "tui")]
 use super::remembered::{
@@ -905,6 +905,9 @@ pub(crate) fn run_dialog(
             typing.theme,
             typing.roles,
         ),
+        Dialog::Storage => {
+            run_storage_dialog(invocation, restoring, stdout, typing.colour, keys, decoder)
+        }
         Dialog::Model => {
             *typing.models = endpoint_models(invocation);
             run_model_dialog(
@@ -1446,6 +1449,7 @@ pub(crate) fn answer_task(
             "/skill" => Some(Dialog::Skill),
             "/session" => Some(Dialog::Session),
             "/settings" => Some(Dialog::Settings),
+            "/storage" => Some(Dialog::Storage),
             "/model" => Some(Dialog::Model),
             _ => None,
         };
@@ -1491,6 +1495,7 @@ pub(crate) enum Dialog {
     Skill,
     Session,
     Settings,
+    Storage,
     Model,
 }
 

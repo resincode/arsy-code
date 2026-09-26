@@ -5572,6 +5572,7 @@ mod tests {
                     | "/todo"
                     | "/agents"
                     | "/skill"
+                    | "/storage"
             ) || INSPECTIONS.iter().any(|(slash, _, _)| slash == name);
             assert!(handled, "{name} is offered but never dispatched");
         }
