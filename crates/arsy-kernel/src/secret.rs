@@ -187,20 +187,43 @@ impl FileCredentialStore {
             return Some(crate::config::config_home()?.join(name));
         }
         let home = crate::config::config_home()?;
-        Self::owner_only_directory(&home.join(crate::config::SECRETS_DIRECTORY));
-        crate::config::home_file(crate::config::SECRETS_DIRECTORY, name)
+        let target = home.join(crate::config::SECRETS_DIRECTORY).join(name);
+        // Resolving is a lookup: it creates nothing unless a credential an
+        // earlier release left beside `arsy.json` has to move in, and then the
+        // directory is made owner-only before the credential enters it.
+        if !target.exists() && home.join(name).is_file() {
+            Self::prepare(&target).ok()?;
+            return crate::config::home_file(crate::config::SECRETS_DIRECTORY, name);
+        }
+        Some(target)
     }
 
     /// Create the secrets directory when missing and restrict it to its owner.
-    fn owner_only_directory(directory: &Path) {
-        // forgeguard: allow FG-SEC-007 -- the fixed secrets directory under the operator's config home
-        let _ = std::fs::create_dir_all(directory);
+    /// Create the directory a credential file is about to be written to.
+    ///
+    /// The secrets directory is created owner-only in the same call that
+    /// creates it, so it is never readable by others between two steps; a
+    /// credential at an absolute path the operator chose gets an ordinary
+    /// directory. Every writer calls this; nothing that only reads does.
+    pub fn prepare(path: &Path) -> std::io::Result<()> {
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        let secrets =
+            crate::config::config_home().map(|home| home.join(crate::config::SECRETS_DIRECTORY));
+        if secrets.as_deref() != Some(parent) {
+            // forgeguard: allow FG-SEC-007 -- the parent of an absolute credential path the operator named
+            return std::fs::create_dir_all(parent);
+        }
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            // forgeguard: allow FG-SEC-007 -- the fixed secrets directory under the operator's config home
-            let _ = std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700));
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
         }
+        // forgeguard: allow FG-SEC-007 -- the fixed secrets directory under the operator's config home
+        builder.create(parent)
     }
 
     fn handle(name: &str) -> SecretHandle {
@@ -254,9 +277,7 @@ impl FileCredentialStore {
             message: "this platform has no user configuration directory".to_owned(),
         })?;
         Self::check_name(name)?;
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+        let _ = Self::prepare(&path);
         #[cfg(unix)]
         {
             use std::fs::OpenOptions;

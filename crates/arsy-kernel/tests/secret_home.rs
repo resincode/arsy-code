@@ -30,14 +30,16 @@ fn bare_credentials_live_in_the_secrets_directory_and_old_ones_are_moved() {
     std::env::set_var(CONFIG_HOME_VAR, home.path());
     let secrets = home.path().join(SECRETS_DIRECTORY);
 
-    // A bare name resolves under `secrets/`, which is made owner-only.
+    // A bare name resolves under `secrets/`. Resolving is a lookup and
+    // creates nothing; the first write creates the directory owner-only.
     let path = FileCredentialStore::path("fresh.key").unwrap();
     assert_eq!(path, secrets.join("fresh.key"));
-    #[cfg(unix)]
-    assert_eq!(mode(&secrets), 0o700, "the secrets directory is owner-only");
+    assert!(!secrets.exists(), "resolving a name wrote nothing");
     FileCredentialStore
         .set("fresh.key", "sk-fresh-0123456789")
         .unwrap();
+    #[cfg(unix)]
+    assert_eq!(mode(&secrets), 0o700, "the secrets directory is owner-only");
     assert!(secrets.join("fresh.key").is_file());
     assert!(!home.path().join("fresh.key").exists());
 
