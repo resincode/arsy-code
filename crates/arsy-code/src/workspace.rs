@@ -600,8 +600,10 @@ const LEGACY_SESSION_STORE: &str = ".arsy/sessions.sqlite3";
 /// destination that exists means the move happened or a newer ARSY started
 /// fresh, and either way the file at the destination is the one in use. The
 /// session store moves together with its `-wal` and `-shm` sidecars, which
-/// hold committed transactions not yet folded into the main file; if any of
-/// the three cannot move, the ones that did are put back.
+/// hold committed transactions not yet folded into the main file, so the log
+/// is checkpointed into the database first and a store another process is
+/// writing to is left for a later run; if any of the three cannot move, the
+/// ones that did are put back.
 ///
 /// `views/` and `eval/` are git worktrees and stay where they are: renaming
 /// one would leave git pointing at a directory that no longer exists.
@@ -631,16 +633,29 @@ fn move_session_store(old: &Path, new: &Path) -> io::Result<()> {
     if !old.exists() || new.exists() {
         return Ok(());
     }
+    // A store another process is writing to stays where it is until a later
+    // run; so does one whose log will not fold in. Only a store whose file
+    // alone holds every commit is moved, so no step can strand a commit in a
+    // log separated from its database.
+    let busy = arsy_kernel::sqlite::is_being_written(old)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let folded = arsy_kernel::sqlite::checkpoint(old)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    if busy || !folded {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "the session store is in use; it moves on a later run",
+        ));
+    }
     let sidecar = |path: &Path, suffix: &str| {
         let mut name = path.as_os_str().to_owned();
         name.push(suffix);
         PathBuf::from(name)
     };
-    // Sidecars first, the main file last: until the main file moves, the old
-    // location is still the database, and a crash between steps leaves at
-    // worst an orphaned sidecar at the destination rather than a database
-    // missing its log.
-    let pairs: Vec<(PathBuf, PathBuf)> = ["-wal", "-shm", ""]
+    // The database first: after the checkpoint its sidecars hold nothing a
+    // reader needs, so a stop between steps leaves a complete database at the
+    // destination and at worst an empty log behind.
+    let pairs: Vec<(PathBuf, PathBuf)> = ["", "-wal", "-shm"]
         .iter()
         .map(|suffix| (sidecar(old, suffix), sidecar(new, suffix)))
         .filter(|(from, _)| from.exists())
