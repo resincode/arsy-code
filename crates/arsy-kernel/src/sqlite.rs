@@ -478,6 +478,21 @@ pub fn is_being_written(path: &Path) -> Result<bool, StoreError> {
     }
 }
 
+/// Fold the write-ahead log of the store at `path` into the database file,
+/// so the file alone holds every committed transaction. `false` when a
+/// reader or writer kept the checkpoint from completing.
+///
+/// Asked before the store's files are moved: a database moved without its
+/// log loses whatever the log still held.
+pub fn checkpoint(path: &Path) -> Result<bool, StoreError> {
+    let connection = Connection::open(path).map_err(storage)?;
+    connection.busy_timeout(Duration::ZERO).map_err(storage)?;
+    let busy: i64 = connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+        .map_err(storage)?;
+    Ok(busy == 0)
+}
+
 fn configure(connection: &Connection, durability: Durability) -> Result<(), StoreError> {
     connection
         .busy_timeout(Duration::from_secs(5))
@@ -557,6 +572,35 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    #[test]
+    fn a_checkpoint_leaves_every_commit_in_the_database_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite3");
+        let writer = Connection::open(&path).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer
+            .execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (7);")
+            .unwrap();
+        let wal = directory.path().join("sessions.sqlite3-wal");
+        assert!(
+            std::fs::metadata(&wal).unwrap().len() > 0,
+            "the commit is in the log"
+        );
+
+        assert!(checkpoint(&path).unwrap());
+        assert_eq!(std::fs::metadata(&wal).map_or(0, |m| m.len()), 0);
+        drop(writer);
+
+        // The database file alone, without its sidecars, still has the row.
+        let moved = directory.path().join("alone.sqlite3");
+        std::fs::copy(&path, &moved).unwrap();
+        let reader = Connection::open(&moved).unwrap();
+        let value: i64 = reader
+            .query_row("SELECT v FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(value, 7);
     }
 
     #[test]
