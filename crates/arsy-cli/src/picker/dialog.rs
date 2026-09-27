@@ -497,9 +497,9 @@ pub(crate) fn run_settings_dialog(
 
 /// Every location `storage::inventory` measured, as the dialog draws it.
 #[cfg(feature = "tui")]
-fn storage_rows(root: &Path) -> Vec<tui::StorageRow> {
-    crate::storage::inventory(root)
-        .into_iter()
+fn storage_rows(entries: &[crate::storage::Entry]) -> Vec<tui::StorageRow> {
+    entries
+        .iter()
         .map(|entry| tui::StorageRow {
             label: entry.label.to_owned(),
             scope: entry.scope.to_owned(),
@@ -531,9 +531,14 @@ pub(crate) fn run_storage_dialog(
     decoder: &mut tui::Keys,
 ) -> Result<(), Diagnostic> {
     let root = workspace_root(&invocation.workspace)?;
-    let entries = crate::storage::inventory(&root);
-    let mut dialog =
-        tui::StorageDialogState::new(storage_rows(&root), crate::storage::workspace_name(&root));
+    // One scan feeds both the rows drawn and the actions dispatched by row, and
+    // both are refreshed together after every action, so an index always
+    // names the entry the operator saw.
+    let mut entries = crate::storage::inventory(&root);
+    let mut dialog = tui::StorageDialogState::new(
+        storage_rows(&entries),
+        crate::storage::workspace_name(&root),
+    );
     let mut changes: Vec<String> = Vec::new();
     let mut drawn = 0;
     loop {
@@ -572,7 +577,8 @@ pub(crate) fn run_storage_dialog(
             }
             Err(reason) => reason,
         };
-        dialog.reload(storage_rows(&root));
+        entries = crate::storage::inventory(&root);
+        dialog.reload(storage_rows(&entries));
         dialog.notice = Some(tui::safe_text(&notice));
     }
     close_dialog(stdout, drawn, &changes, "")?;
