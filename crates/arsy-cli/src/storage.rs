@@ -209,10 +209,8 @@ fn view_directories(root: &Path) -> [PathBuf; 4] {
     ]
 }
 
-/// A view touched this recently may belong to a subagent still running in
-/// another ARSY process, whose lease this one cannot see.
-// ponytail: modification time stands in for the lease, which lives only in
-// the owning process's memory; a lease file per view is the upgrade.
+/// How long a view without a lease marker must sit untouched before it goes:
+/// the length of a lease, for views cut before markers existed.
 const VIEW_IDLE_MS: u128 = 30 * 60 * 1000;
 
 /// Run one cleanup and say what it did.
@@ -259,19 +257,31 @@ fn remove(path: &Path) -> Result<(), String> {
 /// git so the repository forgets the worktree too.
 fn prune_views(root: &Path) -> Result<String, String> {
     let directories = view_directories(root);
-    let views: Vec<std::fs::DirEntry> = directories
+    let entries: Vec<std::fs::DirEntry> = directories
         .iter()
         // forgeguard: allow FG-SEC-007 -- the four fixed view directories under the workspace's .arsy
         .filter_map(|directory| std::fs::read_dir(directory).ok())
         .flat_map(|children| children.flatten())
         .collect();
+    let now = std::time::SystemTime::now();
     let (mut removed, mut kept) = (0, 0);
-    for view in views {
-        if !is_idle(&view) {
+    for entry in &entries {
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            // A lease marker whose view is gone says nothing any more.
+            let marker_of = path
+                .to_string_lossy()
+                .strip_suffix(".lease")
+                .map(PathBuf::from);
+            if marker_of.is_some_and(|view| !view.exists()) {
+                remove(&path)?;
+            }
+            continue;
+        }
+        if !reclaimable(entry, now) {
             kept += 1;
             continue;
         }
-        let path = view.path();
         let through_git = Process::new("git")
             .arg("-C")
             .arg(root)
@@ -282,6 +292,7 @@ fn prune_views(root: &Path) -> Result<String, String> {
         if !through_git {
             remove(&path)?;
         }
+        remove(&workspace::lease_marker(&path))?;
         removed += 1;
     }
     // An emptied directory from an earlier release goes with its views.
@@ -295,18 +306,28 @@ fn prune_views(root: &Path) -> Result<String, String> {
         .output();
     Ok(match kept {
         0 => format!("Removed {removed} view(s)."),
-        kept => format!(
-            "Removed {removed} view(s); kept {kept} used in the last 30 minutes, which another ARSY may still be running in."
-        ),
+        kept => {
+            format!("Removed {removed} view(s); kept {kept} another ARSY still holds a lease on.")
+        }
     })
 }
 
-/// Whether nothing has touched a view for [`VIEW_IDLE_MS`].
-fn is_idle(view: &std::fs::DirEntry) -> bool {
+/// Whether a view may go. Its lease marker decides when it has one; a view cut
+/// before markers existed goes once nothing has touched it for a lease's
+/// length, which is the only sign such a view leaves.
+fn reclaimable(view: &std::fs::DirEntry, now: std::time::SystemTime) -> bool {
+    let now_ms = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        });
+    if let Some(expired) = workspace::lease_expired(&view.path(), now_ms) {
+        return expired;
+    }
     view.metadata()
         .and_then(|metadata| metadata.modified())
         .ok()
-        .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+        .and_then(|modified| now.duration_since(modified).ok())
         .is_some_and(|age| age.as_millis() >= VIEW_IDLE_MS)
 }
 
@@ -485,15 +506,40 @@ mod tests {
     }
 
     #[test]
-    fn a_recent_view_is_kept_and_an_old_layout_directory_goes() {
+    fn a_leased_view_is_kept_and_an_expired_one_goes() {
         let root = tempfile::tempdir().unwrap();
-        let recent = root.path().join(workspace::VIEWS).join("running");
+        let views = root.path().join(workspace::VIEWS);
+        let leased = views.join("running");
+        let expired = views.join("finished");
+        std::fs::create_dir_all(&leased).unwrap();
+        std::fs::create_dir_all(&expired).unwrap();
+        std::fs::write(workspace::lease_marker(&leased), u64::MAX.to_string()).unwrap();
+        std::fs::write(workspace::lease_marker(&expired), "1").unwrap();
+        // A marker left behind by a view that is already gone.
+        std::fs::write(workspace::lease_marker(&views.join("gone")), "1").unwrap();
+
+        let said = prune_views(root.path()).unwrap();
+
+        assert!(leased.is_dir(), "{said}");
+        assert!(workspace::lease_marker(&leased).exists());
+        assert!(!expired.exists(), "{said}");
+        assert!(!workspace::lease_marker(&expired).exists());
+        assert!(!workspace::lease_marker(&views.join("gone")).exists());
+        assert!(
+            said.contains("Removed 1") && said.contains("kept 1"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn a_recent_view_without_a_marker_is_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let recent = root.path().join(workspace::VIEWS).join("older-release");
         std::fs::create_dir_all(&recent).unwrap();
 
         let said = prune_views(root.path()).unwrap();
 
         assert!(recent.is_dir(), "{said}");
-        assert!(said.contains("kept 1"), "{said}");
     }
 
     #[test]
