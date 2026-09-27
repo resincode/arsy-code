@@ -921,15 +921,33 @@ impl From<crate::edit::EditError> for WorkspaceError {
 mod tests {
     use super::*;
 
+    /// A real SQLite store in WAL mode with one committed row, the way ARSY
+    /// left it: a store the migration can checkpoint and has to keep whole.
+    fn legacy_store(path: &Path) {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        connection
+            .execute_batch("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('kept');")
+            .unwrap();
+    }
+
+    /// What the store at `path` holds, read with no sidecar beside it.
+    fn stored(path: &Path) -> String {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row("SELECT v FROM t", [], |row| row.get(0))
+            .unwrap()
+    }
+
     fn legacy_workspace() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
         let arsy = root.path().join(".arsy");
         fs::create_dir_all(arsy.join("artifacts/ab")).unwrap();
         fs::write(arsy.join("artifacts/ab/blob"), "evidence").unwrap();
         fs::write(arsy.join("repo-map.json"), "{}").unwrap();
-        fs::write(arsy.join("sessions.sqlite3"), "db").unwrap();
-        fs::write(arsy.join("sessions.sqlite3-wal"), "wal").unwrap();
-        fs::write(arsy.join("sessions.sqlite3-shm"), "shm").unwrap();
+        legacy_store(&arsy.join("sessions.sqlite3"));
         fs::create_dir_all(arsy.join("views/agent")).unwrap();
         fs::create_dir_all(arsy.join("eval/trial")).unwrap();
         fs::write(arsy.join("arsy.json"), "{}").unwrap();
@@ -944,9 +962,7 @@ mod tests {
         let read = |path: &str| fs::read_to_string(root.path().join(path)).unwrap();
         assert_eq!(read(".arsy/state/artifacts/ab/blob"), "evidence");
         assert_eq!(read(REPO_MAP), "{}");
-        assert_eq!(read(SESSION_STORE), "db");
-        assert_eq!(read(".arsy/state/sessions.sqlite3-wal"), "wal");
-        assert_eq!(read(".arsy/state/sessions.sqlite3-shm"), "shm");
+        assert_eq!(stored(&root.path().join(SESSION_STORE)), "kept");
         for gone in [
             "artifacts",
             "repo-map.json",
@@ -987,25 +1003,25 @@ mod tests {
         assert_eq!(read(SESSION_STORE), "new db");
         assert_eq!(read(REPO_MAP), "new map");
         assert_eq!(
-            read(".arsy/sessions.sqlite3"),
-            "db",
-            "the old store stays put"
+            stored(&root.path().join(".arsy/sessions.sqlite3")),
+            "kept",
+            "the old store stays put, whole"
         );
-        assert_eq!(read(".arsy/sessions.sqlite3-wal"), "wal", "with its log");
-        assert!(!root
-            .path()
-            .join(".arsy/state/sessions.sqlite3-wal")
-            .exists());
     }
 
     #[test]
     fn migrate_moves_sqlite_sidecars_together_or_not_at_all() {
-        // A stale sidecar at the destination stops the move after the WAL has
-        // already gone across; the WAL has to come back with the rest.
+        // A connection left open keeps the log and index files on disk, so
+        // all three have to move; a stale index at the destination stops the
+        // move after the database and its log went across, and both come back.
         let root = legacy_workspace();
-        fs::create_dir_all(root.path().join(RUNTIME_STATE)).unwrap();
         let old = root.path().join(".arsy/sessions.sqlite3");
         let new = root.path().join(".arsy/state/sessions.sqlite3");
+        let open = rusqlite::Connection::open(&old).unwrap();
+        let _: i64 = open
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        fs::create_dir_all(root.path().join(RUNTIME_STATE)).unwrap();
         fs::write(
             root.path().join(".arsy/state/sessions.sqlite3-shm"),
             "stale",
@@ -1014,15 +1030,11 @@ mod tests {
 
         assert!(move_session_store(&old, &new).is_err());
 
-        // forgeguard: allow FG-SEC-007 -- test helper reading a file the test itself wrote in a tempdir
-        let read = |path: &str| fs::read_to_string(root.path().join(path)).unwrap();
-        assert_eq!(read(".arsy/sessions.sqlite3"), "db");
-        assert_eq!(
-            read(".arsy/sessions.sqlite3-wal"),
-            "wal",
-            "the moved log came back"
+        assert_eq!(stored(&old), "kept", "the database came back");
+        assert!(
+            root.path().join(".arsy/sessions.sqlite3-wal").exists(),
+            "with its log"
         );
-        assert_eq!(read(".arsy/sessions.sqlite3-shm"), "shm");
         assert!(!new.exists());
         assert!(!root
             .path()

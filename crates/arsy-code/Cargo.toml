@@ -33,6 +33,7 @@ yaml_serde.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+rusqlite.workspace = true
 
 [[bench]]
 name = "performance"
