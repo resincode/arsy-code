@@ -174,22 +174,41 @@ pub fn inventory(root: &Path) -> Vec<Entry> {
 }
 
 /// Bytes and files under `path`, following no symlink.
+///
+/// Walked with an explicit stack rather than recursion, so a deep tree — a
+/// worktree's `node_modules`, say — costs heap, never the thread's stack.
+/// `DirEntry::file_type` does not follow links either, and answers from the
+/// directory listing itself on most platforms, so most entries cost no extra
+/// metadata call beyond their size.
 fn measure(path: &Path) -> (u64, u64) {
-    // forgeguard: allow FG-SEC-007 -- inventory paths are fixed names under the config home or the workspace; symlinks are not followed
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return (0, 0);
-    };
-    if !metadata.is_dir() {
-        return (metadata.len(), 1);
+    let (mut bytes, mut files) = (0, 0);
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        // forgeguard: allow FG-SEC-007 -- inventory paths are fixed names under the config home or the workspace; symlinks are not followed
+        let Ok(metadata) = std::fs::symlink_metadata(&next) else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            bytes += metadata.len();
+            files += 1;
+            continue;
+        }
+        // forgeguard: allow FG-SEC-007 -- reached only for a directory symlink_metadata confirmed is not a link
+        let Ok(children) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for child in children.flatten() {
+            match child.file_type() {
+                Ok(kind) if kind.is_dir() => pending.push(child.path()),
+                Ok(_) => {
+                    bytes += child.metadata().map_or(0, |metadata| metadata.len());
+                    files += 1;
+                }
+                Err(_) => {}
+            }
+        }
     }
-    // forgeguard: allow FG-SEC-007 -- reached only for a directory symlink_metadata confirmed is not a link
-    let Ok(children) = std::fs::read_dir(path) else {
-        return (0, 0);
-    };
-    children
-        .flatten()
-        .map(|child| measure(&child.path()))
-        .fold((0, 0), |(bytes, files), (b, f)| (bytes + b, files + f))
+    (bytes, files)
 }
 
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {
@@ -540,6 +559,20 @@ mod tests {
         let said = prune_views(root.path()).unwrap();
 
         assert!(recent.is_dir(), "{said}");
+    }
+
+    #[test]
+    fn a_deep_tree_is_measured_without_recursion() {
+        let root = tempfile::tempdir().unwrap();
+        let mut deep = root.path().to_path_buf();
+        for level in 0..200 {
+            deep.push(format!("d{level}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("leaf"), "1234").unwrap();
+        std::fs::write(root.path().join("top"), "12").unwrap();
+
+        assert_eq!(measure(root.path()), (6, 2));
     }
 
     #[test]
