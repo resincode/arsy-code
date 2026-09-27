@@ -55,7 +55,7 @@ impl Scope {
         }
     }
 
-    const fn layer(self) -> Layer {
+    pub(crate) const fn layer(self) -> Layer {
         match self {
             Self::User => Layer::User,
             Self::Workspace => Layer::Workspace,

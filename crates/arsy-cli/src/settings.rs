@@ -4,7 +4,7 @@
 //! so a value is checked against the same registry, lands in the same file,
 //! and is refused the same way whichever surface the operator used.
 
-use crate::config_load::{load_config, replace_file};
+use crate::config_load::replace_file;
 use crate::{config_edit, mcp::Scope};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -42,55 +42,81 @@ pub(crate) fn unset(root: &Path, scope: Scope, key: &str) -> Result<PathBuf, Str
     edit(root, scope, |config| config_edit::remove(config, &path))
 }
 
-/// Apply `change` to one layer's file, then load every layer. A file the loader
-/// refuses is put back as it was, so a write never leaves ARSY unable to start.
+/// Apply `change` to one layer's file. The result is checked by the loader
+/// before the file is touched, so a refused edit never reaches the disk and a
+/// stop part-way leaves the old file or the new one, never one ARSY refuses.
 fn edit(
     root: &Path,
     scope: Scope,
     change: impl FnOnce(&str) -> Result<String, String>,
 ) -> Result<PathBuf, String> {
     let file = scope.path(root).map_err(|diagnostic| diagnostic.message)?;
-    let original = rewrite(&file, change)?;
-    if let Err(diagnostic) = load_config(root, root, None) {
-        let _ = match &original {
-            Some(original) => replace_file(&file, original.as_bytes()),
-            // forgeguard: allow FG-SEC-007 -- the scope's arsy.json under the config home or the workspace, a fixed name
-            None => std::fs::remove_file(&file),
-        };
-        return Err(format!(
-            "{} was left unchanged: {}",
-            file.display(),
-            diagnostic.message
-        ));
-    }
+    let original = read_existing(&file)?;
+    let updated = change(original.as_deref().unwrap_or(""))?;
+    validate(&file, scope, &updated)?;
+    write(&file, &updated)?;
     Ok(file)
+}
+
+/// Whether the loader takes `updated` as this layer's file, judged from a
+/// staged copy beside it that is removed again either way.
+fn validate(file: &Path, scope: Scope, updated: &str) -> Result<(), String> {
+    let name = file
+        .file_name()
+        .map_or_else(|| "arsy.json".into(), |name| name.to_string_lossy());
+    let staged = file.with_file_name(format!(".{name}.check-{}", std::process::id()));
+    if let Some(parent) = staged.parent() {
+        // forgeguard: allow FG-SEC-007 -- the parent of arsy.json under the config home or the workspace
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("{} could not be created: {error}", parent.display()))?;
+    }
+    // forgeguard: allow FG-SEC-007 -- a dotfile staged beside arsy.json under the config home or the workspace
+    std::fs::write(&staged, updated)
+        .map_err(|error| format!("{} could not be written: {error}", staged.display()))?;
+    let checked = arsy_kernel::config::Config::load(&[(scope.layer(), staged.clone())]);
+    let _ = std::fs::remove_file(&staged);
+    checked.map(|_| ()).map_err(|error| {
+        format!(
+            "{} was left unchanged: the edit would not load: {}",
+            file.display(),
+            error.message
+        )
+    })
 }
 
 /// Rewrite one JSON file ARSY owns through `change`, creating it and its
 /// directory when missing, and hand back what it held before (`None` when it
-/// did not exist) so a caller can put it back.
+/// did not exist).
 ///
 /// The write is atomic, so a reader sees the old file or the new one. The
-/// settings and guard writers share it.
+/// guard writer uses it; settings go through `edit`, which also validates.
 pub(crate) fn rewrite(
     file: &Path,
     change: impl FnOnce(&str) -> Result<String, String>,
 ) -> Result<Option<String>, String> {
-    // forgeguard: allow FG-SEC-007 -- only ever arsy.json or guard.json under the config home or the workspace
-    let original = match std::fs::read_to_string(file) {
-        Ok(original) => Some(original),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(format!("{} could not be read: {error}", file.display())),
-    };
+    let original = read_existing(file)?;
     let updated = change(original.as_deref().unwrap_or(""))?;
+    write(file, &updated)?;
+    Ok(original)
+}
+
+fn read_existing(file: &Path) -> Result<Option<String>, String> {
+    // forgeguard: allow FG-SEC-007 -- only ever arsy.json or guard.json under the config home or the workspace
+    match std::fs::read_to_string(file) {
+        Ok(original) => Ok(Some(original)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{} could not be read: {error}", file.display())),
+    }
+}
+
+fn write(file: &Path, updated: &str) -> Result<(), String> {
     if let Some(parent) = file.parent() {
         // forgeguard: allow FG-SEC-007 -- the parent of arsy.json or guard.json under the config home or the workspace
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("{} could not be created: {error}", parent.display()))?;
     }
     replace_file(file, updated.as_bytes())
-        .map_err(|error| format!("{} could not be written: {error}", file.display()))?;
-    Ok(original)
+        .map_err(|error| format!("{} could not be written: {error}", file.display()))
 }
 
 #[cfg(test)]
@@ -138,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_the_loader_refuses_is_put_back() {
+    fn an_edit_the_loader_refuses_never_reaches_the_file() {
         let root = tempfile::tempdir().unwrap();
         let file = root.path().join(".arsy/arsy.json");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -149,5 +175,11 @@ mod tests {
         assert!(set(root.path(), Scope::Workspace, "ui.style", "classic").is_err());
 
         assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        let left: Vec<_> = std::fs::read_dir(file.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(left, ["arsy.json"], "the staged copy is cleaned up");
     }
 }
