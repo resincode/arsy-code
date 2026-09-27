@@ -1058,6 +1058,25 @@ mod tests {
     }
 
     #[test]
+    fn a_store_being_written_is_left_for_a_later_run() {
+        let root = legacy_workspace();
+        let old = root.path().join(".arsy/sessions.sqlite3");
+        let writer = rusqlite::Connection::open(&old).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        migrate_state(root.path());
+
+        assert!(old.exists(), "nothing moved under a writer");
+        assert!(!root.path().join(SESSION_STORE).exists());
+        writer.execute_batch("ROLLBACK;").unwrap();
+        drop(writer);
+
+        migrate_state(root.path());
+        assert!(!old.exists());
+        assert_eq!(stored(&root.path().join(SESSION_STORE)), "kept");
+    }
+
+    #[test]
     fn a_workspace_without_old_state_gets_no_state_directory() {
         let root = tempfile::tempdir().unwrap();
         migrate_state(root.path());
