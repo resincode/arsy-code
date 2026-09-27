@@ -177,9 +177,7 @@ pub fn inventory(root: &Path) -> Vec<Entry> {
 ///
 /// Walked with an explicit stack rather than recursion, so a deep tree — a
 /// worktree's `node_modules`, say — costs heap, never the thread's stack.
-/// `DirEntry::file_type` does not follow links either, and answers from the
-/// directory listing itself on most platforms, so most entries cost no extra
-/// metadata call beyond their size.
+/// Every entry costs one `symlink_metadata`, the same as before.
 fn measure(path: &Path) -> (u64, u64) {
     let (mut bytes, mut files) = (0, 0);
     let mut pending = vec![path.to_path_buf()];
@@ -194,18 +192,8 @@ fn measure(path: &Path) -> (u64, u64) {
             continue;
         }
         // forgeguard: allow FG-SEC-007 -- reached only for a directory symlink_metadata confirmed is not a link
-        let Ok(children) = std::fs::read_dir(&next) else {
-            continue;
-        };
-        for child in children.flatten() {
-            match child.file_type() {
-                Ok(kind) if kind.is_dir() => pending.push(child.path()),
-                Ok(_) => {
-                    bytes += child.metadata().map_or(0, |metadata| metadata.len());
-                    files += 1;
-                }
-                Err(_) => {}
-            }
+        if let Ok(children) = std::fs::read_dir(&next) {
+            pending.extend(children.flatten().map(|child| child.path()));
         }
     }
     (bytes, files)
