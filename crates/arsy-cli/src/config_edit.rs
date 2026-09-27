@@ -500,6 +500,32 @@ mod tests {
         assert!(remove_hook(&guard, "Stop", 0).is_err());
     }
 
+    /// Keys are shifted out of place: shifting in place lets a key moved down
+    /// land on one not yet moved, in whatever order the file lists them.
+    #[test]
+    fn shifting_never_lands_one_key_on_another() {
+        for config in [
+            r#"{"hook": {"disabled": {"/g#Stop[10].0": true, "/g#Stop[9].0": true}}}"#,
+            r#"{"hook": {"disabled": {"/g#Stop[2].0": true, "/g#Stop[1].0": true}}}"#,
+        ] {
+            let shifted = shift_disabled(config, "/g", "Stop", 0).unwrap();
+            let written: Value = serde_json::from_str(&shifted).unwrap();
+            let mut keys: Vec<String> = written["hook"]["disabled"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            keys.sort_unstable();
+            let expected: Vec<String> = if config.contains("[10]") {
+                vec!["/g#Stop[8].0".into(), "/g#Stop[9].0".into()]
+            } else {
+                vec!["/g#Stop[0].0".into(), "/g#Stop[1].0".into()]
+            };
+            assert_eq!(keys, expected, "{config}");
+        }
+    }
+
     #[test]
     fn switched_off_hooks_stay_the_same_hooks_after_a_removal() {
         let config = r#"{"hook": {"disabled": {
