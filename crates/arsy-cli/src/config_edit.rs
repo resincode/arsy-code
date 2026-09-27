@@ -274,6 +274,9 @@ pub fn shift_disabled(
         .filter(|key| key.starts_with(&prefix))
         .cloned()
         .collect();
+    // Taken out first and put back after: moving keys in place would let one
+    // land on another not yet moved, whatever order the file lists them in.
+    let mut moved = Vec::new();
     for key in keys {
         let rest = &key[prefix.len()..];
         let Some((found, tail)) = rest.split_once(']') else {
@@ -282,13 +285,15 @@ pub fn shift_disabled(
         let Ok(found) = found.parse::<usize>() else {
             continue;
         };
+        if found < position {
+            continue;
+        }
         let value = disabled.remove(&key).unwrap_or(Value::Bool(true));
         if found > position {
-            disabled.insert(format!("{prefix}{}]{tail}", found - 1), value);
-        } else if found < position {
-            disabled.insert(key, value);
+            moved.push((format!("{prefix}{}]{tail}", found - 1), value));
         }
     }
+    disabled.extend(moved);
     Ok(render(&document))
 }
 
