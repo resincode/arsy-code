@@ -230,6 +230,7 @@ impl WorkspaceCoordinator {
             branch: Some(owner.branch()),
             carried_patch: carried,
         };
+        write_lease_marker(&lease.view, expires_at_ms);
         self.leases.insert(owner.agent, lease.clone());
         Ok(lease)
     }
@@ -246,7 +247,9 @@ impl WorkspaceCoordinator {
             other => Err(other),
         })?;
         let key = (source.clone(), base.clone());
-        let view = if let Some(existing) = self.readers.get(&key) {
+        // A view someone else's cleanup removed is cut again rather than
+        // handed out as a path that no longer exists.
+        let view = if let Some(existing) = self.readers.get(&key).filter(|view| view.exists()) {
             existing.clone()
         } else {
             fs::create_dir_all(isolation_root)?;
@@ -264,6 +267,10 @@ impl WorkspaceCoordinator {
             self.readers.insert(key, view.clone());
             view
         };
+        // A reader view is shared and never expires in this process, so the
+        // marker another process reads is renewed on every use instead: a view
+        // nobody asked for in a lease's length is one nobody is reading.
+        write_lease_marker(&view, now_ms() + READER_LEASE_MS);
         let backend = if git_revision(&source).is_ok() {
             IsolationBackend::GitWorktree
         } else {
@@ -362,6 +369,7 @@ impl WorkspaceCoordinator {
     pub fn discard(&mut self, lease: &WorkspaceLease) -> Result<(), WorkspaceError> {
         let _admin = admin();
         self.leases.remove(&lease.owner);
+        let _ = fs::remove_file(lease_marker(&lease.view));
         if lease.backend == IsolationBackend::GitWorktree {
             let _ = git(
                 &lease.source,
@@ -583,6 +591,41 @@ pub fn ensure_state_dir(root: &Path, ignore_itself: bool) -> io::Result<PathBuf>
         fs::write(&ignore, "*\n")?;
     }
     Ok(state)
+}
+
+/// How long a reader view's marker says it is in use after its last lease.
+const READER_LEASE_MS: u64 = 30 * 60 * 1_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// The file beside a view that says until when it is leased.
+///
+/// Leases live in the memory of the process that cut them, so another
+/// process — `arsy storage clean views` in a second terminal — cannot see
+/// them. This marker is what it reads instead of guessing from timestamps.
+pub fn lease_marker(view: &Path) -> PathBuf {
+    let mut name = view.as_os_str().to_owned();
+    name.push(".lease");
+    PathBuf::from(name)
+}
+
+fn write_lease_marker(view: &Path, expires_at_ms: u64) {
+    // Best effort: a missing marker falls back to the older, cruder rule,
+    // which is what every view cut before markers existed gets anyway.
+    let _ = fs::write(lease_marker(view), expires_at_ms.to_string());
+}
+
+/// Whether the view's lease has run out: `None` when it has no marker.
+pub fn lease_expired(view: &Path, now_ms: u64) -> Option<bool> {
+    let text = fs::read_to_string(lease_marker(view)).ok()?;
+    let expires_at_ms: u64 = text.trim().parse().ok()?;
+    Some(expires_at_ms <= now_ms)
 }
 
 /// Where each piece of runtime state lived before `.arsy/state/`.
@@ -1395,6 +1438,51 @@ mod tests {
             "uncommitted\n",
             "the operator's work reaches the view rather than vanishing"
         );
+    }
+
+    /// Another process can see a view is leased only through its marker, so
+    /// the marker follows the lease from the moment the view is cut until it
+    /// is discarded, and a shared reader view renews it on every use.
+    #[test]
+    fn a_lease_marker_follows_every_view_it_describes() {
+        let source = repository();
+        let views = tempfile::tempdir().unwrap();
+        let mut coordinator = WorkspaceCoordinator::default();
+
+        let writer = coordinator
+            .writer_for(
+                source.path(),
+                views.path(),
+                &owner(),
+                10,
+                DirtyPolicy::Refuse,
+            )
+            .unwrap();
+        assert_eq!(lease_expired(&writer.view, 9), Some(false));
+        assert_eq!(lease_expired(&writer.view, 10), Some(true));
+        coordinator.discard(&writer).unwrap();
+        assert!(!lease_marker(&writer.view).exists());
+
+        let reader = coordinator
+            .reader(source.path(), views.path(), AgentId::new())
+            .unwrap();
+        assert_eq!(lease_expired(&reader.view, now_ms()), Some(false));
+
+        // Removed from under this process, the shared view is cut again.
+        let _ = git(
+            source.path(),
+            [
+                "worktree",
+                "remove",
+                "--force",
+                path_text(&reader.view).unwrap(),
+            ],
+        );
+        let again = coordinator
+            .reader(source.path(), views.path(), AgentId::new())
+            .unwrap();
+        assert!(again.view.is_dir());
+        assert_eq!(lease_expired(&again.view, now_ms()), Some(false));
     }
 
     #[test]
