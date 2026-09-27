@@ -1811,9 +1811,7 @@ fn read_catalog() -> Result<Option<String>, Diagnostic> {
 fn write_catalog(raw: &str) -> Result<(), Diagnostic> {
     let path = FileCredentialStore::path(CATALOG_FILE)
         .ok_or_else(|| secret_failed("this platform has no user configuration directory"))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(storage_failed)?;
-    }
+    FileCredentialStore::prepare(&path).map_err(storage_failed)?;
     // Created owner-only rather than created and then narrowed: a chmod after
     // the write leaves a window where the catalog is readable by the whole
     // machine.
