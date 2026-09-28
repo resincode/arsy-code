@@ -30,11 +30,11 @@ pub(crate) fn remember_effort(effort: Option<Effort>, emitter: &mut Emitter) {
     }
 }
 
-/// The remembered model lives beside the user configuration layer that
-/// `arsy doctor` already reports.
+/// The remembered model lives in the configuration home's `state` directory,
+/// with the other choices the terminal remembers.
 #[cfg(feature = "tui")]
 fn model_store() -> Option<PathBuf> {
-    Some(arsy_kernel::config::user_config()?.with_file_name("model"))
+    arsy_kernel::config::home_file(arsy_kernel::config::STATE_DIRECTORY, "model")
 }
 
 /// The route chosen last time, as `provider/model`.
@@ -64,7 +64,7 @@ pub(crate) fn save_route(route: &tui::ModelRoute) -> io::Result<()> {
 #[cfg(feature = "tui")]
 #[cfg(feature = "tui")]
 fn effort_store() -> Option<PathBuf> {
-    Some(arsy_kernel::config::user_config()?.with_file_name("effort"))
+    arsy_kernel::config::home_file(arsy_kernel::config::STATE_DIRECTORY, "effort")
 }
 
 /// The effort chosen last time, re-validated on read for the same reason the
@@ -91,7 +91,7 @@ pub(crate) fn save_effort(effort: Option<Effort>) -> io::Result<()> {
 /// The remembered colour theme, beside the remembered effort.
 #[cfg(feature = "tui")]
 fn theme_store() -> Option<PathBuf> {
-    Some(arsy_kernel::config::user_config()?.with_file_name("theme"))
+    arsy_kernel::config::home_file(arsy_kernel::config::STATE_DIRECTORY, "theme")
 }
 
 /// The theme chosen last time, kept only if it is still a built-in name: a

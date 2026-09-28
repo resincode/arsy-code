@@ -51,6 +51,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/settings",
         "settings; alone opens the editor | show effective configuration, [KEY]",
     ),
+    (
+        "/storage",
+        "where ARSY keeps files and how big each is; clean caches, views, history",
+    ),
     ("/doctor", "check workspace, storage, and sandbox assurance"),
     (
         "/auth",

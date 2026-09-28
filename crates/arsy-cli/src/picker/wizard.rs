@@ -431,9 +431,7 @@ pub(crate) fn store_credential(name: &str, secret: &str) -> Result<String, Strin
     let file = format!("{name}.key");
     let path = FileCredentialStore::path(&file)
         .ok_or_else(|| "this platform has no user configuration directory".to_owned())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
+    FileCredentialStore::prepare(&path).map_err(|error| error.to_string())?;
     let mut written = owner_only(&path).map_err(|error| error.message)?;
     written
         .write_all(secret.as_bytes())

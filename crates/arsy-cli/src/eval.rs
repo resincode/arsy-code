@@ -583,7 +583,7 @@ impl Trial {
         let cut = coordinator
             .writer_for(
                 workspace,
-                &workspace.join(".arsy/eval"),
+                &workspace.join(arsy_code::workspace::EVAL),
                 &owner,
                 u64::MAX,
                 // Uncommitted work is carried so a trial measures the tree

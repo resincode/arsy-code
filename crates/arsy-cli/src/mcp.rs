@@ -23,14 +23,14 @@ pub enum Scope {
 }
 
 impl Scope {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::User => "user",
             Self::Workspace => "workspace",
         }
     }
 
-    fn parse(value: Option<&str>) -> Result<Self, Diagnostic> {
+    pub(crate) fn parse(value: Option<&str>) -> Result<Self, Diagnostic> {
         match value {
             // `user` is the default because a connection an operator adds is
             // theirs, not something a cloned repository inherits.
@@ -42,7 +42,7 @@ impl Scope {
         }
     }
 
-    fn path(self, root: &Path) -> Result<PathBuf, Diagnostic> {
+    pub(crate) fn path(self, root: &Path) -> Result<PathBuf, Diagnostic> {
         match self {
             Self::Workspace => Ok(root.join(".arsy").join(config::CONFIG_FILE)),
             Self::User => config::user_config().ok_or_else(|| {
@@ -55,7 +55,7 @@ impl Scope {
         }
     }
 
-    const fn layer(self) -> Layer {
+    pub(crate) const fn layer(self) -> Layer {
         match self {
             Self::User => Layer::User,
             Self::Workspace => Layer::Workspace,

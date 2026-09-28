@@ -86,6 +86,8 @@ pub(crate) fn hook_choices(
                 enabled: !config
                     .hook_disabled()
                     .contains(entry["declaration"].as_str()?),
+                removable: crate::guard::parse_declaration(entry["declaration"].as_str()?)
+                    .is_some_and(|(file, _, _)| crate::guard::scope_of(root, &file).is_some()),
             })
         })
         .collect())
@@ -120,6 +122,52 @@ pub(crate) fn run_hook_dialog(
                 break;
             }
             Keyed::Acted(tui::HookAction::Toggle(index)) => index,
+            Keyed::Acted(tui::HookAction::Add {
+                scope,
+                event,
+                matcher,
+                command,
+            }) => {
+                let matcher = (!matcher.is_empty()).then_some(matcher.as_str());
+                let added =
+                    crate::guard::add(&root, file_scope(scope), &event, matcher, &command, None);
+                dialog.notice = Some(tui::safe_text(&match added {
+                    Ok(file) => {
+                        changed += 1;
+                        let trust = if scope == tui::SettingsScope::Project {
+                            " It runs once this directory is trusted."
+                        } else {
+                            ""
+                        };
+                        format!("Added a {event} hook to {}.{trust}", file.display())
+                    }
+                    Err(reason) => reason,
+                }));
+                rows = hook_choices(&root, invocation)?;
+                dialog.reload(rows);
+                continue;
+            }
+            Keyed::Acted(tui::HookAction::Remove(index)) => {
+                let declaration = dialog.choices[index].declaration.clone();
+                let removed = crate::guard::parse_declaration(&declaration)
+                    .and_then(|(file, event, position)| {
+                        crate::guard::scope_of(&root, &file).map(|scope| (scope, event, position))
+                    })
+                    .ok_or_else(|| "only a hook in ARSY's own guard.json can be removed".to_owned())
+                    .and_then(|(scope, event, position)| {
+                        crate::guard::remove(&root, scope, &event, position)
+                    });
+                dialog.notice = Some(tui::safe_text(&match removed {
+                    Ok(file) => {
+                        changed += 1;
+                        format!("Removed the hook from {}.", file.display())
+                    }
+                    Err(reason) => reason,
+                }));
+                rows = hook_choices(&root, invocation)?;
+                dialog.reload(rows);
+                continue;
+            }
         };
         let choice = dialog.choices[action].clone();
         let enabled = !choice.enabled;
@@ -129,7 +177,6 @@ pub(crate) fn run_hook_dialog(
         let change = write_config(|config| {
             if enabled {
                 config_edit::remove(config, &["hook", "disabled", &choice.declaration])
-                    .map(|_updated| config.to_owned())
             } else {
                 config_edit::set(
                     config,
@@ -137,7 +184,6 @@ pub(crate) fn run_hook_dialog(
                     &choice.declaration,
                     serde_json::Value::Bool(true),
                 )
-                .map(|_updated| config.to_owned())
             }
         });
         dialog.notice = Some(match change {
@@ -155,29 +201,25 @@ pub(crate) fn run_hook_dialog(
     Ok(())
 }
 
-/// Apply one edited setting's new value, printing what happened. `None` when
-/// the key is unknown to this build, `Some(reason)` when the value was
-/// rejected, `Ok` state when it was written.
+/// Apply one edited setting's new value to the file `scope` names. `None`
+/// when it was written, `Some(reason)` when it was refused and nothing changed.
 #[cfg(feature = "tui")]
 pub(crate) fn apply_edited_setting(
+    root: &Path,
+    scope: tui::SettingsScope,
     row: &tui::SettingRow,
     line: &str,
-) -> Result<Option<String>, String> {
-    let Some(setting) = arsy_kernel::config::setting(&row.key) else {
-        return Ok(Some(format!(
-            "`{}` is not a setting this build can write",
-            row.key
-        )));
-    };
-    if let Err(reason) = setting.kind.check(line) {
-        return Ok(Some(reason));
+) -> Option<String> {
+    crate::settings::set(root, file_scope(scope), &row.key, line).err()
+}
+
+/// The dialog's two scopes as the configuration writer names them.
+#[cfg(feature = "tui")]
+pub(crate) const fn file_scope(scope: tui::SettingsScope) -> mcp::Scope {
+    match scope {
+        tui::SettingsScope::User => mcp::Scope::User,
+        tui::SettingsScope::Project => mcp::Scope::Workspace,
     }
-    write_config(|config| {
-        let (path, leaf) = setting_path(&row.key)?;
-        config_edit::set(config, &path, leaf, setting.kind.to_json(line))
-            .map(|_updated| config.to_owned())
-    })
-    .map(|_| None)
 }
 /// One ecosystem's declared skills, as the dialog offers them.
 ///
@@ -294,7 +336,6 @@ pub(crate) fn run_skill_dialog(
                         &choice.key,
                         serde_json::Value::Bool(!offering),
                     )
-                    .map(|_updated| config.to_owned())
                 }) {
                     Ok(()) => {
                         let state = if offering { "offered" } else { "switched off" };
@@ -359,6 +400,15 @@ pub(crate) fn setting_rows(invocation: &Invocation) -> Result<Vec<tui::SettingRo
                     .collect(),
                 kind,
                 set: view.set,
+                origin: view
+                    .origin
+                    .as_ref()
+                    .map(|origin| match origin.layer {
+                        arsy_kernel::config::Layer::Workspace
+                        | arsy_kernel::config::Layer::Nested => "project".to_owned(),
+                        layer => layer.as_str().to_owned(),
+                    })
+                    .unwrap_or_default(),
             }
         })
         .collect())
@@ -374,6 +424,7 @@ pub(crate) fn run_settings_dialog(
     theme: &mut String,
     roles: &std::collections::BTreeMap<String, String>,
 ) -> Result<(), Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
     let mut rows = setting_rows(invocation)?;
     let mut dialog = tui::SettingsDialogState::new(rows);
     let mut changes: Vec<String> = Vec::new();
@@ -393,21 +444,22 @@ pub(crate) fn run_settings_dialog(
             Keyed::Acted(tui::SettingsAction::Close) => break,
             Keyed::Acted(tui::SettingsAction::Reset(index)) => {
                 let row = dialog.rows[index].clone();
-                let removed = match setting_path(&row.key) {
-                    Ok((path, _leaf)) => write_config(|config| {
-                        config_edit::remove(config, &path).map(|_updated| config.to_owned())
-                    }),
-                    Err(reason) => Err(reason),
-                };
-                match removed {
+                let scope = dialog.scope;
+                match crate::settings::unset(&root, file_scope(scope), &row.key) {
                     Ok(_) => {
-                        changes.push(format!("`{}` back to its default.", row.key));
+                        changes.push(format!(
+                            "`{}` removed from the {} settings.",
+                            row.key,
+                            scope.label()
+                        ));
                         dialog.notice = Some(format!(
-                            "`{}` removed; it stands at its default {}.",
-                            row.key, row.default
+                            "`{}` removed from the {} settings; another layer or the default {} decides it.",
+                            row.key,
+                            scope.label(),
+                            row.default
                         ));
                     }
-                    Err(reason) => dialog.notice = Some(reason),
+                    Err(reason) => dialog.notice = Some(tui::safe_text(&reason)),
                 }
                 rows = setting_rows(invocation)?;
                 dialog.reload(rows);
@@ -415,9 +467,15 @@ pub(crate) fn run_settings_dialog(
             }
             Keyed::Acted(tui::SettingsAction::Apply(index, pending)) => {
                 let row = dialog.rows[index].clone();
-                let notice = match apply_edited_setting(&row, &pending) {
-                    Ok(None) => format!("`{}` set to {}.", row.key, tui::safe_text(&pending)),
-                    Ok(Some(reason)) | Err(reason) => tui::safe_text(&reason),
+                let scope = dialog.scope;
+                let notice = match apply_edited_setting(&root, scope, &row, &pending) {
+                    None => format!(
+                        "`{}` set to {} in the {} settings.",
+                        row.key,
+                        tui::safe_text(&pending),
+                        scope.label()
+                    ),
+                    Some(reason) => tui::safe_text(&reason),
                 };
                 dialog.notice = Some(notice);
                 // Two settings cannot wait for a restart, because they change
@@ -432,6 +490,96 @@ pub(crate) fn run_settings_dialog(
                 continue;
             }
         };
+    }
+    close_dialog(stdout, drawn, &changes, "")?;
+    Ok(())
+}
+
+/// Every location `storage::inventory` measured, as the dialog draws it.
+#[cfg(feature = "tui")]
+fn storage_rows(entries: &[crate::storage::Entry]) -> Vec<tui::StorageRow> {
+    entries
+        .iter()
+        .map(|entry| tui::StorageRow {
+            label: entry.label.to_owned(),
+            scope: entry.scope.to_owned(),
+            path: tui::safe_text(&entry.path.display().to_string()),
+            size: if entry.exists {
+                crate::storage::human_bytes(entry.bytes)
+            } else {
+                "—".to_owned()
+            },
+            action: entry.action.map(|action| match action {
+                crate::storage::Action::Clean(_) => "clean".to_owned(),
+                crate::storage::Action::ResetHistory => "reset".to_owned(),
+            }),
+            resets_history: entry.action == Some(crate::storage::Action::ResetHistory),
+        })
+        .collect()
+}
+
+/// Drive `/storage`: list every location, run the cleanup a row offers, and
+/// after a history reset carry on in a fresh session, since the one running
+/// no longer has a store behind it.
+#[cfg(feature = "tui")]
+pub(crate) fn run_storage_dialog(
+    invocation: &Invocation,
+    mut restoring: Restoring<'_>,
+    stdout: &mut io::Stdout,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> Result<(), Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
+    // One scan feeds both the rows drawn and the actions dispatched by row, and
+    // both are refreshed together after every action, so an index always
+    // names the entry the operator saw.
+    let mut entries = crate::storage::inventory(&root);
+    let mut dialog = tui::StorageDialogState::new(
+        storage_rows(&entries),
+        crate::storage::workspace_name(&root),
+    );
+    let mut changes: Vec<String> = Vec::new();
+    let mut drawn = 0;
+    loop {
+        drawn = repaint_dialog(
+            stdout,
+            colour,
+            drawn,
+            &dialog.render(tui::terminal_width(), colour),
+        )?;
+        let action = match next_dialog_key(&mut dialog, keys, decoder, |dialog: &mut _, key| {
+            dialog.handle_key(key)
+        }) {
+            Keyed::Ended | Keyed::Acted(tui::StorageAction::Close) => break,
+            Keyed::Redraw => continue,
+            Keyed::Acted(action) => action,
+        };
+        let outcome = match action {
+            tui::StorageAction::Clean(index) => match entries.get(index).and_then(|e| e.action) {
+                Some(crate::storage::Action::Clean(target)) => {
+                    crate::storage::clean(invocation, &root, target)
+                }
+                _ => Err("nothing to clean here".to_owned()),
+            },
+            tui::StorageAction::ResetHistory(_, typed) => {
+                crate::storage::reset_history(&root, &typed).map(|message| {
+                    let started = super::prompt::start_session(restoring.reborrow());
+                    format!("{message} Started fresh session {started}.")
+                })
+            }
+            tui::StorageAction::Close => break,
+        };
+        let notice = match outcome {
+            Ok(message) => {
+                changes.push(message.clone());
+                message
+            }
+            Err(reason) => reason,
+        };
+        entries = crate::storage::inventory(&root);
+        dialog.reload(storage_rows(&entries));
+        dialog.notice = Some(tui::safe_text(&notice));
     }
     close_dialog(stdout, drawn, &changes, "")?;
     Ok(())
@@ -517,15 +665,6 @@ pub(crate) fn apply_live_setting(
         }
         _ => None,
     }
-}
-
-/// The dotted key as the path its object sits at and the leaf that names it.
-#[cfg(feature = "tui")]
-pub(crate) fn setting_path(key: &str) -> Result<(Vec<&str>, &str), String> {
-    let (path, leaf) = key
-        .rsplit_once('.')
-        .ok_or_else(|| format!("`{key}` is not a dotted key this build can write"))?;
-    Ok((path.split('.').collect(), leaf))
 }
 
 /// The configuration resolved for this workspace, for a dialog that needs to

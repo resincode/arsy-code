@@ -55,8 +55,9 @@ and whether each declaration is loaded, alongside every file the engine read.
 Hooks come from whichever ecosystem the operator already uses, found where
 `CLAUDE_CONFIG_DIR` and `CODEX_HOME` put them. `~/.claude/settings.json`
 supplies Claude-shaped command hooks; `~/.codex/config.toml` supplies Codex's one
-lifecycle callback, `notify`, as `after_turn`; and `~/.arsy/guard.json` is the
-same Claude shape under ARSY's own name, for an operator using neither. Only
+lifecycle callback, `notify`, as `after_turn`; and `~/.arsy/guard.json` (in
+`ARSY_CONFIG_HOME` when that is set) is the same Claude shape under ARSY's own
+name, for an operator using neither. Only
 `type: "command"` runs — a `prompt`, `agent`, or `http` handler is reported
 against its file and skipped.
 
@@ -97,9 +98,15 @@ slash commands are `/model`, which writes the accepted answer to the user
 configuration; the `/mcp` dialog, which writes only `enabled` toggles and
 adoptions; and `/provider` (aliased as `/auth`), which owns the credential
 lifecycle in the TUI — adding an endpoint, signing in with OAuth, storing an
-API key, and removing an endpoint or credential. These write the operator's
-own `arsy.json` and the `0600` credential files beside it; nothing else on this
-route mutates state. They work even without provider authentication. Repeat an
+API key, and removing an endpoint or credential. Bare `/settings` edits a
+setting in the user `arsy.json`, or after Tab the project's; bare `/hooks`
+switches a hook off or on, and with `a` and `x` adds a command hook to or
+removes one from ARSY's own `guard.json`; `/storage` lists where ARSY keeps
+files and runs the cleanups `arsy storage` offers, a history reset asking for
+the workspace name as well as a yes. These write the operator's `arsy.json`,
+the project's `.arsy/arsy.json`, the two `guard.json` files, and the `0600`
+credential files in `~/.arsy/secrets/`; nothing else on this route mutates
+state. They work even without provider authentication. Repeat an
 inspection to reload its source files. Unknown slash commands report an error
 instead of becoming model prompts.
 
@@ -249,7 +256,7 @@ with configuration: a server switched off or redefined is disconnected, a
 connection that broke under a call is reopened, and a server that failed to
 start is reported once and not retried until its definition changes. While a
 server connects, the model is offered the tools it published the last time it
-connected under the same definition — cached in `~/.arsy/mcp-tools.json`, keyed
+connected under the same definition — cached in `~/.arsy/cache/mcp-tools.json`, keyed
 by a SHA-256 of the definition including its launch values — and a call to one
 waits up to a minute for the connection. A server's own log lines are scrubbed of the values it was
 launched with, held, and shown at a turn boundary rather than written as they
@@ -347,6 +354,8 @@ read-only: they never mutate the workspace, session history, or stored configura
 | Command | Positional arguments | Command flags | Description | Availability |
 |---|---|---|---|---|
 | `arsy config explain [KEY]` | optional dotted key; omitted explains every key | `--source-only` | show the effective value, the layer that supplied it, the merge strategy, and the rejected candidates | 1 |
+| `arsy config set <KEY> <VALUE>` | one registry key and its value | `--scope <user\|workspace>` | write one setting to the user or workspace `arsy.json`; a value the registry or loader refuses changes nothing | 1 |
+| `arsy config unset <KEY>` | one registry key | `--scope <user\|workspace>` | remove one setting from that file, so a lower layer or the default decides it | 1 |
 | `arsy compat explain <ECOSYSTEM>` | one of `claude`, `codex`, `omp` | `--loss-only` | show discovered sources, precedence, canonical mapping, and the loss report | 5 |
 | `arsy policy explain <OPERATION>` | one canonical operation kind | `--resource <REF>`, `--actor <ID>` | evaluate a policy query and print the decision, deciding rule, and policy source without executing anything | 1 |
 
@@ -384,6 +393,8 @@ read-only: they never mutate the workspace, session history, or stored configura
 | `arsy plugin refresh [ID]` | optional plugin ID; omitted refreshes every source | `--dry-run` | reload plugins, skills, and hooks from their sources, effective at the next turn boundary | 8 |
 | `arsy skill list` | none | `--source` | list loaded skills with their originating layer and authority class | 5 |
 | `arsy hook list` | none | `--event <NAME>` | list registered hooks with lifecycle event, declared effect class, and origin | 8 |
+| `arsy hook add` | none | `--event <EVENT>` and `--command <CMD>` required, `--matcher <PATTERN>`, `--timeout <SECONDS>`, `--scope <user\|workspace>` | append a `command` hook to ARSY's own `guard.json`; a project hook runs once the directory is trusted | 1 |
+| `arsy hook remove <EVENT> <POSITION>` | event and entry position from `hook list` | `--scope <user\|workspace>` | remove one entry from ARSY's own `guard.json`, keeping every switched-off hook switched off | 1 |
 
 ### Evidence
 
@@ -401,7 +412,10 @@ read-only: they never mutate the workspace, session history, or stored configura
 | `arsy memory list` | none | `--scope <SCOPE>`, `--all` | what this workspace remembers; `--all` includes superseded and revoked records | 9 |
 | `arsy memory remember <CLAIM>` | one required claim | `--scope <SCOPE>` | record a durable claim, stored as an artifact like any other evidence | 9 |
 | `arsy memory forget <ID>` | one required memory ID | `--to <REASON>` | withdraw a record, keeping the tombstone and its reason | 9 |
-| `arsy gc` | none | `--apply`, `--retention <DURATION>` | report artifacts unreachable and past retention; `--apply` is required to delete | 1 |
+| `arsy gc` | none | `--apply`, `--retention <DURATION>` | report artifacts unreachable and past retention (`storage.artifact_retention_days` unless `--retention` is given); `--apply` is required to delete | 1 |
+| `arsy storage` | none | none | list every global and workspace location ARSY uses, with its size, reading only file metadata | 1 |
+| `arsy storage clean <TARGET>` | one of `cache`, `repo-map`, `views`, `artifacts` | none | remove what ARSY rebuilds; views used in the last 30 minutes are kept | 1 |
+| `arsy storage reset-history` | none | `--confirm <WORKSPACE NAME>` required | delete the workspace's session store once nothing is writing to it | 1 |
 | `arsy serve` | none | `--protocol <mcp\|acp>`, `--transport stdio` | offer operations as MCP tools, or speak ACP to an editor; stdio only, because this is never a background daemon | 1 |
 | `arsy eval <SUITE>` | one suite path or ID | `--trials <N>`, `--out <PATH>` | run an evaluation suite and report outcome, efficiency, and safety metrics | 1 |
 | `arsy completions <SHELL>` | one of `bash`, `zsh`, `fish`, `powershell` | none | print a shell completion script to standard output | 1 |

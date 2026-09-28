@@ -1066,7 +1066,7 @@ fn two_writers_change_separate_components_and_an_integrator_applies_both() {
 
     // The views the writers worked in are gone, and nothing they wrote
     // reached the workspace except through the integrator.
-    let views = workspace.path().join(".arsy/views");
+    let views = workspace.path().join(arsy_code::workspace::VIEWS);
     let remaining: Vec<_> = std::fs::read_dir(&views)
         .map(|entries| entries.filter_map(Result::ok).collect())
         .unwrap_or_default();
@@ -1245,7 +1245,7 @@ fn a_claim_that_looks_like_a_credential_is_never_written_to_the_artifact_store()
     let provider = FakeProvider::serving(vec![answers("noted.")]);
     configure(home.path(), provider.port);
 
-    let artifacts = workspace.path().join(".arsy/artifacts");
+    let artifacts = workspace.path().join(arsy_code::workspace::ARTIFACTS);
     let count = || -> usize { walk(&artifacts).len() };
 
     // A claim that is fine is stored, so the comparison below is against a
@@ -1303,10 +1303,11 @@ fn a_hook_denies_a_tool_call_and_the_model_is_told_why() {
     let workspace = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     std::fs::write(workspace.path().join("notes.txt"), "the answer is 42\n").unwrap();
-    std::fs::create_dir_all(home.path().join(".arsy")).unwrap();
+    // `arsy_with_home` points `ARSY_CONFIG_HOME` here, so this is the
+    // operator's `~/.arsy/guard.json`.
     std::fs::write(
-        home.path().join(".arsy/guard.json"),
-        denying_guard(&home.path().join(".arsy"), "notes are off limits"),
+        home.path().join("guard.json"),
+        denying_guard(home.path(), "notes are off limits"),
     )
     .unwrap();
 
@@ -1336,6 +1337,137 @@ fn a_hook_denies_a_tool_call_and_the_model_is_told_why() {
         !transcript.contains("the answer is 42"),
         "the file was never read: {transcript}"
     );
+}
+
+/// `ARSY_CONFIG_HOME` moves the operator's guard with the rest of their ARSY
+/// files: a `guard.json` left in `$HOME/.arsy` is not the one in force.
+#[test]
+fn the_user_guard_follows_the_arsy_config_home() {
+    let workspace = tempfile::tempdir().unwrap();
+    let config_home = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("notes.txt"), "the answer is 42\n").unwrap();
+    std::fs::create_dir_all(home.path().join(".arsy")).unwrap();
+    std::fs::write(
+        home.path().join(".arsy/guard.json"),
+        denying_guard(&home.path().join(".arsy"), "the stale home said no"),
+    )
+    .unwrap();
+
+    let provider = FakeProvider::serving(vec![asks_to_read("notes.txt"), answers("42.")]);
+    configure(config_home.path(), provider.port);
+
+    let (code, records) = arsy_with_home(
+        workspace.path(),
+        config_home.path(),
+        home.path(),
+        &["run", "what does notes.txt say?"],
+    );
+    assert_eq!(code, 0, "{:#?}", result(&records));
+    let _first = provider.request();
+    let unguarded = provider.request().to_string();
+    assert!(
+        !unguarded.contains("the stale home said no"),
+        "the guard outside the config home did not run: {unguarded}"
+    );
+    assert!(
+        unguarded.contains("the answer is 42"),
+        "so the read happened: {unguarded}"
+    );
+
+    // The same guard inside the configuration home is in force.
+    std::fs::write(
+        config_home.path().join("guard.json"),
+        denying_guard(config_home.path(), "the config home said no"),
+    )
+    .unwrap();
+    let provider = FakeProvider::serving(vec![asks_to_read("notes.txt"), answers("I could not.")]);
+    configure(config_home.path(), provider.port);
+
+    let (code, records) = arsy_with_home(
+        workspace.path(),
+        config_home.path(),
+        home.path(),
+        &["run", "what does notes.txt say?"],
+    );
+    assert_eq!(code, 0, "{:#?}", result(&records));
+    let _first = provider.request();
+    let guarded = provider.request().to_string();
+    assert!(
+        guarded.contains("the config home said no"),
+        "the guard in the config home ran: {guarded}"
+    );
+    assert!(
+        !guarded.contains("the answer is 42"),
+        "the file was never read: {guarded}"
+    );
+}
+
+/// A hook added with `arsy hook add` is one the engine runs, and `arsy hook
+/// remove` takes it away again: the commands edit the file the engine reads.
+#[test]
+fn a_hook_added_from_the_cli_denies_and_its_removal_allows() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("notes.txt"), "the answer is 42\n").unwrap();
+    let guard: Value =
+        serde_json::from_str(&denying_guard(home.path(), "added from the cli")).unwrap();
+    let command = guard["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (code, records) = arsy_with_home(
+        workspace.path(),
+        home.path(),
+        home.path(),
+        &[
+            "hook",
+            "add",
+            "--event",
+            "PreToolUse",
+            "--matcher",
+            "fs.read",
+            "--command",
+            &command,
+        ],
+    );
+    assert_eq!(code, 0, "{records:#?}");
+    assert!(home.path().join("guard.json").is_file());
+
+    let provider = FakeProvider::serving(vec![asks_to_read("notes.txt"), answers("I could not.")]);
+    configure(home.path(), provider.port);
+    let (code, records) = arsy_with_home(
+        workspace.path(),
+        home.path(),
+        home.path(),
+        &["run", "what does notes.txt say?"],
+    );
+    assert_eq!(code, 0, "{:#?}", result(&records));
+    let _first = provider.request();
+    let denied = provider.request().to_string();
+    assert!(denied.contains("added from the cli"), "{denied}");
+
+    let (code, records) = arsy_with_home(
+        workspace.path(),
+        home.path(),
+        home.path(),
+        &["hook", "remove", "PreToolUse", "0"],
+    );
+    assert_eq!(code, 0, "{records:#?}");
+
+    let provider = FakeProvider::serving(vec![asks_to_read("notes.txt"), answers("42.")]);
+    configure(home.path(), provider.port);
+    let (code, records) = arsy_with_home(
+        workspace.path(),
+        home.path(),
+        home.path(),
+        &["run", "what does notes.txt say?"],
+    );
+    assert_eq!(code, 0, "{:#?}", result(&records));
+    let _first = provider.request();
+    let allowed = provider.request().to_string();
+    assert!(allowed.contains("the answer is 42"), "{allowed}");
 }
 
 /// The same file in the repository rather than the operator's home does

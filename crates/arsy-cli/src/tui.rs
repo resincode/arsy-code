@@ -71,6 +71,7 @@ mod provider_dialog;
 mod session;
 mod settings_dialog;
 mod skill_dialog;
+mod storage_dialog;
 mod stream;
 mod tool_cards;
 pub use approval::*;
@@ -90,6 +91,7 @@ pub use provider_dialog::*;
 pub use session::*;
 pub use settings_dialog::*;
 pub use skill_dialog::*;
+pub use storage_dialog::*;
 pub use stream::*;
 pub use tool_cards::*;
 

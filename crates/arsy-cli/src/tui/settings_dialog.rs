@@ -8,9 +8,9 @@
 //! the row shows. A value this dialog offers is therefore always one the
 //! loader takes.
 //!
-//! Writes go to the operator's own `arsy.json` through `write_config`, the one
-//! funnel every configuration write uses, so a workspace or enterprise layer
-//! still outranks what is set here.
+//! Writes go to the operator's own `arsy.json` or, after Tab, to the
+//! project's `.arsy/arsy.json`. Either way a higher layer still outranks what
+//! is set here, and each row says which layer its value came from.
 use super::*;
 
 /// The value shape of one setting, as this dialog edits it.
@@ -42,6 +42,34 @@ pub struct SettingRow {
     pub kind: SettingKind,
     /// Whether a layer set this key, as opposed to it standing at default.
     pub set: bool,
+    /// The layer that set it — `user`, `project`, `enterprise` — when `set`.
+    pub origin: String,
+}
+
+/// Which file an edit is written to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SettingsScope {
+    /// `~/.arsy/arsy.json`: every workspace this operator opens.
+    #[default]
+    User,
+    /// `<workspace>/.arsy/arsy.json`: this project, for everyone who opens it.
+    Project,
+}
+
+impl SettingsScope {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Project => "project",
+        }
+    }
+
+    const fn other(self) -> Self {
+        match self {
+            Self::User => Self::Project,
+            Self::Project => Self::User,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +99,8 @@ pub struct SettingsDialogState {
     /// What the last action did, shown inside the frame rather than printed
     /// under it.
     pub notice: Option<String>,
+    /// The file Enter and `r` write to. Tab switches it.
+    pub scope: SettingsScope,
 }
 
 impl SettingsDialogState {
@@ -80,6 +110,7 @@ impl SettingsDialogState {
             selected: 0,
             editing: None,
             notice: None,
+            scope: SettingsScope::User,
         }
     }
 
@@ -99,7 +130,8 @@ impl SettingsDialogState {
     pub fn render(&self, width: usize, colour: bool) -> String {
         let width = width.max(MIN_WIDTH);
         let inner = width.saturating_sub(4);
-        let mut lines = vec![dialog_top(" SETTINGS ", width, colour)];
+        let title = format!(" SETTINGS · writes to {} ", self.scope.label());
+        let mut lines = vec![dialog_top(&title, width, colour)];
         if self.rows.is_empty() {
             lines.push(dialog_line(
                 "  no setting can be written by this build",
@@ -119,7 +151,7 @@ impl SettingsDialogState {
         let footer = if self.editing.is_some() {
             "[←/→/↑/↓] Change  [Enter] Set  [r] Reset  [Esc] Close"
         } else {
-            "[↑/↓] Navigate  [Enter/e] Edit  [r] Reset  [Esc] Close"
+            "[↑/↓] Navigate  [Enter/e] Edit  [r] Reset  [Tab] User/Project  [Esc] Close"
         };
         lines.push(dialog_line(footer, inner, colour, sgr_dim()));
         lines.push(dialog_line(
@@ -254,7 +286,7 @@ impl SettingsDialogState {
             .map(|edit| edit.pending.as_str());
         let mut lines = Vec::new();
 
-        let origin_label = if row.set { "set" } else { "default" };
+        let origin_label = origin_label(row);
         let origin_badge = if row.set {
             paint(colour, sgr_ok(), &format!("[{origin_label}]"))
         } else {
@@ -318,6 +350,11 @@ impl SettingsDialogState {
                 .get(self.selected)
                 .is_some()
                 .then_some(SettingsAction::Reset(self.selected)),
+            Key::Tab => {
+                self.scope = self.scope.other();
+                self.notice = None;
+                None
+            }
             Key::Interrupt | Key::Eof => Some(SettingsAction::Close),
             _ => None,
         }
@@ -457,11 +494,22 @@ impl SettingsDialogState {
     }
 }
 
+/// Where a row's value came from, as the dialog names it.
+fn origin_label(row: &SettingRow) -> &str {
+    if row.set && !row.origin.is_empty() {
+        &row.origin
+    } else if row.set {
+        "set"
+    } else {
+        "default"
+    }
+}
+
 /// One setting as a row: marker, key, value, and where it came from. While the
 /// row is being edited, the value shown is the one Enter would set.
 fn setting_row(row: &SettingRow, marked: bool, key_width: usize, pending: Option<&str>) -> String {
     let key = format!("{:<key_width$}", row.key);
-    let origin = if row.set { "set" } else { "default" };
+    let origin = origin_label(row);
     let value = match pending {
         Some(pending) if pending != row.value => format!("{} → {pending}", row.value),
         _ => row.value.clone(),
@@ -583,6 +631,11 @@ mod tests {
             choices: vec!["modern".to_owned(), "classic".to_owned()],
             kind: SettingKind::Choice,
             set,
+            origin: if set {
+                "user".to_owned()
+            } else {
+                String::new()
+            },
         }
     }
 
@@ -595,6 +648,7 @@ mod tests {
             choices: Vec::new(),
             kind: SettingKind::Bool,
             set: false,
+            origin: String::new(),
         }
     }
 
@@ -607,6 +661,7 @@ mod tests {
             choices: Vec::new(),
             kind: SettingKind::Integer { min: 1, max: 3 },
             set: false,
+            origin: String::new(),
         }
     }
 
@@ -729,6 +784,25 @@ mod tests {
         assert!(frame.contains("[↑/↓] Navigate"), "{frame}");
     }
 
+    /// Tab chooses the file an edit lands in, and the frame says which; each
+    /// row says which layer its value came from.
+    #[test]
+    fn tab_switches_the_file_edits_are_written_to() {
+        let mut row = choice_row("ui.style", "classic", true);
+        row.origin = "project".to_owned();
+        let mut dialog = SettingsDialogState::new(vec![row]);
+        assert_eq!(dialog.scope, SettingsScope::User);
+        assert!(dialog.render(100, false).contains("writes to user"));
+        assert!(dialog.render(100, false).contains("[project]"));
+
+        assert_eq!(dialog.handle_key(Key::Tab), None);
+        assert_eq!(dialog.scope, SettingsScope::Project);
+        assert!(dialog.render(100, false).contains("writes to project"));
+
+        dialog.handle_key(Key::Tab);
+        assert_eq!(dialog.scope, SettingsScope::User);
+    }
+
     #[test]
     fn a_text_row_is_not_edited_here() {
         let mut dialog = SettingsDialogState::new(vec![SettingRow {
@@ -739,6 +813,7 @@ mod tests {
             choices: Vec::new(),
             kind: SettingKind::Text,
             set: false,
+            origin: String::new(),
         }]);
         assert_eq!(dialog.handle_key(Key::Enter), None);
         assert_eq!(dialog.editing, None);

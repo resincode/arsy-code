@@ -4,7 +4,7 @@
 #[cfg(feature = "tui")]
 use super::dialog::{
     close_dialog, next_dialog_key, repaint_dialog, run_hook_dialog, run_mcp_dialog,
-    run_model_dialog, run_settings_dialog, run_skill_dialog, Keyed,
+    run_model_dialog, run_settings_dialog, run_skill_dialog, run_storage_dialog, Keyed,
 };
 #[cfg(feature = "tui")]
 use super::remembered::{
@@ -13,6 +13,7 @@ use super::remembered::{
 #[cfg(feature = "tui")]
 use super::session::{
     configured_providers, load_workspace_sessions, reconstruct_session_conversation,
+    stored_session_title,
 };
 #[cfg(feature = "tui")]
 use super::wizard::{
@@ -551,7 +552,7 @@ pub(crate) fn offer_rows(prompt: &Prompt, composer: &mut tui::Composer, picker: 
 #[cfg(feature = "tui")]
 pub(crate) fn run_session_dialog(
     mut dialog: tui::SessionDialogState,
-    restoring: Restoring<'_>,
+    mut restoring: Restoring<'_>,
     stdout: &mut io::Stdout,
     colour: bool,
     keys: &std::sync::mpsc::Receiver<u8>,
@@ -579,15 +580,7 @@ pub(crate) fn run_session_dialog(
             Keyed::Redraw => continue,
             Keyed::Acted(action) => action,
         };
-        let borrowed = Restoring {
-            workspace: restoring.workspace,
-            state: restoring.state,
-            conversation: restoring.conversation,
-            transcript: restoring.transcript,
-            history: restoring.history,
-            approval: restoring.approval,
-            queued: restoring.queued,
-        };
+        let borrowed = restoring.reborrow();
         match action {
             tui::SessionAction::Resume(id) => {
                 close_dialog(stdout, drawn, &[], "")?;
@@ -628,7 +621,10 @@ pub(crate) fn run_session_dialog(
         // action left standing.
         dialog.mode = tui::SessionDialogMode::Select;
         dialog.rename_buffer.clear();
-        dialog.reload(load_workspace_sessions(restoring.workspace));
+        // The title of the row being injected, which is the dialog's own
+        // active session rather than whatever the process moved on to.
+        let active_title = stored_session_title(restoring.workspace, dialog.active_session);
+        dialog.reload(load_workspace_sessions(restoring.workspace), active_title);
     }
     close_dialog(stdout, drawn, &changes, "")?;
     Ok(())
@@ -884,6 +880,7 @@ pub(crate) fn run_dialog(
             tui::SessionDialogState::new(
                 load_workspace_sessions(restoring.workspace),
                 restoring.state.session_id(),
+                stored_session_title(restoring.workspace, restoring.state.session_id()),
             ),
             restoring,
             stdout,
@@ -900,6 +897,9 @@ pub(crate) fn run_dialog(
             typing.theme,
             typing.roles,
         ),
+        Dialog::Storage => {
+            run_storage_dialog(invocation, restoring, stdout, typing.colour, keys, decoder)
+        }
         Dialog::Model => {
             *typing.models = endpoint_models(invocation);
             run_model_dialog(
@@ -1018,6 +1018,7 @@ fn session_command<'a>(
         None => Ok(Some(Prompt::Session(tui::SessionDialogState::new(
             load_workspace_sessions(restoring.workspace),
             restoring.state.session_id(),
+            stored_session_title(restoring.workspace, restoring.state.session_id()),
         )))),
         Some("list") => {
             *sessions = load_workspace_sessions(restoring.workspace);
@@ -1055,10 +1056,18 @@ pub(crate) fn rename_session(
         return writeln!(stdout, "Usage: {usage}").map_err(terminal_failed);
     }
     let session = restoring.state.session_id();
-    if let Ok(store) = open_store(restoring.workspace) {
-        let _ = store.set_session_title(session, title);
-    }
-    writeln!(stdout, "Renamed session {session} to \"{title}\".").map_err(terminal_failed)
+    // Reported as the dialog reports it: a title that was not written is not
+    // a rename, and saying it was is what makes a later listing look broken.
+    let written = open_store(restoring.workspace).and_then(|store| {
+        store
+            .set_session_title(session, title)
+            .map_err(storage_failed)
+    });
+    let message = match written {
+        Ok(()) => format!("Renamed session {session} to \"{title}\"."),
+        Err(error) => format!("`{title}` was not written: {}", error.message),
+    };
+    writeln!(stdout, "{}", tui::safe_text(&message)).map_err(terminal_failed)
 }
 
 /// Delete a session, starting a fresh one when it was the open one.
@@ -1205,6 +1214,23 @@ pub(crate) struct Restoring<'a> {
     pub(crate) history: &'a mut arsy_code::agent::budget::History,
     pub(crate) approval: &'a approval::ApprovalCell,
     pub(crate) queued: &'a mut std::collections::VecDeque<String>,
+}
+
+#[cfg(feature = "tui")]
+impl Restoring<'_> {
+    /// The same session state, lent again for one action inside a loop that
+    /// keeps its own handle.
+    pub(crate) fn reborrow(&mut self) -> Restoring<'_> {
+        Restoring {
+            workspace: self.workspace,
+            state: &mut *self.state,
+            conversation: &mut *self.conversation,
+            transcript: &mut *self.transcript,
+            history: &mut *self.history,
+            approval: self.approval,
+            queued: &mut *self.queued,
+        }
+    }
 }
 
 /// Open a recorded session, answering how many messages it carried.
@@ -1432,6 +1458,7 @@ pub(crate) fn answer_task(
             "/skill" => Some(Dialog::Skill),
             "/session" => Some(Dialog::Session),
             "/settings" => Some(Dialog::Settings),
+            "/storage" => Some(Dialog::Storage),
             "/model" => Some(Dialog::Model),
             _ => None,
         };
@@ -1477,6 +1504,7 @@ pub(crate) enum Dialog {
     Skill,
     Session,
     Settings,
+    Storage,
     Model,
 }
 

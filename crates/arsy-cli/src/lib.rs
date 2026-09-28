@@ -29,6 +29,7 @@ mod connector;
 mod eval;
 mod evidence;
 mod extensions;
+mod guard;
 mod integrations;
 mod mcp;
 mod memory;
@@ -41,6 +42,8 @@ mod review;
 mod run;
 mod serve;
 mod session;
+mod settings;
+mod storage;
 mod subagent;
 mod telemetry;
 mod transcript;
@@ -104,7 +107,7 @@ use std::{
 };
 
 /// Every session of one workspace shares this store.
-const STORE_PATH: &str = ".arsy/sessions.sqlite3";
+const STORE_PATH: &str = arsy_code::workspace::SESSION_STORE;
 
 /// No provider credential is available, so the turn cannot dispatch.
 pub const ARSY_PRV_1000: &str = "ARSY-PRV-1000";
@@ -131,6 +134,11 @@ Usage:
   arsy eval <SUITE> [--strict]  run an evaluation fixture; --strict needs its revision
   arsy compat explain <KIND> explain claude, codex, omp, or agents imports
   arsy config explain [KEY]  show effective configuration and where it came from
+  arsy config set <KEY> <VALUE> [--scope <user|workspace>]  write one setting
+  arsy config unset <KEY> [--scope <user|workspace>]  remove one setting
+  arsy storage               list where ARSY keeps files and how big each is
+  arsy storage clean <cache|repo-map|views|artifacts>  remove what ARSY rebuilds
+  arsy storage reset-history --confirm <WORKSPACE NAME>  delete this workspace's sessions
   arsy session list [--limit <N>]      list recorded sessions in this workspace
   arsy session show <ID> [--turns] [--evidence]   show one session's projection
   arsy session export <ID> [--out <PATH>]         export canonical events as JSONL
@@ -165,6 +173,8 @@ Usage:
   arsy mcp remove|enable|disable <NAME> [--scope <user|workspace>]
   arsy mcp test <NAME> [--timeout <SECONDS>]  connect, negotiate, disconnect
   arsy hook list [--event <NAME>]      list lifecycle hooks and what runs
+  arsy hook add --event <EVENT> [--matcher <PATTERN>] --command <CMD> [--timeout <SECONDS>] [--scope <user|workspace>]
+  arsy hook remove <EVENT> <POSITION> [--scope <user|workspace>]  remove one from ARSY's guard.json
   arsy auth set <PROVIDER>   store a credential in the OS credential store
   arsy auth login <PROVIDER> sign in to a provider through its OAuth client
   arsy auth list             list credential handles (never values)
@@ -304,6 +314,25 @@ pub enum Command {
     ConfigExplain {
         key: Option<String>,
     },
+    /// `arsy hook add|remove`: edit ARSY's own `guard.json`.
+    Hook {
+        request: guard::Request,
+    },
+    /// `arsy storage [clean <TARGET> | reset-history --confirm <NAME>]`.
+    Storage {
+        request: storage::Request,
+    },
+    /// `arsy config set <KEY> <VALUE> [--scope user|workspace]`.
+    ConfigSet {
+        key: String,
+        value: String,
+        scope: mcp::Scope,
+    },
+    /// `arsy config unset <KEY> [--scope user|workspace]`.
+    ConfigUnset {
+        key: String,
+        scope: mcp::Scope,
+    },
     /// `arsy verify <SESSION>`: rebuild the completion proof and report it.
     Verify {
         session: SessionId,
@@ -346,7 +375,8 @@ pub enum Command {
     },
     Gc {
         apply: bool,
-        retention_ms: u64,
+        /// `--retention`, or `None` for `storage.artifact_retention_days`.
+        retention_ms: Option<u64>,
     },
     MemoryList {
         scope: Option<String>,
@@ -540,6 +570,7 @@ const SUBSYSTEMS: &[(&str, SubsystemParser)] = &[
     ("provider", provider::parse_list),
     ("model", provider::parse_models),
     ("mcp", mcp::parse),
+    ("storage", storage::parse),
 ];
 
 fn parse_subsystem(name: &str, parsed: &ParsedArguments) -> Option<Result<Command, Diagnostic>> {
@@ -575,8 +606,11 @@ fn parse_owned(name: &str, mut parsed: ParsedArguments) -> Result<Command, Diagn
             ecosystem: compatibility_kind(parsed.positional)?,
         },
         "auth" => parse_auth(parsed.positional, parsed.handle, parsed.force)?,
-        "config" => parse_config(parsed.positional)?,
-        "hook" => integrations::parse("hook", parsed.positional, parsed.source, parsed.event)?,
+        "config" => parse_config(parsed.positional, parsed.scope.as_deref())?,
+        "hook" => match guard::parse(&parsed) {
+            Some(command) => command?,
+            None => integrations::parse("hook", parsed.positional, parsed.source, parsed.event)?,
+        },
         other => return Err(unknown_command(other)),
     })
 }
@@ -609,6 +643,8 @@ struct ParsedArguments {
     to: Option<String>,
     at: Option<String>,
     retention: Option<String>,
+    /// `arsy storage reset-history --confirm`: the workspace name, typed.
+    confirm: Option<String>,
     /// `arsy code symbol --tier`: which tier answers.
     tier: Option<String>,
     /// `arsy migrate --backup`: where the pre-migration copy goes.
@@ -629,6 +665,8 @@ struct ParsedArguments {
     transport: Option<String>,
     protocol: Option<String>,
     command: Option<String>,
+    /// `arsy hook add --matcher`: which subjects a hook applies to.
+    matcher: Option<String>,
     url: Option<String>,
     scope: Option<String>,
     timeout: Option<u64>,
@@ -656,7 +694,9 @@ fn collect_arguments<I: IntoIterator<Item = String>>(
             }
             continue;
         }
-        if apply_value_flag(&argument, &mut parsed, &mut arguments)? {
+        if apply_value_flag(&argument, &mut parsed, &mut arguments)?
+            || apply_management_flag(&argument, &mut parsed, &mut arguments)?
+        {
             continue;
         }
         if argument.starts_with("--") {
@@ -691,6 +731,22 @@ fn apply_switch(argument: &str, parsed: &mut ParsedArguments) -> bool {
         _ => return false,
     }
     true
+}
+
+/// The flags `arsy storage` and `arsy hook add` take, apart from the shared
+/// table above so each stays a list short enough to read.
+fn apply_management_flag(
+    argument: &str,
+    parsed: &mut ParsedArguments,
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<bool, Diagnostic> {
+    let slot = match argument {
+        "--confirm" => &mut parsed.confirm,
+        "--matcher" => &mut parsed.matcher,
+        _ => return Ok(false),
+    };
+    *slot = Some(value(arguments, argument)?);
+    Ok(true)
 }
 
 fn apply_value_flag(
@@ -864,13 +920,24 @@ fn inspection_args(line: &str) -> Option<Vec<String>> {
 
 /// `config explain [KEY]`. Only `explain` exists; the rest of the documented
 /// `config` surface belongs to a later phase.
-fn parse_config(positional: Vec<String>) -> Result<Command, Diagnostic> {
+fn parse_config(positional: Vec<String>, scope: Option<&str>) -> Result<Command, Diagnostic> {
     match positional.first().map(String::as_str) {
         Some("explain") if positional.len() <= 2 => Ok(Command::ConfigExplain {
             key: positional.into_iter().nth(1),
         }),
         Some("explain") => Err(usage("config explain accepts only [KEY]")),
-        _ => Err(usage("config requires explain")),
+        Some("set") if positional.len() == 3 => Ok(Command::ConfigSet {
+            key: positional[1].clone(),
+            value: positional[2].clone(),
+            scope: mcp::Scope::parse(scope)?,
+        }),
+        Some("set") => Err(usage("config set requires <KEY> <VALUE>")),
+        Some("unset") if positional.len() == 2 => Ok(Command::ConfigUnset {
+            key: positional[1].clone(),
+            scope: mcp::Scope::parse(scope)?,
+        }),
+        Some("unset") => Err(usage("config unset requires <KEY>")),
+        _ => Err(usage("config requires explain, set, or unset")),
     }
 }
 
@@ -1366,6 +1433,12 @@ fn execute_inspect(
             emitter,
         ),
         Command::ConfigExplain { key } => config_explain(invocation, key.as_deref(), emitter),
+        Command::Storage { request } => storage::run(invocation, request, emitter),
+        Command::Hook { request } => guard::run(invocation, request, emitter),
+        Command::ConfigSet { key, value, scope } => {
+            config_write(invocation, key, Some(value), *scope, emitter)
+        }
+        Command::ConfigUnset { key, scope } => config_write(invocation, key, None, *scope, emitter),
         Command::Review { base, strict } => review::run(invocation, base, *strict, emitter),
         Command::PolicyExplain {
             operation,
@@ -1556,6 +1629,44 @@ fn config_explain(
     Ok(0)
 }
 
+/// `arsy config set` and `unset`: one setting, written to one layer's file.
+fn config_write(
+    invocation: &Invocation,
+    key: &str,
+    value: Option<&str>,
+    scope: mcp::Scope,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
+    let written = match value {
+        Some(value) => settings::set(&root, scope, key, value),
+        None => settings::unset(&root, scope, key),
+    };
+    let file = written.map_err(|reason| {
+        Diagnostic::error(
+            ARSY_CFG_1000,
+            reason,
+            "`arsy config explain` lists every key and the values it accepts",
+        )
+    })?;
+    let message = match value {
+        Some(value) => format!("`{key}` set to {value} in {}.", file.display()),
+        None => format!("`{key}` removed from {}.", file.display()),
+    };
+    emitter.result(if emitter.output == Output::Json {
+        json!({
+            "key": key,
+            "value": value,
+            "scope": scope.as_str(),
+            "file": file,
+            "message": message,
+        })
+    } else {
+        json!({"configuration": message})
+    });
+    Ok(0)
+}
+
 /// `config explain` for a reader: one row per key with the value it resolved to
 /// and the layer that decided it.
 ///
@@ -1700,9 +1811,7 @@ fn read_catalog() -> Result<Option<String>, Diagnostic> {
 fn write_catalog(raw: &str) -> Result<(), Diagnostic> {
     let path = FileCredentialStore::path(CATALOG_FILE)
         .ok_or_else(|| secret_failed("this platform has no user configuration directory"))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(storage_failed)?;
-    }
+    FileCredentialStore::prepare(&path).map_err(storage_failed)?;
     // Created owner-only rather than created and then narrowed: a chmod after
     // the write leaves a window where the catalog is readable by the whole
     // machine.
@@ -2805,9 +2914,7 @@ fn compat_homes() -> arsy_compat::CompatHomes {
 fn hook_engine(root: &Path, config: &arsy_kernel::config::Config) -> arsy_code::hook::Loaded {
     arsy_code::hook::load(&arsy_code::hook::Discovery {
         homes: compat_homes(),
-        arsy_home: std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(PathBuf::from),
+        arsy_config_home: arsy_kernel::config::config_home(),
         claude: config.compat_enabled("claude"),
         codex: config.compat_enabled("codex"),
         disabled: config.hook_disabled().clone(),
@@ -3263,19 +3370,32 @@ fn read_stdin() -> Result<String, Diagnostic> {
 }
 
 fn workspace_root(requested: &Path) -> Result<PathBuf, Diagnostic> {
-    std::fs::canonicalize(requested).map_err(|error| {
+    // forgeguard: allow FG-SEC-007 -- the operator's own --workspace argument, canonicalized before any use
+    let root = std::fs::canonicalize(requested).map_err(|error| {
         usage(format!(
             "workspace {} is unusable: {error}",
             requested.display()
         ))
-    })
+    })?;
+    // Every command resolves its workspace here, so this is the one place an
+    // older layout is noticed before anything opens it.
+    arsy_code::workspace::migrate_state(&root);
+    Ok(root)
 }
 
 fn open_store(workspace: &Path) -> Result<Arc<SqliteEventStore>, Diagnostic> {
+    // The setting only matters while `.gitignore` is missing, so the layers —
+    // which include reading Claude's and Codex's files — are loaded then and
+    // not on every open. A configuration that does not load still gets its
+    // store: the loader's own error is reported by whatever reads it next.
+    let ignore_file = workspace
+        .join(arsy_code::workspace::RUNTIME_STATE)
+        .join(".gitignore");
+    let ignore_itself = !ignore_file.exists()
+        && load_config(workspace, workspace, None).map_or(true, |config| config.state_gitignore());
+    arsy_code::workspace::ensure_state_dir(workspace, ignore_itself)
+        .map_err(|error| storage_failed(error.to_string()))?;
     let path = workspace.join(STORE_PATH);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| storage_failed(error.to_string()))?;
-    }
     SqliteEventStore::open(&path, Durability::Normal)
         .map(Arc::new)
         .map_err(|error| storage_failed(format!("{path:?}: {error}")))
@@ -3306,7 +3426,7 @@ fn actor() -> Principal {
 /// The workspace's artifact store: where every operation's result, every
 /// exported excerpt, and every memory's claim is kept.
 fn artifact_store(root: &Path) -> Result<arsy_kernel::artifact::FileArtifactStore, Diagnostic> {
-    arsy_kernel::artifact::FileArtifactStore::open(root.join(".arsy/artifacts"), 0)
+    arsy_kernel::artifact::FileArtifactStore::open(root.join(arsy_code::workspace::ARTIFACTS), 0)
         .map_err(|error| storage_failed(error.to_string()))
 }
 
@@ -3475,9 +3595,10 @@ fn mcp_log_rows(logs: Vec<(String, String)>, level: &str) -> Vec<String> {
 fn session_connector() -> &'static connector::McpConnector {
     static CONNECTOR: std::sync::OnceLock<connector::McpConnector> = std::sync::OnceLock::new();
     CONNECTOR.get_or_init(|| {
-        connector::McpConnector::new(
-            arsy_kernel::config::config_home().map(|home| home.join("mcp-tools.json")),
-        )
+        connector::McpConnector::new(arsy_kernel::config::home_file(
+            arsy_kernel::config::CACHE_DIRECTORY,
+            "mcp-tools.json",
+        ))
     })
 }
 
@@ -3753,6 +3874,53 @@ mod tests {
             .filter(|name| name != "arsy.json")
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// What `/settings` applies reaches the file, and a reset takes it back
+    /// out: the dialog reporting a change is not the same as making one.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_settings_edit_is_written_and_a_reset_removes_it() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|held| held.into_inner());
+        let directory = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os(arsy_kernel::config::CONFIG_HOME_VAR);
+        std::env::set_var(arsy_kernel::config::CONFIG_HOME_VAR, directory.path());
+        let path = directory.path().join(arsy_kernel::config::CONFIG_FILE);
+        std::fs::write(&path, "{}\n").unwrap();
+        let row = tui::SettingRow {
+            key: "ui.style".to_owned(),
+            value: "modern".to_owned(),
+            default: "modern".to_owned(),
+            description: String::new(),
+            choices: Vec::new(),
+            kind: tui::SettingKind::Choice,
+            set: false,
+            origin: String::new(),
+        };
+        let workspace = tempfile::tempdir().unwrap();
+
+        let applied = picker::dialog::apply_edited_setting(
+            workspace.path(),
+            tui::SettingsScope::User,
+            &row,
+            "classic",
+        );
+        let written = std::fs::read_to_string(&path).unwrap();
+
+        let reset =
+            picker::wizard::write_config(|config| config_edit::remove(config, &["ui", "style"]));
+        let after_reset = std::fs::read_to_string(&path).unwrap();
+        match previous {
+            Some(value) => std::env::set_var(arsy_kernel::config::CONFIG_HOME_VAR, value),
+            None => std::env::remove_var(arsy_kernel::config::CONFIG_HOME_VAR),
+        }
+        assert_eq!(applied, None);
+        assert!(written.contains("classic"), "not written: {written}");
+        assert!(reset.is_ok());
+        assert!(
+            !after_reset.contains("classic"),
+            "not removed: {after_reset}"
+        );
     }
 
     #[test]
@@ -5438,6 +5606,7 @@ mod tests {
                     | "/todo"
                     | "/agents"
                     | "/skill"
+                    | "/storage"
             ) || INSPECTIONS.iter().any(|(slash, _, _)| slash == name);
             assert!(handled, "{name} is offered but never dispatched");
         }

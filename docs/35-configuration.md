@@ -10,6 +10,17 @@ path on every platform, because two separate products have to agree on it. The
 directory can be replaced with `ARSY_CONFIG_HOME`, which points a run at a
 throwaway configuration without editing the operator's own file.
 
+Files a person edits sit at the top of `~/.arsy/` — `arsy.json` and
+`guard.json`. Everything ARSY writes on its own goes one level down:
+`secrets/` (owner-only, `0700`) holds the credential catalog and file
+credentials, `cache/` holds what is rebuilt on demand, and `state/` holds the
+terminal's remembered model, effort, and theme. A workspace follows the same
+rule: `.arsy/arsy.json`, `.arsy/guard.json`, `.arsy/AGENTS.md`, and
+`.arsy/plugins/` are the project's to commit, and `.arsy/state/` — sessions,
+artifacts, the repository map, subagent views, eval trees — ignores itself.
+See [Where ARSY keeps files](#where-arsy-keeps-files) and
+[ADR-0015](ADR/0015-arsy-directory-layout.md).
+
 `~/.arsy/arsy.json` is created on install and, failing that, on the first run
 that reads configuration. An older ARSY's `config.toml` in the platform
 configuration directory is converted into it once, at that point — never when
@@ -87,6 +98,8 @@ Authority classes are:
 | `execution.max_parallel` | positive integer | `4` | min | ceiling |
 | `storage.data_dir` | absolute path | platform data directory | replace | user |
 | `storage.durability` | `"fast"`, `"balanced"`, or `"strict"` | `"balanced"` | max | user |
+| `storage.state_gitignore` | boolean | `true` | replace | intent |
+| `storage.artifact_retention_days` | integer, 1 to 3650 | `7` | replace | intent |
 | `lsp.server.<name>.command` | array of strings, program first | none | replace | user |
 | `lsp.server.<name>.extensions` | array of file extensions | `[]` | replace | user |
 | `telemetry.sample_every` | positive integer | `1` | replace | intent |
@@ -262,6 +275,46 @@ golden output.
 
 Only `modern` and `classic` are accepted. The setting applies when the
 interactive session starts; it does not alter scripted `arsy run` output.
+
+## Where ARSY keeps files
+
+```
+~/.arsy/                       <workspace>/.arsy/
+├── arsy.json                  ├── arsy.json
+├── guard.json                 ├── guard.json
+├── secrets/        (0700)     ├── AGENTS.md
+│   ├── credentials.json       ├── plugins/
+│   └── <handle>    (0600)     └── state/              (ignores itself)
+├── cache/                         ├── sessions.sqlite3
+│   └── mcp-tools.json             ├── repo-map.json
+└── state/                         ├── artifacts/
+    └── model, effort, theme       ├── views/
+                                   └── eval/
+```
+
+`state/` and `cache/` may be deleted at any time; ARSY rebuilds what it needs,
+and a deleted `state/` in a workspace loses that workspace's session history
+and nothing else. `secrets/` is written only through the credential commands.
+
+A layout an earlier release left behind is moved on first use, by rename and
+never over a file already at the destination: workspace state the first time
+any command resolves that workspace, and each credential, cache, or remembered
+choice the first time it is read. Subagent views and eval trees are git
+worktrees and stay where they were; `arsy storage clean views` removes them.
+
+Nothing here needs a hand-edited file:
+
+- `/settings` edits the user file, and after Tab the project's;
+  `arsy config set <KEY> <VALUE> [--scope user|workspace]` and
+  `arsy config unset <KEY>` do the same from a shell. A write the loader
+  would refuse is put back.
+- `/storage` and `arsy storage` list every location with its size, and clean
+  the cache, the repository map, idle subagent views, and unreferenced
+  artifacts. `arsy storage reset-history --confirm <WORKSPACE NAME>` deletes
+  the session store once nothing is writing to it.
+- `/hooks` and `arsy hook add|remove [--scope user|workspace]` add a
+  `command` hook to, or remove one from, ARSY's own `guard.json`. Claude's
+  and Codex's files are only ever switched off through `hook.disabled`.
 
 ## Six-layer example
 

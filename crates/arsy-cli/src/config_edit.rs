@@ -184,6 +184,119 @@ pub fn set_default(config: &str, name: &str) -> Result<String, String> {
     )
 }
 
+/// Append one `command` hook to a Claude-shaped `guard.json`, as a new entry
+/// under `event` so no existing declaration changes position.
+pub fn add_hook(
+    guard: &str,
+    event: &str,
+    matcher: Option<&str>,
+    command: &str,
+    timeout: Option<u64>,
+) -> Result<String, String> {
+    if command.trim().is_empty() {
+        return Err("a hook needs a command to run".to_owned());
+    }
+    let mut document = document(guard)?;
+    let hooks =
+        object_at(&mut document, &["hooks"]).ok_or("`hooks` is not an object in the guard file")?;
+    let entries = hooks
+        .entry(event.to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| format!("`hooks.{event}` is not a list in the guard file"))?;
+    let mut handler = Map::new();
+    handler.insert("type".to_owned(), Value::String("command".to_owned()));
+    handler.insert("command".to_owned(), Value::String(command.to_owned()));
+    if let Some(timeout) = timeout {
+        handler.insert("timeout".to_owned(), timeout.into());
+    }
+    let mut entry = Map::new();
+    if let Some(matcher) = matcher.filter(|matcher| !matcher.trim().is_empty()) {
+        entry.insert("matcher".to_owned(), Value::String(matcher.to_owned()));
+    }
+    entry.insert(
+        "hooks".to_owned(),
+        Value::Array(vec![Value::Object(handler)]),
+    );
+    entries.push(Value::Object(entry));
+    Ok(render(&document))
+}
+
+/// Remove the entry at `position` under `event`, and the event once it has
+/// none left.
+pub fn remove_hook(guard: &str, event: &str, position: usize) -> Result<String, String> {
+    let mut document = document(guard)?;
+    let hooks = document
+        .get_mut("hooks")
+        .and_then(Value::as_object_mut)
+        .ok_or("the guard file declares no hooks")?;
+    let entries = hooks
+        .get_mut(event)
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| format!("the guard file declares no `{event}` hook"))?;
+    if position >= entries.len() {
+        return Err(format!(
+            "`{event}` has {} hook(s); there is none at {position}",
+            entries.len()
+        ));
+    }
+    entries.remove(position);
+    if entries.is_empty() {
+        hooks.remove(event);
+    }
+    Ok(render(&document))
+}
+
+/// Keep `hook.disabled` pointing at the same hooks after the entry at
+/// `position` under `event` in `source` was removed.
+///
+/// A declaration key names a hook by its position, so without this the keys
+/// after the removed entry would switch off whichever hook moved into their
+/// place. The removed entry's own keys go; later ones move up by one.
+pub fn shift_disabled(
+    config: &str,
+    source: &str,
+    event: &str,
+    position: usize,
+) -> Result<String, String> {
+    let mut document = document(config)?;
+    let Some(disabled) = document
+        .get_mut("hook")
+        .and_then(Value::as_object_mut)
+        .and_then(|hook| hook.get_mut("disabled"))
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(config.to_owned());
+    };
+    let prefix = format!("{source}#{event}[");
+    let keys: Vec<String> = disabled
+        .keys()
+        .filter(|key| key.starts_with(&prefix))
+        .cloned()
+        .collect();
+    // Taken out first and put back after: moving keys in place would let one
+    // land on another not yet moved, whatever order the file lists them in.
+    let mut moved = Vec::new();
+    for key in keys {
+        let rest = &key[prefix.len()..];
+        let Some((found, tail)) = rest.split_once(']') else {
+            continue;
+        };
+        let Ok(found) = found.parse::<usize>() else {
+            continue;
+        };
+        if found < position {
+            continue;
+        }
+        let value = disabled.remove(&key).unwrap_or(Value::Bool(true));
+        if found > position {
+            moved.push((format!("{prefix}{}]{tail}", found - 1), value));
+        }
+    }
+    disabled.extend(moved);
+    Ok(render(&document))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +471,84 @@ mod tests {
         assert!(set_default("[1, 2]", "acme")
             .unwrap_err()
             .contains("not a JSON object"));
+    }
+
+    #[test]
+    fn a_hook_is_appended_without_moving_the_others() {
+        let guard = add_hook("", "PreToolUse", Some("fs.read"), "deny.sh", Some(5)).unwrap();
+        let guard = add_hook(&guard, "PreToolUse", None, "log.sh", None).unwrap();
+        let written: Value = serde_json::from_str(&guard).unwrap();
+        let entries = written["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries[0]["matcher"], "fs.read");
+        assert_eq!(entries[0]["hooks"][0]["command"], "deny.sh");
+        assert_eq!(entries[0]["hooks"][0]["timeout"], 5);
+        assert!(entries[1].get("matcher").is_none());
+        assert!(add_hook("", "Stop", None, "  ", None).is_err());
+        assert!(add_hook("{not json", "Stop", None, "x", None).is_err());
+    }
+
+    #[test]
+    fn removing_the_last_entry_removes_the_event() {
+        let guard = add_hook("", "Stop", None, "a", None).unwrap();
+        let guard = add_hook(&guard, "Stop", None, "b", None).unwrap();
+        let guard = remove_hook(&guard, "Stop", 0).unwrap();
+        let written: Value = serde_json::from_str(&guard).unwrap();
+        assert_eq!(written["hooks"]["Stop"][0]["hooks"][0]["command"], "b");
+        let guard = remove_hook(&guard, "Stop", 0).unwrap();
+        let written: Value = serde_json::from_str(&guard).unwrap();
+        assert!(written["hooks"].get("Stop").is_none());
+        assert!(remove_hook(&guard, "Stop", 0).is_err());
+    }
+
+    /// Keys are shifted out of place: shifting in place lets a key moved down
+    /// land on one not yet moved, in whatever order the file lists them.
+    #[test]
+    fn shifting_never_lands_one_key_on_another() {
+        let shifted = |config: &str| {
+            let written: Value =
+                serde_json::from_str(&shift_disabled(config, "/g", "Stop", 0).unwrap()).unwrap();
+            let mut keys: Vec<String> = written["hook"]["disabled"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            keys.sort_unstable();
+            keys
+        };
+        assert_eq!(
+            shifted(r#"{"hook": {"disabled": {"/g#Stop[10].0": true, "/g#Stop[9].0": true}}}"#),
+            ["/g#Stop[8].0", "/g#Stop[9].0"]
+        );
+        assert_eq!(
+            shifted(r#"{"hook": {"disabled": {"/g#Stop[2].0": true, "/g#Stop[1].0": true}}}"#),
+            ["/g#Stop[0].0", "/g#Stop[1].0"]
+        );
+    }
+
+    #[test]
+    fn switched_off_hooks_stay_the_same_hooks_after_a_removal() {
+        let config = r#"{"hook": {"disabled": {
+            "/g.json#Stop[0].0": true,
+            "/g.json#Stop[1].0": true,
+            "/g.json#Stop[2].1": true,
+            "/g.json#PreToolUse[2].0": true,
+            "/other.json#Stop[2].0": true
+        }}}"#;
+        let shifted = shift_disabled(config, "/g.json", "Stop", 1).unwrap();
+        let written: Value = serde_json::from_str(&shifted).unwrap();
+        let disabled = written["hook"]["disabled"].as_object().unwrap();
+        let mut keys: Vec<&str> = disabled.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "/g.json#PreToolUse[2].0",
+                "/g.json#Stop[0].0",
+                "/g.json#Stop[1].1",
+                "/other.json#Stop[2].0",
+            ]
+        );
+        assert_eq!(shift_disabled("{}", "/g.json", "Stop", 0).unwrap(), "{}");
     }
 }

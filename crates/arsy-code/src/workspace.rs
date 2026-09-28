@@ -230,6 +230,7 @@ impl WorkspaceCoordinator {
             branch: Some(owner.branch()),
             carried_patch: carried,
         };
+        write_lease_marker(&lease.view, expires_at_ms);
         self.leases.insert(owner.agent, lease.clone());
         Ok(lease)
     }
@@ -246,7 +247,9 @@ impl WorkspaceCoordinator {
             other => Err(other),
         })?;
         let key = (source.clone(), base.clone());
-        let view = if let Some(existing) = self.readers.get(&key) {
+        // A view someone else's cleanup removed is cut again rather than
+        // handed out as a path that no longer exists.
+        let view = if let Some(existing) = self.readers.get(&key).filter(|view| view.exists()) {
             existing.clone()
         } else {
             fs::create_dir_all(isolation_root)?;
@@ -264,6 +267,10 @@ impl WorkspaceCoordinator {
             self.readers.insert(key, view.clone());
             view
         };
+        // A reader view is shared and never expires in this process, so the
+        // marker another process reads is renewed on every use instead: a view
+        // nobody asked for in a lease's length is one nobody is reading.
+        write_lease_marker(&view, now_ms() + READER_LEASE_MS);
         let backend = if git_revision(&source).is_ok() {
             IsolationBackend::GitWorktree
         } else {
@@ -362,6 +369,7 @@ impl WorkspaceCoordinator {
     pub fn discard(&mut self, lease: &WorkspaceLease) -> Result<(), WorkspaceError> {
         let _admin = admin();
         self.leases.remove(&lease.owner);
+        let _ = fs::remove_file(lease_marker(&lease.view));
         if lease.backend == IsolationBackend::GitWorktree {
             let _ = git(
                 &lease.source,
@@ -557,6 +565,167 @@ const EXCLUDE_HARNESS_STATE: &str = ":(exclude).arsy/**";
 
 /// The same directory, as a path prefix.
 pub const HARNESS_STATE: &str = ".arsy";
+
+/// Where everything ARSY writes on its own lives, apart from the files an
+/// operator edits: deleting it loses history, never configuration.
+pub const RUNTIME_STATE: &str = ".arsy/state";
+/// The session event store.
+pub const SESSION_STORE: &str = ".arsy/state/sessions.sqlite3";
+/// Content-addressed artifacts: evidence, tool output, completion proofs.
+pub const ARTIFACTS: &str = ".arsy/state/artifacts";
+/// The git worktrees subagents run in.
+pub const VIEWS: &str = ".arsy/state/views";
+/// The trees `arsy eval` measures in.
+pub const EVAL: &str = ".arsy/state/eval";
+/// The repository map a turn is given as context.
+pub const REPO_MAP: &str = ".arsy/state/repo-map.json";
+
+/// Create the runtime directory, and when `ignore_itself` is set, the
+/// `.gitignore` that keeps it out of the repository without the operator
+/// adding anything. An existing `.gitignore` is left as it is.
+pub fn ensure_state_dir(root: &Path, ignore_itself: bool) -> io::Result<PathBuf> {
+    let state = root.join(RUNTIME_STATE);
+    fs::create_dir_all(&state)?;
+    let ignore = state.join(".gitignore");
+    if ignore_itself && !ignore.exists() {
+        fs::write(&ignore, "*\n")?;
+    }
+    Ok(state)
+}
+
+/// How long a reader view's marker says it is in use after its last lease.
+const READER_LEASE_MS: u64 = 30 * 60 * 1_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// The file beside a view that says until when it is leased.
+///
+/// Leases live in the memory of the process that cut them, so another
+/// process — `arsy storage clean views` in a second terminal — cannot see
+/// them. This marker is what it reads instead of guessing from timestamps.
+pub fn lease_marker(view: &Path) -> PathBuf {
+    let mut name = view.as_os_str().to_owned();
+    name.push(".lease");
+    PathBuf::from(name)
+}
+
+fn write_lease_marker(view: &Path, expires_at_ms: u64) {
+    // Best effort: a missing marker falls back to the older, cruder rule,
+    // which is what every view cut before markers existed gets anyway.
+    let _ = fs::write(lease_marker(view), expires_at_ms.to_string());
+}
+
+/// Whether the view's lease has run out: `None` when it has no marker.
+pub fn lease_expired(view: &Path, now_ms: u64) -> Option<bool> {
+    let text = fs::read_to_string(lease_marker(view)).ok()?;
+    let expires_at_ms: u64 = text.trim().parse().ok()?;
+    Some(expires_at_ms <= now_ms)
+}
+
+/// Where each piece of runtime state lived before `.arsy/state/`.
+const LEGACY_STATE: [(&str, &str); 2] = [
+    (".arsy/repo-map.json", REPO_MAP),
+    (".arsy/artifacts", ARTIFACTS),
+];
+/// The old session store; its WAL sidecars move with it.
+const LEGACY_SESSION_STORE: &str = ".arsy/sessions.sqlite3";
+
+/// Move runtime state an older ARSY left directly under `.arsy/` into
+/// `.arsy/state/`, once.
+///
+/// A rename, never a copy, and never over something already there: a
+/// destination that exists means the move happened or a newer ARSY started
+/// fresh, and either way the file at the destination is the one in use. The
+/// session store moves together with its `-wal` and `-shm` sidecars, which
+/// hold committed transactions not yet folded into the main file, so the log
+/// is checkpointed into the database first and a store another process is
+/// writing to is left for a later run; if any of the three cannot move, the
+/// ones that did are put back.
+///
+/// `views/` and `eval/` are git worktrees and stay where they are: renaming
+/// one would leave git pointing at a directory that no longer exists.
+///
+/// Failures are silent, as the user configuration bootstrap's are: a
+/// workspace whose old state cannot move runs with fresh state rather than
+/// not at all.
+pub fn migrate_state(root: &Path) {
+    let has_legacy = LEGACY_STATE.iter().any(|(old, _)| root.join(old).exists())
+        || root.join(LEGACY_SESSION_STORE).exists();
+    // The directory only: whether it ignores itself is configuration, which
+    // the store decides when it opens, a moment later.
+    if !has_legacy || ensure_state_dir(root, false).is_err() {
+        return;
+    }
+    for (old, new) in LEGACY_STATE {
+        let (old, new) = (root.join(old), root.join(new));
+        if old.exists() && !new.exists() {
+            let _ = fs::rename(&old, &new);
+        }
+    }
+    let _ = move_session_store(&root.join(LEGACY_SESSION_STORE), &root.join(SESSION_STORE));
+}
+
+/// Move an SQLite database and its WAL sidecars as one.
+fn move_session_store(old: &Path, new: &Path) -> io::Result<()> {
+    if !old.exists() || new.exists() {
+        return Ok(());
+    }
+    // A store another process is writing to stays where it is until a later
+    // run; so does one whose log will not fold in. Only a store whose file
+    // alone holds every commit is moved, so no step can strand a commit in a
+    // log separated from its database.
+    let busy = arsy_kernel::sqlite::is_being_written(old)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let folded = arsy_kernel::sqlite::checkpoint(old)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    if busy || !folded {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "the session store is in use; it moves on a later run",
+        ));
+    }
+    let sidecar = |path: &Path, suffix: &str| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    // The database first: after the checkpoint its sidecars hold nothing a
+    // reader needs, so a stop between steps leaves a complete database at the
+    // destination and at worst an empty log behind.
+    let pairs: Vec<(PathBuf, PathBuf)> = ["", "-wal", "-shm"]
+        .iter()
+        .map(|suffix| (sidecar(old, suffix), sidecar(new, suffix)))
+        .filter(|(from, _)| from.exists())
+        .collect();
+    let mut moved = Vec::new();
+    for (from, to) in &pairs {
+        if to.exists() {
+            restore(&moved);
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} already exists", to.display()),
+            ));
+        }
+        if let Err(error) = fs::rename(from, to) {
+            restore(&moved);
+            return Err(error);
+        }
+        moved.push((from.clone(), to.clone()));
+    }
+    Ok(())
+}
+
+fn restore(moved: &[(PathBuf, PathBuf)]) {
+    for (from, to) in moved.iter().rev() {
+        let _ = fs::rename(to, from);
+    }
+}
 
 fn apply_patch(view: &Path, patch: &str) -> Result<(), WorkspaceError> {
     let file = view.join(".arsy-carried.patch");
@@ -809,6 +978,190 @@ impl From<crate::edit::EditError> for WorkspaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real SQLite store in WAL mode with one committed row, the way ARSY
+    /// left it: a store the migration can checkpoint and has to keep whole.
+    fn legacy_store(path: &Path) {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        connection
+            .execute_batch("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('kept');")
+            .unwrap();
+    }
+
+    /// What the store at `path` holds, read with no sidecar beside it.
+    fn stored(path: &Path) -> String {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row("SELECT v FROM t", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn legacy_workspace() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let arsy = root.path().join(".arsy");
+        fs::create_dir_all(arsy.join("artifacts/ab")).unwrap();
+        fs::write(arsy.join("artifacts/ab/blob"), "evidence").unwrap();
+        fs::write(arsy.join("repo-map.json"), "{}").unwrap();
+        legacy_store(&arsy.join("sessions.sqlite3"));
+        fs::create_dir_all(arsy.join("views/agent")).unwrap();
+        fs::create_dir_all(arsy.join("eval/trial")).unwrap();
+        fs::write(arsy.join("arsy.json"), "{}").unwrap();
+        root
+    }
+
+    #[test]
+    fn migrate_moves_old_layout_into_state() {
+        let root = legacy_workspace();
+        migrate_state(root.path());
+        // forgeguard: allow FG-SEC-007 -- test helper reading a file the test itself wrote in a tempdir
+        let read = |path: &str| fs::read_to_string(root.path().join(path)).unwrap();
+        assert_eq!(read(".arsy/state/artifacts/ab/blob"), "evidence");
+        assert_eq!(read(REPO_MAP), "{}");
+        assert_eq!(stored(&root.path().join(SESSION_STORE)), "kept");
+        for gone in [
+            "artifacts",
+            "repo-map.json",
+            "sessions.sqlite3",
+            "sessions.sqlite3-wal",
+        ] {
+            assert!(
+                !root.path().join(".arsy").join(gone).exists(),
+                "{gone} moved"
+            );
+        }
+        assert_eq!(read(".arsy/arsy.json"), "{}", "configuration stays");
+        // Whether it ignores itself is configuration, which the store applies
+        // when it opens; the move only makes the directory.
+        assert!(!root.path().join(".arsy/state/.gitignore").exists());
+    }
+
+    #[test]
+    fn migrate_leaves_views_and_eval() {
+        let root = legacy_workspace();
+        migrate_state(root.path());
+        assert!(root.path().join(".arsy/views/agent").is_dir());
+        assert!(root.path().join(".arsy/eval/trial").is_dir());
+        assert!(!root.path().join(VIEWS).exists());
+    }
+
+    #[test]
+    fn migrate_never_overwrites_existing_state() {
+        let root = legacy_workspace();
+        fs::create_dir_all(root.path().join(RUNTIME_STATE)).unwrap();
+        fs::write(root.path().join(SESSION_STORE), "new db").unwrap();
+        fs::write(root.path().join(REPO_MAP), "new map").unwrap();
+
+        migrate_state(root.path());
+
+        // forgeguard: allow FG-SEC-007 -- test helper reading a file the test itself wrote in a tempdir
+        let read = |path: &str| fs::read_to_string(root.path().join(path)).unwrap();
+        assert_eq!(read(SESSION_STORE), "new db");
+        assert_eq!(read(REPO_MAP), "new map");
+        assert_eq!(
+            stored(&root.path().join(".arsy/sessions.sqlite3")),
+            "kept",
+            "the old store stays put, whole"
+        );
+    }
+
+    #[test]
+    fn migrate_moves_sqlite_sidecars_together_or_not_at_all() {
+        // A connection left open keeps the log and index files on disk, so
+        // all three have to move; a stale index at the destination stops the
+        // move after the database and its log went across, and both come back.
+        let root = legacy_workspace();
+        let old = root.path().join(".arsy/sessions.sqlite3");
+        let new = root.path().join(".arsy/state/sessions.sqlite3");
+        let open = rusqlite::Connection::open(&old).unwrap();
+        let _: i64 = open
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        fs::create_dir_all(root.path().join(RUNTIME_STATE)).unwrap();
+        fs::write(
+            root.path().join(".arsy/state/sessions.sqlite3-shm"),
+            "stale",
+        )
+        .unwrap();
+
+        assert!(move_session_store(&old, &new).is_err());
+
+        assert_eq!(stored(&old), "kept", "the database came back");
+        assert!(
+            root.path().join(".arsy/sessions.sqlite3-wal").exists(),
+            "with its log"
+        );
+        assert!(!new.exists());
+        assert!(!root
+            .path()
+            .join(".arsy/state/sessions.sqlite3-wal")
+            .exists());
+    }
+
+    #[test]
+    fn a_store_being_written_is_left_for_a_later_run() {
+        let root = legacy_workspace();
+        let old = root.path().join(".arsy/sessions.sqlite3");
+        let writer = rusqlite::Connection::open(&old).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        migrate_state(root.path());
+
+        assert!(old.exists(), "nothing moved under a writer");
+        assert!(!root.path().join(SESSION_STORE).exists());
+        writer.execute_batch("ROLLBACK;").unwrap();
+        drop(writer);
+
+        migrate_state(root.path());
+        assert!(!old.exists());
+        assert_eq!(stored(&root.path().join(SESSION_STORE)), "kept");
+    }
+
+    #[test]
+    fn a_workspace_without_old_state_gets_no_state_directory() {
+        let root = tempfile::tempdir().unwrap();
+        migrate_state(root.path());
+        assert!(!root.path().join(".arsy").exists());
+    }
+
+    #[test]
+    fn the_state_directory_ignores_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let status = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        status(&["init", "-q"]);
+        let state = ensure_state_dir(root.path(), true).unwrap();
+        fs::write(state.join("sessions.sqlite3"), "db").unwrap();
+        assert_eq!(
+            status(&["status", "--porcelain", "--untracked-files=all"]),
+            ""
+        );
+
+        let quiet = tempfile::tempdir().unwrap();
+        let state = ensure_state_dir(quiet.path(), false).unwrap();
+        assert!(!state.join(".gitignore").exists());
+    }
+
+    /// Everything ARSY writes on its own sits under one directory, so an
+    /// operator can delete or ignore it without touching configuration.
+    #[test]
+    fn every_runtime_path_is_under_the_runtime_state() {
+        for path in [SESSION_STORE, ARTIFACTS, VIEWS, EVAL, REPO_MAP] {
+            assert!(
+                Path::new(path).starts_with(RUNTIME_STATE),
+                "{path} is outside {RUNTIME_STATE}"
+            );
+        }
+    }
 
     #[test]
     fn copied_writers_are_unique_and_expired_uncommitted_views_are_reclaimed() {
@@ -1085,6 +1438,51 @@ mod tests {
             "uncommitted\n",
             "the operator's work reaches the view rather than vanishing"
         );
+    }
+
+    /// Another process can see a view is leased only through its marker, so
+    /// the marker follows the lease from the moment the view is cut until it
+    /// is discarded, and a shared reader view renews it on every use.
+    #[test]
+    fn a_lease_marker_follows_every_view_it_describes() {
+        let source = repository();
+        let views = tempfile::tempdir().unwrap();
+        let mut coordinator = WorkspaceCoordinator::default();
+
+        let writer = coordinator
+            .writer_for(
+                source.path(),
+                views.path(),
+                &owner(),
+                10,
+                DirtyPolicy::Refuse,
+            )
+            .unwrap();
+        assert_eq!(lease_expired(&writer.view, 9), Some(false));
+        assert_eq!(lease_expired(&writer.view, 10), Some(true));
+        coordinator.discard(&writer).unwrap();
+        assert!(!lease_marker(&writer.view).exists());
+
+        let reader = coordinator
+            .reader(source.path(), views.path(), AgentId::new())
+            .unwrap();
+        assert_eq!(lease_expired(&reader.view, now_ms()), Some(false));
+
+        // Removed from under this process, the shared view is cut again.
+        let _ = git(
+            source.path(),
+            [
+                "worktree",
+                "remove",
+                "--force",
+                path_text(&reader.view).unwrap(),
+            ],
+        );
+        let again = coordinator
+            .reader(source.path(), views.path(), AgentId::new())
+            .unwrap();
+        assert!(again.view.is_dir());
+        assert_eq!(lease_expired(&again.view, now_ms()), Some(false));
     }
 
     #[test]

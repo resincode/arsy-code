@@ -51,8 +51,11 @@ pub fn run(invocation: &Invocation, _emitter: &mut Emitter) -> Result<i32, Diagn
     let workspace = arsy_code::resource::Workspace::open(&root)
         .map_err(|error| storage_failed(error.to_string()))?;
     let artifacts = std::sync::Arc::new(
-        arsy_kernel::artifact::FileArtifactStore::open(root.join(".arsy/artifacts"), 0)
-            .map_err(|error| storage_failed(error.to_string()))?,
+        arsy_kernel::artifact::FileArtifactStore::open(
+            root.join(arsy_code::workspace::ARTIFACTS),
+            0,
+        )
+        .map_err(|error| storage_failed(error.to_string()))?,
     );
     // One registry for the life of this process, and this process is the
     // whole of one client's session: its own fresh scope is the plan and

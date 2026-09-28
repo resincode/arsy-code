@@ -117,6 +117,8 @@ arsy session rewind <SESSION_ID> --to <EVENT_ID>
 arsy session fork <SESSION_ID> [--at <EVENT_ID>]
 
 arsy config explain [KEY] [--source-only]
+arsy config set <KEY> <VALUE> [--scope user|workspace]
+arsy config unset <KEY> [--scope user|workspace]
 arsy compat explain <claude|codex|omp> [--loss-only]
 arsy policy explain <OPERATION> [--resource <REF>] [--actor <ID>]
 arsy code symbol <NAME> [--tier auto|text] [--limit <N>]
@@ -144,6 +146,8 @@ arsy mcp refresh <NAME> [--all]
 
 arsy skill list [--source <ECOSYSTEM>]
 arsy hook list [--event <NAME>]
+arsy hook add --event <EVENT> [--matcher <PATTERN>] --command <CMD> [--timeout <SECONDS>] [--scope user|workspace]
+arsy hook remove <EVENT> <POSITION> [--scope user|workspace]
 arsy plugin list [--capabilities]
 arsy plugin install <SOURCE> [--scope user|workspace] [--force]
 arsy plugin inspect <ID>
@@ -157,6 +161,9 @@ arsy memory list [--scope <SCOPE>] [--all]
 arsy memory remember <CLAIM> [--scope <SCOPE>]
 arsy memory forget <ID> [--to <REASON>]
 arsy gc [--apply] [--retention <DURATION>]
+arsy storage
+arsy storage clean <cache|repo-map|views|artifacts>
+arsy storage reset-history --confirm <WORKSPACE NAME>
 arsy migrate [--apply] [--backup <PATH>]
 arsy eval <SUITE> [--trials <N>] [--strict] [--out <PATH>]
 arsy serve [--protocol mcp|acp] [--transport stdio]
@@ -168,6 +175,55 @@ Global options can be used with commands that support them:
 `--output human|json|ci`, `--no-color`, `--debug`, `--help`, and `--version`.
 Run `arsy --help` for the exact syntax and availability of the current build. Commands that are
 roadmap-gated report a diagnostic instead of silently behaving differently.
+
+## Where ARSY keeps files
+
+ARSY keeps the operator's own files in `~/.arsy/` (or wherever
+`ARSY_CONFIG_HOME` points) and a project's in `<workspace>/.arsy/`. In both,
+the files a person edits sit at the top, and everything ARSY writes on its
+own goes one level down:
+
+```
+~/.arsy/                       <workspace>/.arsy/
+├── arsy.json                  ├── arsy.json
+├── guard.json                 ├── guard.json
+├── secrets/        (0700)     ├── AGENTS.md
+│   ├── credentials.json       ├── plugins/
+│   └── <handle>    (0600)     └── state/              (ignores itself)
+├── cache/                         ├── sessions.sqlite3
+│   └── mcp-tools.json             ├── repo-map.json
+└── state/                         ├── artifacts/
+    └── model, effort, theme       ├── views/
+                                   └── eval/
+```
+
+- **Top level** — settings and hooks. A project's `.arsy/arsy.json`,
+  `guard.json`, `AGENTS.md`, and `plugins/` are meant to be committed.
+- **`state/`, `cache/`** — safe to delete; ARSY rebuilds what it needs.
+  Deleting a workspace's `state/` loses its session history and nothing else.
+  `.arsy/state/` writes its own `.gitignore`, so a repository needs no entry
+  for it (`storage.state_gitignore` switches that off).
+- **`secrets/`** — owner-only, written only through `/provider` and
+  `arsy auth`.
+
+A layout from an earlier release is moved on first use, by rename and never
+over an existing file. Old subagent views are git worktrees and stay put until
+`arsy storage clean views` removes them.
+
+Configuration resolves enterprise → `~/.arsy/arsy.json` →
+`<workspace>/.arsy/arsy.json` → nested `.arsy/arsy.json` files toward the
+working directory; later layers win within the limits
+[docs/35](docs/35-configuration.md) sets. Everything above can be managed
+without editing a file:
+
+| Task | In the TUI | From a shell |
+|---|---|---|
+| Change a setting for you or for the project | `/settings`, Tab switches user/project | `arsy config set <KEY> <VALUE> [--scope workspace]` |
+| See where a value came from | `/settings [KEY]` | `arsy config explain [KEY]` |
+| See what ARSY stores and how big it is | `/storage` | `arsy storage` |
+| Clear caches, idle views, old artifacts | `/storage` | `arsy storage clean <target>` |
+| Delete this workspace's session history | `/storage`, then type the workspace name | `arsy storage reset-history --confirm <name>` |
+| Add or remove a hook | `/hooks`, then `a` or `x` | `arsy hook add ...` / `arsy hook remove ...` |
 
 ## Design documents
 

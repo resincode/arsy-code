@@ -97,7 +97,7 @@ pub const MAX_TOOL_ROUNDS: usize = 200;
 
 /// Top-level keys this loader accepts and applies nothing from. `schema_version`
 /// is here because `check_schema_version` has already read it.
-const INERT_SECTIONS: &[&str] = &["schema_version", "context", "git", "sandbox", "storage"];
+const INERT_SECTIONS: &[&str] = &["schema_version", "context", "git", "sandbox"];
 
 /// Other tools whose configuration can be read as a lower layer.
 pub const COMPAT_SOURCES: &[&str] = &["claude", "codex", "omp"];
@@ -110,6 +110,10 @@ pub const THEME_BASES: &[&str] = &[
 ];
 /// The theme in force when no layer names one.
 pub const DEFAULT_THEME_BASE: &str = "dark";
+/// How many days `arsy gc` keeps an artifact nothing references, by default.
+pub const DEFAULT_ARTIFACT_RETENTION_DAYS: usize = 7;
+/// The longest retention a layer may ask for: ten years.
+pub const MAX_ARTIFACT_RETENTION_DAYS: usize = 3650;
 
 /// The value shape of one editable setting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -254,6 +258,21 @@ pub const SETTINGS: &[Setting] = &[
         kind: SettingKind::Choice(THEME_BASES),
         default: DEFAULT_THEME_BASE,
         description: "the palette an interactive transcript is drawn in",
+    },
+    Setting {
+        key: "storage.state_gitignore",
+        kind: SettingKind::Bool,
+        default: "true",
+        description: "keep .arsy/state out of git with its own .gitignore",
+    },
+    Setting {
+        key: "storage.artifact_retention_days",
+        kind: SettingKind::Integer {
+            min: 1,
+            max: MAX_ARTIFACT_RETENTION_DAYS,
+        },
+        default: "7",
+        description: "days `arsy gc` keeps an artifact nothing references",
     },
 ];
 
@@ -953,6 +972,10 @@ pub struct Config {
     /// What the layers that spoke agreed on for `telemetry.include_content`.
     /// `None` means none of them did, which is not the same as `Some(false)`.
     telemetry_include_content: Option<bool>,
+    /// `storage.state_gitignore`. `None` is the built-in default, on.
+    state_gitignore: Option<bool>,
+    /// `storage.artifact_retention_days`. `None` is the built-in default.
+    artifact_retention_days: Option<usize>,
     trace: BTreeMap<String, Origin>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -979,6 +1002,19 @@ impl Config {
     /// `ui.mcp_log`: how much of a server's own logging to show.
     pub fn mcp_log(&self) -> &str {
         self.mcp_log.as_deref().unwrap_or(DEFAULT_MCP_LOG)
+    }
+
+    /// `storage.state_gitignore`: whether `.arsy/state` writes the
+    /// `.gitignore` that keeps it out of the repository.
+    pub fn state_gitignore(&self) -> bool {
+        self.state_gitignore.unwrap_or(true)
+    }
+
+    /// `storage.artifact_retention_days`: how long `arsy gc` keeps an
+    /// artifact nothing references.
+    pub fn artifact_retention_days(&self) -> usize {
+        self.artifact_retention_days
+            .unwrap_or(DEFAULT_ARTIFACT_RETENTION_DAYS)
     }
 
     /// The hook declarations this operator switched off.
@@ -1021,6 +1057,8 @@ impl Config {
             "execution.max_tool_rounds" => self.max_tool_rounds().to_string(),
             "theme.base" => self.theme_base().to_owned(),
             "ui.mcp_log" => self.mcp_log().to_owned(),
+            "storage.state_gitignore" => self.state_gitignore().to_string(),
+            "storage.artifact_retention_days" => self.artifact_retention_days().to_string(),
             _ => match key
                 .strip_prefix("compat.")
                 .and_then(|rest| rest.strip_suffix(".enabled"))
@@ -1582,6 +1620,7 @@ impl Config {
         match key {
             "theme" => self.apply_theme(layer, path, value),
             "ui" => self.apply_ui(layer, path, value),
+            "storage" => self.apply_storage(layer, path, value),
             "hook" => self.apply_hook(layer, path, value),
             "skill" => self.apply_skill(layer, path, value),
             other => Err(ConfigError {
@@ -2596,6 +2635,56 @@ impl Config {
         Ok(())
     }
 
+    /// `[storage]`: what ARSY keeps on disk and for how long.
+    fn apply_storage(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let table = as_table(value, "storage", path)?;
+        for (key, value) in table {
+            let refuse = |message: String| ConfigError {
+                path: path.to_path_buf(),
+                message,
+            };
+            match key.as_str() {
+                "state_gitignore" => {
+                    let flag = value.as_bool().ok_or_else(|| {
+                        refuse("`storage.state_gitignore` must be true or false".to_owned())
+                    })?;
+                    self.state_gitignore = Some(flag);
+                    self.record(layer, path, "storage.state_gitignore", flag.to_string());
+                }
+                "artifact_retention_days" => {
+                    let days = value
+                        .as_integer()
+                        .and_then(|days| usize::try_from(days).ok())
+                        .filter(|days| (1..=MAX_ARTIFACT_RETENTION_DAYS).contains(days))
+                        .ok_or_else(|| {
+                            refuse(format!(
+                                "`storage.artifact_retention_days` must be between 1 and \
+                                 {MAX_ARTIFACT_RETENTION_DAYS}"
+                            ))
+                        })?;
+                    self.artifact_retention_days = Some(days);
+                    self.record(
+                        layer,
+                        path,
+                        "storage.artifact_retention_days",
+                        days.to_string(),
+                    );
+                }
+                // Designed in docs/35 and accepted, but not applied yet: the
+                // section was inert before these two keys existed, and a file
+                // that set them must keep loading.
+                "data_dir" | "durability" => {}
+                other => return Err(refuse(format!("unknown key `storage.{other}`"))),
+            }
+        }
+        Ok(())
+    }
+
     fn apply_theme(
         &mut self,
         layer: Layer,
@@ -3357,6 +3446,37 @@ pub fn user_config() -> Option<PathBuf> {
     Some(config_home()?.join(CONFIG_FILE))
 }
 
+/// Credentials, under the configuration home: owner-only, and written only
+/// through the credential commands.
+pub const SECRETS_DIRECTORY: &str = "secrets";
+/// Anything rebuilt on demand; safe to delete.
+pub const CACHE_DIRECTORY: &str = "cache";
+/// What the operator last picked in the terminal: model, effort, theme.
+pub const STATE_DIRECTORY: &str = "state";
+
+/// A file ARSY keeps for itself under the configuration home, in one of the
+/// directories above, rather than beside `arsy.json`.
+///
+/// Releases before that split kept these files directly in the home. The first
+/// time one is asked for, a file still at the old place is renamed into the
+/// new one, and never over a file already there. A failed move leaves the old
+/// file where it was and the new path is returned regardless: what is missing
+/// there reads as missing, which is what it would be without the move.
+pub fn home_file(directory: &str, name: &str) -> Option<PathBuf> {
+    let home = config_home()?;
+    let target = home.join(directory).join(name);
+    let legacy = home.join(name);
+    if !target.exists() && legacy.is_file() {
+        if let Some(parent) = target.parent() {
+            // forgeguard: allow FG-SEC-007 -- a fixed directory name under the operator's config home
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // forgeguard: allow FG-SEC-007 -- both ends are the operator's config home joined with a name check_name or the caller fixed
+        let _ = std::fs::rename(&legacy, &target);
+    }
+    Some(target)
+}
+
 /// The directory the operator's own ARSY state lives in: `~/.arsy`, or whatever
 /// `ARSY_CONFIG_HOME` names.
 ///
@@ -3701,6 +3821,45 @@ mod tests {
             "unexpected: {}",
             error.message
         );
+    }
+
+    #[test]
+    fn storage_settings_default_and_refuse_what_they_cannot_mean() {
+        let directory = tempfile::tempdir().unwrap();
+        let read = |body: &str| {
+            let path = write(directory.path(), CONFIG_FILE, body);
+            Config::load(&[(Layer::User, path)])
+        };
+
+        let defaults = read("schema_version = 1\n").unwrap();
+        assert!(defaults.state_gitignore());
+        assert_eq!(
+            defaults.artifact_retention_days(),
+            DEFAULT_ARTIFACT_RETENTION_DAYS
+        );
+
+        let set = read(
+            "schema_version = 1\n[storage]\nstate_gitignore = false\nartifact_retention_days = 30\n",
+        )
+        .unwrap();
+        assert!(!set.state_gitignore());
+        assert_eq!(set.artifact_retention_days(), 30);
+        assert_eq!(set.setting_value("storage.artifact_retention_days"), "30");
+
+        assert!(read(
+            "schema_version = 1\n[storage]\ndata_dir = \"/x\"\ndurability = \"strict\"\n"
+        )
+        .is_ok());
+
+        for bad in [
+            "[storage]\nstate_gitignore = \"no\"\n",
+            "[storage]\nartifact_retention_days = 0\n",
+            "[storage]\nartifact_retention_days = 99999\n",
+            "[storage]\nsomething_else = 1\n",
+        ] {
+            let error = read(&format!("schema_version = 1\n{bad}")).unwrap_err();
+            assert!(error.message.contains("storage"), "{bad}: {error}");
+        }
     }
 
     #[test]
