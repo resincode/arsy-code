@@ -1867,10 +1867,12 @@ pub(crate) fn take_turn(
         .state
         .set_approval_mode(running.approval.get().label());
     running.state.set_effort(running.approval.effort());
-    if running.approval.get() == approval::ApprovalMode::Plan
-        && !turn.interrupted
-        && turn.failure.is_none()
-    {
+    if plan_is_ready(
+        running.approval.get(),
+        turn.interrupted,
+        turn.failure.is_some(),
+        running.queued.len(),
+    ) {
         settle_plan(
             running.workspace,
             &turn.response,
@@ -1884,6 +1886,23 @@ pub(crate) fn take_turn(
         )?;
     }
     Ok(Pass::Go)
+}
+
+/// Whether a finished turn should put the plan to the operator.
+///
+/// Only in Plan Mode, after a turn that ran to its end. And not while the
+/// operator has follow-ups queued: those were typed into the planning, so the
+/// next planning turn takes them first, and the plan is offered once the
+/// queue is empty. Offering it now would put "implement" ahead of them, or
+/// drop them on cancel.
+#[cfg(feature = "tui")]
+fn plan_is_ready(
+    mode: approval::ApprovalMode,
+    interrupted: bool,
+    failed: bool,
+    queued: usize,
+) -> bool {
+    mode == approval::ApprovalMode::Plan && !interrupted && !failed && queued == 0
 }
 
 /// Answer a slash command that only reads: help, or one of the inspections
@@ -2299,4 +2318,23 @@ pub(crate) enum TaskPass {
     /// Collect the next answer at this prompt instead.
     Ask(Prompt),
     Stop,
+}
+
+#[cfg(all(test, feature = "tui"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_queued_follow_up_runs_before_the_plan_is_offered() {
+        use approval::ApprovalMode::{Default, Plan};
+
+        assert!(plan_is_ready(Plan, false, false, 0));
+        assert!(
+            !plan_is_ready(Plan, false, false, 1),
+            "a message typed during planning is planned first"
+        );
+        assert!(!plan_is_ready(Plan, true, false, 0));
+        assert!(!plan_is_ready(Plan, false, true, 0));
+        assert!(!plan_is_ready(Default, false, false, 0));
+    }
 }
