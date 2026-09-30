@@ -266,6 +266,101 @@ impl Workspace {
     }
 }
 
+/// Where a path the model wrote lives, relative to what this session may touch.
+pub enum Location {
+    /// A plain workspace-relative path; [`Workspace`] confines it as always.
+    Inside,
+    /// Under the workspace or an added directory, named absolutely or with
+    /// `..`: that root opened, and the path relative to it. Confinement then
+    /// applies inside the root exactly as it does inside the workspace, so a
+    /// symlink there still cannot leave it.
+    Rooted(Workspace, PathBuf),
+    /// Outside every root. Only an operator's approval of this exact path
+    /// opens it, which is the caller's decision, not this module's.
+    Undeclared(PathBuf),
+}
+
+/// Classify a path against the workspace and the added directories.
+///
+/// A path that names nothing outside lexically is [`Location::Inside`]. The
+/// rest is made absolute against the workspace, normalized lexically, and
+/// matched against the roots by whole components, so `../b-evil` is not under
+/// `../b`.
+pub fn locate(
+    roots: &[PathBuf],
+    workspace: &Path,
+    path: impl AsRef<Path>,
+) -> Result<Location, ResolveError> {
+    let path = path.as_ref();
+    if !escapes(path) {
+        return Ok(Location::Inside);
+    }
+    let absolute = absolute(workspace, path);
+    let Some(root) = root_of(roots, workspace, &absolute) else {
+        return Ok(Location::Undeclared(absolute));
+    };
+    let relative = absolute
+        .strip_prefix(root)
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let relative = if relative.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        relative
+    };
+    Ok(Location::Rooted(Workspace::open(root)?, relative))
+}
+
+/// Whether a path lies outside the workspace and every added directory,
+/// decided lexically and without touching the filesystem — the question
+/// policy asks before a call runs.
+pub fn is_undeclared(roots: &[PathBuf], workspace: &Path, path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
+    escapes(path) && root_of(roots, workspace, &absolute(workspace, path)).is_none()
+}
+
+/// The workspace or added directory an absolute path lies under.
+fn root_of<'a>(roots: &'a [PathBuf], workspace: &'a Path, absolute: &Path) -> Option<&'a Path> {
+    std::iter::once(workspace)
+        .chain(roots.iter().map(PathBuf::as_path))
+        .find(|root| absolute.starts_with(root))
+}
+
+/// A path made absolute against the workspace and normalized lexically.
+pub fn absolute(workspace: &Path, path: impl AsRef<Path>) -> PathBuf {
+    let mut absolute = PathBuf::new();
+    for component in workspace.join(path).components() {
+        match component {
+            Component::ParentDir => {
+                absolute.pop();
+            }
+            Component::CurDir => {}
+            other => absolute.push(other),
+        }
+    }
+    absolute
+}
+
+/// Open an approved path outside every root: its parent directory as the
+/// capability root, and the file name under it. The name still resolves
+/// through cap-std, so a symlink named there cannot redirect the effect.
+pub fn open_parent(absolute: &Path) -> Result<(Workspace, PathBuf), ResolveError> {
+    let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) else {
+        return Err(ResolveError::EmptyPath);
+    };
+    Ok((Workspace::open(parent)?, PathBuf::from(name)))
+}
+
+/// Whether a path names something outside the workspace lexically.
+pub fn escapes(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    })
+}
+
 /// The one walk every repository-wide traversal uses.
 ///
 /// Honours `.gitignore` and the other standard filters, and skips the
@@ -401,6 +496,86 @@ mod tests {
             .unwrap();
 
         assert_eq!(resolved.resource.value(), "target");
+    }
+
+    fn rooted(location: Location) -> (Workspace, PathBuf) {
+        match location {
+            Location::Rooted(root, relative) => (root, relative),
+            Location::Inside => panic!("expected a rooted path, got Inside"),
+            Location::Undeclared(path) => panic!("expected a rooted path, got {path:?}"),
+        }
+    }
+
+    #[test]
+    fn locates_added_directories_and_nothing_beside_them() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("project-a");
+        let added = parent.path().join("project-b");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(added.join("src")).unwrap();
+        std::fs::write(added.join("src/lib.rs"), "added").unwrap();
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+        let roots = vec![std::fs::canonicalize(&added).unwrap()];
+
+        let (root, relative) =
+            rooted(locate(&roots, &workspace, "../project-b/src/lib.rs").unwrap());
+        assert_eq!(root.read(&relative, 64).unwrap().bytes, b"added");
+        let (_, relative) =
+            rooted(locate(&roots, &workspace, roots[0].join("src/lib.rs")).unwrap());
+        assert_eq!(relative, Path::new("src/lib.rs"));
+        let (_, relative) = rooted(locate(&roots, &workspace, "../project-b").unwrap());
+        assert_eq!(relative, Path::new("."));
+        let (root, relative) = rooted(locate(&roots, &workspace, workspace.join("x")).unwrap());
+        assert_eq!(
+            (root.path(), relative.as_path()),
+            (workspace.as_path(), Path::new("x"))
+        );
+
+        assert!(matches!(
+            locate(&roots, &workspace, "src/lib.rs"),
+            Ok(Location::Inside)
+        ));
+        for outside in ["../private/x", "../project-b-evil/x"] {
+            assert!(matches!(
+                locate(&roots, &workspace, outside),
+                Ok(Location::Undeclared(path)) if path.ends_with(&outside[3..])
+            ));
+        }
+        assert!(matches!(
+            locate(&[], &workspace, "../project-b/src/lib.rs"),
+            Ok(Location::Undeclared(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_added_directory_symlink_cannot_leave_it() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let added = parent.path().join("project-b");
+        std::fs::create_dir_all(&added).unwrap();
+        std::fs::write(parent.path().join("secret"), "secret").unwrap();
+        symlink(parent.path().join("secret"), added.join("escape")).unwrap();
+        let roots = vec![std::fs::canonicalize(&added).unwrap()];
+
+        let (root, relative) =
+            rooted(locate(&roots, parent.path(), roots[0].join("escape")).unwrap());
+        assert!(matches!(
+            root.resolve_file(relative),
+            Err(ResolveError::OutsideWorkspace)
+        ));
+    }
+
+    #[test]
+    fn an_approved_outside_path_opens_under_its_parent() {
+        let parent = tempfile::tempdir().unwrap();
+        let file = parent.path().join("notes.txt");
+        std::fs::write(&file, "outside").unwrap();
+
+        let (root, name) = open_parent(&file).unwrap();
+        assert_eq!(root.read(&name, 64).unwrap().bytes, b"outside");
+        assert!(open_parent(Path::new("/")).is_err());
     }
 
     #[cfg(unix)]

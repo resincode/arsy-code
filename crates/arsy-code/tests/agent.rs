@@ -546,14 +546,12 @@ fn a_skill_declared_outside_the_workspace_is_read_where_it_lives() {
     let body = ok(&runtime, "fs.read", json!({"path": "skill://review"}));
     assert!(body.contains("how to review"), "{body}");
 
-    // The reference is what opens it, not the path: the same file named
-    // directly is outside the workspace and stays refused.
-    let direct = err(
-        &runtime,
-        "fs.read",
-        json!({"path": declared.display().to_string()}),
-    );
-    assert!(!direct.is_empty());
+    // The reference is what opens it without asking: the same file named
+    // directly is outside the workspace, so it runs only once the operator
+    // approves that path, and an unattended call is refused.
+    let direct = json!({"path": declared.display().to_string()});
+    assert!(runtime.outside_workspace(&runtime.prepare("fs.read", &direct).unwrap()));
+    assert!(!runtime.invoke("fs.read", &direct).success);
 
     // A name nothing declared is an error, not a read of the literal string.
     let unknown = err(&runtime, "fs.read", json!({"path": "skill://nothing"}));
@@ -868,8 +866,11 @@ fn a_patch_that_half_applies_says_what_already_landed() {
     );
 }
 
+/// Outside the workspace nothing runs unasked: even under a policy that
+/// allows every file, such a call needs the operator's approval of that exact
+/// path, so the unattended surface refuses it.
 #[test]
-fn no_tool_reaches_outside_the_workspace() {
+fn no_tool_reaches_outside_the_workspace_unasked() {
     let root = tempfile::tempdir().unwrap();
     let elsewhere = tempfile::tempdir().unwrap();
     std::fs::write(elsewhere.path().join("target.txt"), "outside\n").unwrap();
@@ -881,10 +882,13 @@ fn no_tool_reaches_outside_the_workspace() {
             ("fs.write", json!({"path": escape, "content": "x"})),
             ("fs.delete", json!({"path": escape})),
         ] {
-            let refused = err(&runtime, tool, arguments);
+            let request = runtime.prepare(tool, &arguments).unwrap();
+            assert!(runtime.outside_workspace(&request), "{tool} {escape}");
+            let refused = runtime.invoke(tool, &arguments);
             assert!(
-                refused.contains("outside the workspace") || refused.contains("path"),
-                "{tool} {escape}: {refused}"
+                !refused.success && refused.output.contains("approval"),
+                "{tool} {escape}: {}",
+                refused.output
             );
         }
     }
@@ -1109,6 +1113,7 @@ fn instructions_are_discovered_root_first_and_only_where_they_belong() {
         &found,
         &[],
         &[],
+        &[],
         None,
         ExecutionMode::Normal,
         &arsy_kernel::secret::Redactor::new(),
@@ -1133,6 +1138,7 @@ fn instructions_are_discovered_root_first_and_only_where_they_belong() {
         &found,
         &[],
         &[],
+        &[std::path::PathBuf::from("/work/project-b")],
         None,
         ExecutionMode::Plan,
         &arsy_kernel::secret::Redactor::new(),
@@ -1141,6 +1147,7 @@ fn instructions_are_discovered_root_first_and_only_where_they_belong() {
     .unwrap();
     let rendered = agent::instructions::render(&plan);
     assert!(rendered.contains("You are in Plan Mode"), "{rendered}");
+    assert!(rendered.contains("- `/work/project-b`"), "{rendered}");
     assert!(rendered.contains("Do not execute the plan"), "{rendered}");
 
     // `plugin.invoke` takes an id, and its schema cannot say which ids exist:
@@ -1153,6 +1160,7 @@ fn instructions_are_discovered_root_first_and_only_where_they_belong() {
             version: "1.2.0".to_owned(),
             capabilities: vec!["fs.read".to_owned()],
         }],
+        &[],
         &[],
         None,
         ExecutionMode::Normal,
@@ -1357,4 +1365,195 @@ fn every_tool_result_is_recoverable_evidence_in_the_artifact_store() {
     assert!(result.metadata["digest"]
         .as_str()
         .is_some_and(|digest| !digest.is_empty()));
+}
+
+/// An added directory is worked in like the workspace; a path outside it and
+/// the workspace is asked about, and runs only under the operator's grant for
+/// that exact path.
+#[test]
+fn additional_directories_work_like_the_workspace_and_others_need_approval() {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("project-a");
+    let added = parent.path().join("project-b");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(added.join("src")).unwrap();
+    std::fs::create_dir_all(parent.path().join("private")).unwrap();
+    std::fs::write(added.join("src/lib.rs"), "fn compare_me() {}\n").unwrap();
+    std::fs::write(parent.path().join("private/notes"), "outside").unwrap();
+    let added = std::fs::canonicalize(added).unwrap();
+
+    let workspace = Workspace::open(&root).unwrap();
+    let artifacts: Arc<dyn ArtifactStore> =
+        Arc::new(FileArtifactStore::open(root.join(".arsy/artifacts"), 0).unwrap());
+    let runtime = agent::runtime(
+        &workspace,
+        rules(CapabilityAction::ALL),
+        artifacts,
+        0,
+        Principal::System,
+        RiskContext {
+            reversible: true,
+            workspace: WorkspaceCleanliness::Clean,
+            sandbox: SandboxAssurance::None,
+        },
+        arsy_code::operations::Reachable {
+            additional_directories: arsy_code::operations::Directories::new(vec![added.clone()]),
+            ..Default::default()
+        },
+        "test",
+        arsy_code::operations::TurnState::default(),
+        &[],
+    )
+    .unwrap();
+
+    let calls = vec![
+        (
+            "fs.read".to_owned(),
+            json!({"path": "../project-b/src/lib.rs"}),
+        ),
+        ("fs.list".to_owned(), json!({"path": "../project-b"})),
+        (
+            "search.text".to_owned(),
+            json!({"query": "compare_me", "path": "../project-b"}),
+        ),
+        (
+            "search.files".to_owned(),
+            json!({"pattern": "*.rs", "path": "../project-b/src"}),
+        ),
+        (
+            "fs.edit".to_owned(),
+            json!({"path": "../project-b/src/lib.rs", "old_text": "compare_me", "new_text": "compared"}),
+        ),
+        (
+            "fs.write".to_owned(),
+            json!({"path": "../project-b/new.txt", "content": "made"}),
+        ),
+    ];
+    let results = runtime.invoke_batch(&calls, 1);
+    for (result, (tool, _)) in results.iter().zip(&calls) {
+        assert!(result.success, "{tool}: {}", result.output);
+    }
+    let hit = format!("{}/src/lib.rs", added.display());
+    assert!(
+        results[0].output.contains("compare_me"),
+        "{}",
+        results[0].output
+    );
+    assert!(results[2].output.contains(&hit), "{}", results[2].output);
+    assert!(results[3].output.contains(&hit), "{}", results[3].output);
+    assert_eq!(
+        std::fs::read_to_string(added.join("src/lib.rs")).unwrap(),
+        "fn compared() {}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(added.join("new.txt")).unwrap(),
+        "made"
+    );
+    // A delete asks here exactly as it does in the workspace: irreversible.
+    let delete = runtime
+        .prepare("fs.delete", &json!({"path": "../project-b/new.txt"}))
+        .unwrap();
+    assert!(!runtime.outside_workspace(&delete));
+    assert!(matches!(
+        runtime.authorize(&delete),
+        Authorization::NeedsApproval { .. }
+    ));
+
+    // Outside everything: policy allows `file:**`, and still the operator is
+    // asked, because a rule is not an answer about this path.
+    let outside = json!({"path": "../private/notes", "content": "changed"});
+    let request = runtime.prepare("fs.write", &outside).unwrap();
+    assert!(runtime.outside_workspace(&request));
+    let authorization = runtime.authorize(&request);
+    let Authorization::NeedsApproval { granted, .. } = &authorization else {
+        panic!("expected approval, got {authorization:?}");
+    };
+    // A caller that skipped asking and ran on the broad grant is refused.
+    let skipped = runtime.dispatch(
+        "fs.write",
+        &request,
+        &[arsy_kernel::capability::CapabilityGrant {
+            id: arsy_kernel::domain::GrantId::new(),
+            actor: Principal::System,
+            action: CapabilityAction::FsWrite,
+            scope: arsy_kernel::capability::ResourceScope::single(
+                ResourcePattern::new("file", "**").unwrap(),
+            ),
+            expires_at_ms: None,
+            delegation_depth: 0,
+            source: PolicySource::User,
+        }],
+        std::time::Instant::now(),
+    );
+    assert!(!skipped.success, "{}", skipped.output);
+    assert!(granted.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(parent.path().join("private/notes")).unwrap(),
+        "outside"
+    );
+
+    // Approved: the exact grant runs it.
+    let grants = authorization.approve().unwrap();
+    let approved = runtime.dispatch("fs.write", &request, &grants, std::time::Instant::now());
+    assert!(approved.success, "{}", approved.output);
+    assert_eq!(
+        std::fs::read_to_string(parent.path().join("private/notes")).unwrap(),
+        "changed"
+    );
+
+    // Reads and searches outside are asked about the same way.
+    for (tool, arguments) in [
+        ("fs.read", json!({"path": "../private/notes"})),
+        ("search.text", json!({"query": "x", "path": "../private"})),
+    ] {
+        let request = runtime.prepare(tool, &arguments).unwrap();
+        assert!(
+            matches!(
+                runtime.authorize(&request),
+                Authorization::NeedsApproval { .. }
+            ),
+            "{tool}"
+        );
+    }
+    let inside = runtime
+        .prepare("fs.read", &json!({"path": "../project-b/src/lib.rs"}))
+        .unwrap();
+    assert!(!runtime.outside_workspace(&inside));
+
+    // Answering "always" for an outside read allows that directory for
+    // reading, for every later call: the next file there is not asked about,
+    // while a write there still is.
+    std::fs::create_dir(parent.path().join("private/.git")).unwrap();
+    std::fs::create_dir(parent.path().join("private/src")).unwrap();
+    std::fs::write(parent.path().join("private/src/more"), "more").unwrap();
+    let read = runtime
+        .prepare("fs.read", &json!({"path": "../private/src/more"}))
+        .unwrap();
+    let (directory, access) = runtime.outside_directory(&read).unwrap();
+    assert!(
+        directory.ends_with("private"),
+        "the repository, not its subfolder: {directory:?}"
+    );
+    assert_eq!(access, arsy_code::operations::DirectoryAccess::Read);
+    runtime.allow_directory(&directory, access);
+    let later = runtime.invoke("fs.read", &json!({"path": "../private/notes"}));
+    assert!(later.success, "{}", later.output);
+    let write = runtime
+        .prepare(
+            "fs.write",
+            &json!({"path": "../private/notes", "content": "x"}),
+        )
+        .unwrap();
+    assert!(
+        runtime.outside_workspace(&write),
+        "reading was allowed, not editing"
+    );
+
+    runtime.allow_directory(&directory, arsy_code::operations::DirectoryAccess::Full);
+    assert!(!runtime.outside_workspace(&write));
+    let edited = runtime.invoke(
+        "fs.write",
+        &json!({"path": "../private/notes", "content": "x"}),
+    );
+    assert!(edited.success, "{}", edited.output);
 }

@@ -3834,6 +3834,7 @@ fn system_prompt(
         &instructions,
         &installed_extensions(root),
         &prompt_skills(root, config),
+        config.additional_directories(),
         memory::recalled(root, MAX_RECALLED_MEMORY_BYTES).as_deref(),
         mode,
         &arsy_kernel::secret::Redactor::new(),

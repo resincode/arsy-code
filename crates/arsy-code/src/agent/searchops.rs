@@ -7,7 +7,8 @@
 //! indistinguishable from arbitrary execution in the audit trail.
 
 use crate::{
-    resource::Workspace,
+    operations::Directories,
+    resource::{locate, Location, ResolveError, Workspace},
     search::{SearchError, SearchResults},
 };
 use arsy_kernel::{
@@ -21,7 +22,11 @@ use arsy_kernel::{
 };
 use globset::{GlobBuilder, GlobMatcher};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 /// Defaults that keep one call's answer inside a turn. A caller that wants more
 /// asks for more; a caller that forgets does not lose the turn to one search.
@@ -78,6 +83,9 @@ pub struct SearchExecutor {
     workspace: PathBuf,
     artifacts: Arc<dyn ArtifactStore>,
     retain_until_ms: u64,
+    /// Directories the operator added beside the workspace; a `path` under one
+    /// searches it instead of the workspace.
+    directories: Directories,
 }
 
 impl SearchExecutor {
@@ -86,6 +94,7 @@ impl SearchExecutor {
         workspace: &Workspace,
         artifacts: Arc<dyn ArtifactStore>,
         retain_until_ms: u64,
+        directories: Directories,
     ) -> Arc<Self> {
         Arc::new(Self {
             operation,
@@ -96,7 +105,10 @@ impl SearchExecutor {
                         operation.query_field().to_owned(),
                         JsonType::String,
                     )]),
-                    optional: BTreeMap::from([("limit".to_owned(), JsonType::Number)]),
+                    optional: BTreeMap::from([
+                        ("limit".to_owned(), JsonType::Number),
+                        ("path".to_owned(), JsonType::String),
+                    ]),
                     allow_extra: false,
                 },
                 actions: vec![CapabilityAction::FsRead],
@@ -107,6 +119,7 @@ impl SearchExecutor {
             workspace: workspace.path().to_owned(),
             artifacts,
             retain_until_ms,
+            directories,
         })
     }
 }
@@ -119,10 +132,15 @@ impl OperationExecutor for SearchExecutor {
     fn execute(
         &self,
         request: &OperationRequest,
-        _grants: &[CapabilityGrant],
+        grants: &[CapabilityGrant],
     ) -> Result<OperationOutcome, OperationError> {
-        let workspace = Workspace::open(&self.workspace)
-            .map_err(|error| OperationError::Execution(error.to_string()))?;
+        let (workspace, prefix) = self.searched(
+            request
+                .input
+                .get("path")
+                .and_then(serde_json::Value::as_str),
+            grants,
+        )?;
         let query = request
             .input
             .get(self.operation.query_field())
@@ -151,7 +169,7 @@ impl OperationExecutor for SearchExecutor {
                     hits: hits
                         .into_iter()
                         .map(|hit| TextHit {
-                            path: hit.resource.value().to_owned(),
+                            path: prefixed(prefix.as_deref(), hit.resource.value()),
                             line: hit.line,
                             text: hit.text,
                         })
@@ -162,6 +180,10 @@ impl OperationExecutor for SearchExecutor {
             }
             SearchOperation::Files => {
                 let (paths, truncated) = find_files(&workspace, &query, limit)?;
+                let paths = paths
+                    .iter()
+                    .map(|path| prefixed(prefix.as_deref(), path))
+                    .collect();
                 SearchOutcome {
                     query: query.clone(),
                     hits: Vec::new(),
@@ -188,6 +210,61 @@ impl OperationExecutor for SearchExecutor {
             state: None,
         })
     }
+}
+
+impl SearchExecutor {
+    /// The tree a call searches, and the prefix its results carry.
+    ///
+    /// No `path`, or one inside the workspace, searches the whole workspace
+    /// with workspace-relative results, as it always has. A `path` under an
+    /// added directory — or outside every root, when the operator approved
+    /// that exact path — searches that directory and reports absolute paths,
+    /// so `fs.read` can open a hit as written. The directory is canonicalized
+    /// and must still lie under the root it was found in, which is what stops
+    /// a symlinked directory from widening the search.
+    fn searched(
+        &self,
+        path: Option<&str>,
+        grants: &[CapabilityGrant],
+    ) -> Result<(Workspace, Option<String>), OperationError> {
+        let execution = |error: std::io::Error| OperationError::Execution(error.to_string());
+        let refused = || OperationError::Schema(ResolveError::OutsideWorkspace.to_string());
+        let Some(path) = path.filter(|path| crate::resource::escapes(Path::new(path))) else {
+            return Ok((Workspace::open(&self.workspace).map_err(execution)?, None));
+        };
+        let location = locate(&self.directories.roots(true), &self.workspace, path)
+            .map_err(|error| OperationError::Schema(error.to_string()))?;
+        let (root, searched) = match location {
+            Location::Inside => {
+                return Ok((Workspace::open(&self.workspace).map_err(execution)?, None))
+            }
+            Location::Rooted(root, relative) => {
+                let searched = Workspace::open(root.path().join(relative)).map_err(execution)?;
+                (root.path().to_path_buf(), searched)
+            }
+            Location::Undeclared(absolute) => {
+                let resource = ResourceRef::new(CapabilityAction::FsRead.default_scheme(), path)
+                    .map_err(|error| OperationError::Schema(error.to_string()))?;
+                if !grants.iter().any(|grant| {
+                    grant.action == CapabilityAction::FsRead && grant.names_exactly(&resource)
+                }) {
+                    return Err(refused());
+                }
+                let searched = Workspace::open(&absolute).map_err(execution)?;
+                (absolute, searched)
+            }
+        };
+        if !searched.path().starts_with(&root) {
+            return Err(refused());
+        }
+        let prefix = searched.path().to_string_lossy().replace('\\', "/");
+        Ok((searched, Some(prefix)))
+    }
+}
+
+/// A result path as the caller can read it back.
+fn prefixed(prefix: Option<&str>, path: &str) -> String {
+    prefix.map_or_else(|| path.to_owned(), |prefix| format!("{prefix}/{path}"))
 }
 
 /// Match `pattern` against workspace-relative paths.
@@ -259,12 +336,18 @@ pub fn executors(
     workspace: &Workspace,
     artifacts: &Arc<dyn ArtifactStore>,
     retain_until_ms: u64,
+    directories: &Directories,
 ) -> Vec<Arc<dyn OperationExecutor>> {
     SearchOperation::ALL
         .into_iter()
         .map(|operation| {
-            SearchExecutor::new(operation, workspace, Arc::clone(artifacts), retain_until_ms)
-                as Arc<dyn OperationExecutor>
+            SearchExecutor::new(
+                operation,
+                workspace,
+                Arc::clone(artifacts),
+                retain_until_ms,
+                directories.clone(),
+            ) as Arc<dyn OperationExecutor>
         })
         .collect()
 }

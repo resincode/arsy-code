@@ -117,6 +117,70 @@ pub const DEFAULT_TERMINATION_GRACE: Duration = Duration::from_secs(5);
 pub struct Reachable {
     pub remote_targets: Vec<(String, arsy_kernel::config::RemoteTarget)>,
     pub language_servers: Vec<arsy_kernel::config::LanguageServer>,
+    /// Directories the operator added beside the workspace. File and search
+    /// operations work in them as in the workspace.
+    pub additional_directories: Directories,
+}
+
+/// How much of an added directory a session may use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectoryAccess {
+    /// Reads and searches only: what an operator allowed by approving a read.
+    Read,
+    /// Everything the workspace allows, under the same approval mode.
+    Full,
+}
+
+/// The directories beside the workspace a session may use, shared by the
+/// runtime and every executor it registered.
+///
+/// Shared rather than copied so a directory the operator allows in the middle
+/// of a turn applies to the very next call, rather than to the next turn.
+#[derive(Clone, Debug, Default)]
+pub struct Directories(
+    std::sync::Arc<std::sync::RwLock<Vec<(std::path::PathBuf, DirectoryAccess)>>>,
+);
+
+impl Directories {
+    /// Canonical directories, each with full access.
+    pub fn new(full: Vec<std::path::PathBuf>) -> Self {
+        Self(std::sync::Arc::new(std::sync::RwLock::new(
+            full.into_iter()
+                .map(|directory| (directory, DirectoryAccess::Full))
+                .collect(),
+        )))
+    }
+
+    /// The roots an action may use: every directory for a read, only the
+    /// fully added ones for anything else.
+    pub fn roots(&self, reading: bool) -> Vec<std::path::PathBuf> {
+        self.0
+            .read()
+            .unwrap_or_else(|held| held.into_inner())
+            .iter()
+            .filter(|(_, access)| reading || *access == DirectoryAccess::Full)
+            .map(|(directory, _)| directory.clone())
+            .collect()
+    }
+
+    /// Every directory and its access, for carrying into another runtime.
+    pub fn entries(&self) -> Vec<(std::path::PathBuf, DirectoryAccess)> {
+        self.0
+            .read()
+            .unwrap_or_else(|held| held.into_inner())
+            .clone()
+    }
+
+    /// Allow a canonical directory for the rest of the session. Access only
+    /// widens: allowing a directory for reading again leaves full access.
+    pub fn allow(&self, directory: std::path::PathBuf, access: DirectoryAccess) {
+        let mut held = self.0.write().unwrap_or_else(|held| held.into_inner());
+        match held.iter_mut().find(|(known, _)| *known == directory) {
+            Some((_, known)) if access == DirectoryAccess::Full => *known = access,
+            Some(_) => {}
+            None => held.push((directory, access)),
+        }
+    }
 }
 
 impl Reachable {
@@ -128,6 +192,7 @@ impl Reachable {
                 .map(|(name, target)| (name.clone(), target.clone()))
                 .collect(),
             language_servers: config.language_servers().cloned().collect(),
+            additional_directories: Directories::new(config.additional_directories().to_vec()),
         }
     }
 }
@@ -220,20 +285,26 @@ pub fn registry(
     // agent so that `arsy policy explain`, the MCP server, and a turn all see
     // the same set: a tool the model can call is a tool an operator can reason
     // about beforehand.
-    for executor in crate::agent::fsops::executors(workspace, &artifacts, retain_until_ms, skills)
-        .into_iter()
-        .chain(crate::agent::searchops::executors(
-            workspace,
-            &artifacts,
-            retain_until_ms,
-        ))
-        .chain(crate::agent::codeops::executors(
-            workspace,
-            &artifacts,
-            retain_until_ms,
-            reachable.language_servers,
-        ))
-    {
+    for executor in crate::agent::fsops::executors(
+        workspace,
+        &artifacts,
+        retain_until_ms,
+        skills,
+        &reachable.additional_directories,
+    )
+    .into_iter()
+    .chain(crate::agent::searchops::executors(
+        workspace,
+        &artifacts,
+        retain_until_ms,
+        &reachable.additional_directories,
+    ))
+    .chain(crate::agent::codeops::executors(
+        workspace,
+        &artifacts,
+        retain_until_ms,
+        reachable.language_servers,
+    )) {
         registry.register(executor)?;
     }
     #[cfg(feature = "dap")]

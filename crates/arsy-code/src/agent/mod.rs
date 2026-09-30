@@ -279,7 +279,7 @@ pub const TOOLS: &[Tool] = &[
         schema: || {
             object(
                 json!({
-                    "path": {"type": "string", "description": "Workspace-relative path."},
+                    "path": {"type": "string", "description": "Workspace-relative path, or a path inside a listed reference."},
                     "offset": {"type": "number", "description": "One-based first line. Defaults to 1."},
                     "limit": {"type": "number", "description": "How many lines to return. Defaults to the whole file."}
                 }),
@@ -303,7 +303,7 @@ pub const TOOLS: &[Tool] = &[
         description: "List one directory of the workspace. Directories first, then files, both sorted.",
         schema: || {
             object(
-                json!({"path": {"type": "string", "description": "Workspace-relative directory. Defaults to the root."}}),
+                json!({"path": {"type": "string", "description": "Workspace-relative directory, or one inside a listed reference. Defaults to the root."}}),
                 &[],
             )
         },
@@ -326,6 +326,7 @@ pub const TOOLS: &[Tool] = &[
             object(
                 json!({
                     "pattern": {"type": "string", "description": "Glob, such as `*.rs` or `src/**/mod.rs`."},
+                    "path": {"type": "string", "description": "A listed reference, or a directory inside one, to search instead of the workspace."},
                     "limit": {"type": "number", "description": "Most paths to return. Defaults to 100."}
                 }),
                 &["pattern"],
@@ -335,6 +336,9 @@ pub const TOOLS: &[Tool] = &[
             let mut input = json!({"pattern": text(arguments, "pattern")});
             if let Some(limit) = arguments.get("limit").and_then(Value::as_u64) {
                 input["limit"] = json!(limit);
+            }
+            if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+                input["path"] = json!(path);
             }
             Ok(input)
         },
@@ -348,6 +352,7 @@ pub const TOOLS: &[Tool] = &[
             object(
                 json!({
                     "query": {"type": "string", "description": "Literal text to find. Not a regular expression."},
+                    "path": {"type": "string", "description": "A listed reference, or a directory inside one, to search instead of the workspace."},
                     "limit": {"type": "number", "description": "Most matches to return. Defaults to 100."}
                 }),
                 &["query"],
@@ -357,6 +362,9 @@ pub const TOOLS: &[Tool] = &[
             let mut input = json!({"query": text(arguments, "query")});
             if let Some(limit) = arguments.get("limit").and_then(Value::as_u64) {
                 input["limit"] = json!(limit);
+            }
+            if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+                input["path"] = json!(path);
             }
             Ok(input)
         },
@@ -1119,6 +1127,10 @@ pub struct ToolRuntime {
     dynamic: Arc<Vec<DynamicTool>>,
     safety_cache: Arc<Mutex<SafetyReviewCache>>,
     safety_audits: Arc<Mutex<Vec<SafetyAuditRecord>>>,
+    /// Directories the operator added beside the workspace, shared with the
+    /// executors. A file path outside these and the workspace needs the
+    /// operator's approval of that exact path, whatever policy says.
+    directories: crate::operations::Directories,
 }
 
 /// The execution ceiling applied after decoding and before dispatch.
@@ -1153,7 +1165,85 @@ impl ToolRuntime {
             dynamic: Arc::new(Vec::new()),
             safety_cache: Arc::new(Mutex::new(SafetyReviewCache::new(128))),
             safety_audits: Arc::new(Mutex::new(Vec::new())),
+            directories: crate::operations::Directories::default(),
         }
+    }
+
+    /// Work in these directories beside the workspace as in the workspace.
+    /// The handle must be the one the registry's executors hold, so a
+    /// directory allowed later reaches both.
+    pub fn with_additional_directories(
+        mut self,
+        directories: crate::operations::Directories,
+    ) -> Self {
+        self.directories = directories;
+        self
+    }
+
+    /// Allow a directory for the rest of this runtime's life — for this turn's
+    /// remaining calls; the caller carries it into later turns.
+    pub fn allow_directory(&self, directory: &Path, access: crate::operations::DirectoryAccess) {
+        if let Ok(canonical) = std::fs::canonicalize(directory) {
+            self.directories.allow(canonical, access);
+        }
+    }
+
+    /// Whether a file requirement names a path outside the workspace and every
+    /// added directory.
+    fn undeclared(&self, requirement: &CapabilityRequirement) -> bool {
+        matches!(
+            requirement.action,
+            CapabilityAction::FsRead | CapabilityAction::FsWrite | CapabilityAction::FsDelete
+        ) && requirement.resource.scheme() == requirement.action.default_scheme()
+            && crate::resource::is_undeclared(
+                &self
+                    .directories
+                    .roots(requirement.action == CapabilityAction::FsRead),
+                &self.workspace,
+                requirement.resource.value(),
+            )
+    }
+
+    /// Whether a call reaches outside the workspace and every added directory.
+    ///
+    /// Such a call is asked about in every approval mode but Bypass, as
+    /// Claude Code does: an approval mode is a standing answer about the
+    /// places the operator chose to work in, not about the rest of the disk.
+    pub fn outside_workspace(&self, request: &OperationRequest) -> bool {
+        self.outside_directory(request).is_some()
+    }
+
+    /// The directory an approval of an outside call would allow for the
+    /// session, and how much of it: reading only when every outside
+    /// requirement is a read, as Claude Code offers "allow reading from this
+    /// directory".
+    ///
+    /// The directory is the repository the path lives in — the nearest
+    /// ancestor holding `.git` — so allowing one file of a sibling project
+    /// allows that project rather than one folder of it. Never the home
+    /// directory or a filesystem root, which a dotfiles repository would
+    /// otherwise make the answer; without a repository it is the path's own
+    /// directory.
+    pub fn outside_directory(
+        &self,
+        request: &OperationRequest,
+    ) -> Option<(PathBuf, crate::operations::DirectoryAccess)> {
+        let outside: Vec<_> = request
+            .requirements
+            .iter()
+            .filter(|requirement| self.undeclared(requirement))
+            .collect();
+        let first = outside.first()?;
+        let path = crate::resource::absolute(&self.workspace, first.resource.value());
+        let access = if outside
+            .iter()
+            .all(|requirement| requirement.action == CapabilityAction::FsRead)
+        {
+            crate::operations::DirectoryAccess::Read
+        } else {
+            crate::operations::DirectoryAccess::Full
+        };
+        Some((repository_of(&path), access))
     }
 
     pub fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
@@ -1465,6 +1555,25 @@ impl ToolRuntime {
                 context,
             };
             match self.rules.evaluate(&query).decision {
+                // A rule written about the workspace, or a broad `file:**`,
+                // is not an answer about a path outside everything the
+                // operator chose to work in, so that path is asked about.
+                PolicyDecision::Allow(_) if self.undeclared(requirement) => {
+                    approvals.push(ApprovalRequest {
+                        id: arsy_kernel::domain::ApprovalId::new(),
+                        actor: request.actor.clone(),
+                        operation: request.kind.clone(),
+                        requirement: requirement.clone(),
+                        operation_digest: digest,
+                        reversible,
+                        expires_at_ms: None,
+                        delegation_depth: 0,
+                        reason: format!(
+                            "{} is outside the workspace and every added directory",
+                            requirement.resource.value()
+                        ),
+                    })
+                }
                 PolicyDecision::Allow(grant) => granted.push(grant),
                 PolicyDecision::RequireApproval(approval) => approvals.push(approval),
                 // Refusal is total and immediate: dispatching the rest would
@@ -1508,12 +1617,10 @@ impl ToolRuntime {
                 }
                 _ => {}
             }
-            if requirement.resource.scheme() == "file" {
-                let target = Path::new(requirement.resource.value());
-                if target.is_absolute() && !target.starts_with(&self.workspace) {
-                    flags.push(RiskFlag::ScopeEscape);
-                }
-            }
+            // A file path outside the workspace and every added directory is
+            // not flagged here: `authorize` already turns it into a question
+            // for the operator, and a ScopeEscape flag would make Auto deny
+            // it outright instead of asking, as Claude Code's Auto does.
         }
         if let Some((flag, reason)) =
             shell_text(request).and_then(|command| command_risk::assess(&command, &self.workspace))
@@ -2283,6 +2390,22 @@ fn explain(error: &OperationError) -> String {
     }
 }
 
+/// The directory an outside path's approval covers: its repository, or its
+/// own directory. See [`ToolRuntime::outside_directory`].
+fn repository_of(path: &Path) -> PathBuf {
+    let own = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .map_or_else(|| path.to_path_buf(), Path::to_path_buf)
+    };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    own.ancestors()
+        .take_while(|ancestor| ancestor.parent().is_some() && Some(*ancestor) != home.as_deref())
+        .find(|ancestor| ancestor.join(".git").exists())
+        .map_or(own.clone(), Path::to_path_buf)
+}
+
 /// Build the runtime for one workspace, with every operation this build offers.
 #[allow(clippy::too_many_arguments)]
 pub fn runtime(
@@ -2297,6 +2420,7 @@ pub fn runtime(
     turn: crate::operations::TurnState,
     skills: &[instructions::Skill],
 ) -> Result<ToolRuntime, arsy_kernel::operation::RegistrationError> {
+    let directories = reachable.additional_directories.clone();
     let registry = crate::operations::registry(
         workspace,
         Arc::clone(&artifacts),
@@ -2306,12 +2430,8 @@ pub fn runtime(
         turn,
         skills,
     )?;
-    Ok(ToolRuntime::new(
-        registry,
-        rules,
-        artifacts,
-        workspace.path(),
-        actor,
-        context,
-    ))
+    Ok(
+        ToolRuntime::new(registry, rules, artifacts, workspace.path(), actor, context)
+            .with_additional_directories(directories),
+    )
 }
