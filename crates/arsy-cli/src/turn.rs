@@ -313,7 +313,7 @@ pub(crate) fn run_turn(
     let task = prepare_task(task, emitter)?;
     let root = workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    let config = load_config(&root, &working, invocation.config.as_deref())?;
+    let config = load_session_config(&root, &working, invocation)?;
     // Loaded once per turn, as `arsy run` loads them: a turn finishes with the
     // hooks it began with.
     let loaded = hook_engine(&root, &config);
@@ -374,6 +374,7 @@ pub(crate) fn run_turn(
                 &prompt_skills(&root, &config),
             )?
             .with_execution_mode(approval.get().execution_mode());
+            approval.carry_directories(&runtime);
             let outcome = native_turn(
                 resolved,
                 &config,
@@ -2800,6 +2801,9 @@ fn execute_call(
                     keys,
                     decoder: &mut *decoder,
                     approval,
+                    // A hook's question is about the hook, not the path.
+                    outside: None,
+                    runtime,
                 };
                 match hooked_arguments(terminal, colour, hooked, asking, &notes)? {
                     Ok(run) => run,
@@ -2840,6 +2844,8 @@ fn execute_call(
             keys,
             decoder,
             approval,
+            outside: runtime.outside_directory(&request),
+            runtime,
         },
         authorization,
         safety.as_ref(),
@@ -2941,6 +2947,11 @@ struct Asking<'a> {
     keys: &'a std::sync::mpsc::Receiver<u8>,
     decoder: &'a mut tui::Keys,
     approval: &'a approval::ApprovalCell,
+    /// The directory, and how much of it, that approving "always" allows for
+    /// the session, when the call reaches outside the workspace and every
+    /// added directory.
+    outside: Option<(PathBuf, arsy_code::operations::DirectoryAccess)>,
+    runtime: &'a arsy_code::agent::ToolRuntime,
 }
 
 #[cfg(feature = "tui")]
@@ -3070,7 +3081,13 @@ fn authorize(
     let command = (name == "bash")
         .then(|| asking.arguments["command"].as_str())
         .flatten();
-    match mode_decision(asking.approval, name, command, force_approval) {
+    match mode_decision(
+        asking.approval,
+        name,
+        command,
+        force_approval,
+        asking.outside.is_some(),
+    ) {
         approval::Decision::Approve => Ok(granted(authorization, name, None)),
         approval::Decision::Refuse => Ok(refused(
             name,
@@ -3082,7 +3099,10 @@ fn authorize(
         )),
         approval::Decision::Ask => {
             let preview = format_tool_preview(name, asking.arguments);
-            let facts = policy_approval_facts(name, asking.summary, &authorization);
+            let facts = outside_facts(
+                policy_approval_facts(name, asking.summary, &authorization),
+                asking.outside.as_ref(),
+            );
             if let Some(grants) = asking.approval.cached(&authorization) {
                 return Ok(Granted::Run { grants, note: None });
             }
@@ -3097,7 +3117,7 @@ fn authorize(
             )? {
                 Answer::Yes { note } => Ok(granted(authorization, name, note)),
                 Answer::Rule { note } => {
-                    asking.approval.remember(&authorization);
+                    remember_always(&asking, &authorization);
                     if let Some(command) = command {
                         asking.approval.remember_command(command);
                     }
@@ -3117,6 +3137,38 @@ fn authorize(
     }
 }
 
+/// Outside every directory, "always" is an answer about the directory, so the
+/// card shows the directory it would allow rather than one file's grant.
+#[cfg(feature = "tui")]
+fn outside_facts(
+    mut facts: ApprovalFacts,
+    outside: Option<&(PathBuf, arsy_code::operations::DirectoryAccess)>,
+) -> ApprovalFacts {
+    if let Some((directory, access)) = outside {
+        let access = match access {
+            arsy_code::operations::DirectoryAccess::Read => "read",
+            arsy_code::operations::DirectoryAccess::Full => "read and edit",
+        };
+        facts.scope = format!("{} for this session ({access})", directory.display());
+        facts.rule_approval = true;
+    }
+    facts
+}
+
+/// Keep an "always" answer: the directory for an outside call, the exact
+/// grants otherwise.
+#[cfg(feature = "tui")]
+fn remember_always(asking: &Asking<'_>, authorization: &arsy_code::agent::Authorization) {
+    match &asking.outside {
+        Some((directory, access)) => {
+            asking
+                .approval
+                .allow_directory(asking.runtime, directory, *access)
+        }
+        None => asking.approval.remember(authorization),
+    }
+}
+
 /// What the approval mode says about a call policy left for approval.
 ///
 /// A safety review that requires approval always asks. Otherwise Accept
@@ -3128,11 +3180,18 @@ fn mode_decision(
     name: &str,
     command: Option<&str>,
     force_approval: bool,
+    outside: bool,
 ) -> approval::Decision {
+    let mode = approval.get();
+    // Outside the workspace and every added directory, the mode's standing
+    // answer does not apply; `requested` already names the path, so a
+    // refusal here says why.
+    if let Some(decision) = outside.then(|| approval::decide_outside(mode)).flatten() {
+        return decision;
+    }
     if force_approval {
         return approval::Decision::Ask;
     }
-    let mode = approval.get();
     match approval::decide(mode, name) {
         approval::Decision::Ask
             if mode == approval::ApprovalMode::AcceptEdits

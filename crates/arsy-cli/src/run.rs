@@ -137,7 +137,7 @@ impl TaskRun {
     ) -> Result<Self, Diagnostic> {
         let root = workspace_root(&invocation.workspace)?;
         let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-        let config = load_config(&root, &working, invocation.config.as_deref())?;
+        let config = load_session_config(&root, &working, invocation)?;
         let resolved = provider::resolve(&config, invocation.provider.as_deref())?;
         let model = selected_model(&config, &resolved.endpoint, invocation.model.as_deref())?;
 

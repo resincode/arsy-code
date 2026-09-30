@@ -54,7 +54,7 @@ mod updater;
 mod verify;
 
 use config_load::{bootstrap_user_config, replace_file};
-pub(crate) use config_load::{load_config, selected_model};
+pub(crate) use config_load::{load_config, load_session_config, selected_model};
 #[cfg(feature = "tui")]
 use picker::prompt::{
     answer_prompt, cancels_to_task, leave_picker, masked, offer_rows, open_palette, open_route,
@@ -184,6 +184,8 @@ Usage:
 Global flags:
   --workspace <PATH>   workspace root (default: current directory)
   --config <PATH>      one extra config file, applied last; it cannot widen policy
+  --add-dir <PATH>     another directory to work in beside the workspace, under
+                       the same approval mode; repeat for more than one
   --provider <ID>      the endpoint this run dispatches to
   --model <ID>         the model this run asks for, within model.allowed
   --output <MODE>      human, json, or ci
@@ -503,6 +505,10 @@ pub struct Invocation {
     /// `--config <PATH>`: one extra configuration file, applied after every
     /// discovered layer. It cannot weaken policy — ceilings intersect.
     pub config: Option<PathBuf>,
+    /// `--add-dir <PATH>`, repeatable: directories to work in beside the
+    /// workspace for this invocation, on top of
+    /// `execution.additional_directories`.
+    pub additional_directories: Vec<PathBuf>,
     /// `--provider <ID>`: the endpoint a turn dispatches to, overriding
     /// `provider.default` and the routing that "auto" would otherwise do.
     pub provider: Option<String>,
@@ -523,6 +529,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
         debug: parsed.debug,
         skip_permissions: parsed.skip_permissions,
         config: parsed.config.take(),
+        additional_directories: std::mem::take(&mut parsed.additional_directories),
         // `--provider` doubles as the filter for `arsy model list`, so it is
         // cloned rather than taken: one flag, read in both places.
         provider: parsed.provider.clone(),
@@ -661,6 +668,8 @@ struct ParsedArguments {
     actor: Option<String>,
     /// `--config <PATH>`: one extra configuration file for this invocation.
     config: Option<PathBuf>,
+    /// `--add-dir <PATH>`, repeatable: directories beside the workspace.
+    additional_directories: Vec<PathBuf>,
     /// `--image <PATH>`: a picture attached to the prompt.
     image: Option<PathBuf>,
     /// `--provider <ID>`: a global override, and the filter `model list` reads.
@@ -702,6 +711,7 @@ fn collect_arguments<I: IntoIterator<Item = String>>(
         }
         if apply_value_flag(&argument, &mut parsed, &mut arguments)?
             || apply_management_flag(&argument, &mut parsed, &mut arguments)?
+            || apply_directory_flag(&argument, &mut parsed, &mut arguments)?
         {
             continue;
         }
@@ -765,6 +775,21 @@ fn apply_management_flag(
         _ => return Ok(false),
     };
     *slot = Some(value(arguments, argument)?);
+    Ok(true)
+}
+
+/// `--add-dir <PATH>`: repeatable, so it collects rather than fills a slot.
+fn apply_directory_flag(
+    argument: &str,
+    parsed: &mut ParsedArguments,
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<bool, Diagnostic> {
+    if argument != "--add-dir" {
+        return Ok(false);
+    }
+    parsed
+        .additional_directories
+        .push(PathBuf::from(value(arguments, argument)?));
     Ok(true)
 }
 
@@ -855,6 +880,7 @@ struct Global {
     debug: bool,
     skip_permissions: bool,
     config: Option<PathBuf>,
+    additional_directories: Vec<PathBuf>,
     provider: Option<String>,
     model: Option<String>,
 }
@@ -867,6 +893,7 @@ fn invocation(global: Global, command: Command) -> Invocation {
         debug: global.debug,
         skip_permissions: global.skip_permissions,
         config: global.config,
+        additional_directories: global.additional_directories,
         provider: global.provider,
         model: global.model,
         command,
@@ -5412,6 +5439,7 @@ mod tests {
             debug: false,
             skip_permissions: false,
             config: None,
+            additional_directories: Vec::new(),
             provider: None,
             model: None,
             workspace: PathBuf::from("."),
@@ -5497,6 +5525,7 @@ mod tests {
             debug: false,
             skip_permissions: false,
             config: None,
+            additional_directories: Vec::new(),
             provider: None,
             model: None,
             workspace: PathBuf::from("."),
@@ -6411,6 +6440,16 @@ mod tests {
         // consumption of the next word.
         assert!(parse(["run", "a task", "--model"].map(str::to_owned)).is_err());
         assert!(parse(["--config"].map(str::to_owned)).is_err());
+        assert!(parse(["--add-dir"].map(str::to_owned)).is_err());
+
+        // `--add-dir` repeats and collects, on either side of the subcommand.
+        let added =
+            parse(["--add-dir", "../b", "run", "a task", "--add-dir", "/c"].map(str::to_owned))
+                .unwrap();
+        assert_eq!(
+            added.additional_directories,
+            [PathBuf::from("../b"), PathBuf::from("/c")]
+        );
 
         // Tracing is opt-in, so an ordinary run stays as quiet as it was.
         assert!(!parse(["run", "a task"].map(str::to_owned)).unwrap().debug);
@@ -6811,6 +6850,7 @@ mod tests {
             debug: false,
             skip_permissions: false,
             config: None,
+            additional_directories: Vec::new(),
             provider: None,
             model: None,
             workspace: workspace.clone(),
