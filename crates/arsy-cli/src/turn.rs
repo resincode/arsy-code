@@ -635,6 +635,7 @@ pub(crate) fn native_turn(
         if runtime.execution_mode() != mode {
             runtime = runtime.with_execution_mode(mode);
         }
+        steer_into(conversation, composer, transcript, colour)?;
         // Before the request, not after: a transcript that has outgrown the
         // window fails at the provider, and the operator is told what was
         // elided rather than watching the turn shrink invisibly. The request
@@ -1172,21 +1173,90 @@ fn absorb_live_keys(
             *expanded = !*expanded;
             continue;
         }
+        if key == tui::Key::Tab {
+            queue_draft(composer);
+            continue;
+        }
         match composer.press(key) {
             action if live_control(&action, approval) => {}
             tui::Action::Expand => *expanded = !*expanded,
-            tui::Action::Submit(line) if !line.trim().is_empty() => {
-                // Bounded as `drain_keys` bounds it; past it the draft stays.
-                if composer.held_len() < 16 {
-                    composer.hold(line);
-                } else {
-                    composer.restore(line);
-                }
-            }
+            tui::Action::Submit(line) if !line.trim().is_empty() => keep_sent(composer, line, true),
             _ => {}
         }
     }
     Ok(cancelled)
+}
+
+/// Keep a line sent while a turn runs: steering it into the turn (Enter) or
+/// queueing it for after (Tab). Bounded, so a held key cannot grow the queue
+/// without limit; past the bound the draft is handed back.
+#[cfg(feature = "tui")]
+fn keep_sent(composer: &mut tui::Composer, line: String, steer: bool) {
+    if composer.held_len() >= 16 {
+        composer.restore(line);
+    } else if steer {
+        composer.steer(line);
+    } else {
+        composer.hold(line);
+    }
+}
+
+/// Tab while a turn runs: queue the draft for after the turn instead of
+/// steering it in, as the Codex CLI does. Taken through the same submit Enter
+/// uses, so pastes and history behave alike. Answers whether a line was taken.
+#[cfg(feature = "tui")]
+fn queue_draft(composer: &mut tui::Composer) -> bool {
+    if composer.is_empty() {
+        return false;
+    }
+    match composer.press(tui::Key::Enter) {
+        tui::Action::Submit(line) if !line.trim().is_empty() => {
+            keep_sent(composer, line, false);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Put the lines the operator steered in while the turn ran into the
+/// conversation, beside the tool results the model is about to read.
+///
+/// Only where the conversation ends in those results — the start of a later
+/// round — so a model request always follows and answers them; a turn that
+/// ends first leaves them held, and they run as follow-ups instead. Each is
+/// drawn as a prompt and recorded in the transcript, as a typed prompt is.
+#[cfg(feature = "tui")]
+fn steer_into(
+    conversation: &mut [ModelMessage],
+    composer: &mut tui::Composer,
+    transcript: &mut tui::Transcript,
+    colour: bool,
+) -> io::Result<()> {
+    let Some(results) = conversation
+        .last_mut()
+        .filter(|message| message.role == ModelRole::User)
+        .filter(|message| {
+            message
+                .content
+                .iter()
+                .any(|content| matches!(content, ModelContent::ToolResult { .. }))
+        })
+    else {
+        return Ok(());
+    };
+    let steering = composer.take_steering();
+    if steering.is_empty() {
+        return Ok(());
+    }
+    let mut terminal = io::stdout();
+    for line in steering {
+        write!(terminal, "{}", composer.commit(&line, colour))?;
+        transcript.push_user(&line);
+        results.content.push(ModelContent::Text {
+            text: format!("The operator added this while you were working: {line}"),
+        });
+    }
+    terminal.flush()
 }
 
 /// Erase a running tool's card and the composer drawn under it, leaving the
@@ -2385,22 +2455,22 @@ pub(crate) fn drain_keys(
             outcome.interrupted = true;
             return Typed::Interrupted;
         }
+        if key == tui::Key::Tab {
+            if queue_draft(composer) {
+                typed = Typed::Redraw;
+            }
+            continue;
+        }
         match composer.press(key) {
             // Shift+Tab changes authority immediately; it never becomes a
             // model prompt or a queued follow-up. Nor do Ctrl+T or `/effort`.
             action if live_control(&action, approval) => typed = Typed::Redraw,
-            // Held by the composer, not this round's outcome: the composer
-            // outlives every round of the turn, so a line sent while one round
-            // streams is still there when the turn ends, and it is drawn above
-            // the input while it waits. Bounded as on the Codex route, so a
-            // held Enter cannot grow the queue without limit; past the bound
-            // the draft is handed back.
+            // Enter steers the running turn. Held by the composer, not this
+            // round's outcome: the composer outlives every round of the turn,
+            // so the line is still there for the next round, and it is drawn
+            // above the input while it waits.
             tui::Action::Submit(line) if !line.trim().is_empty() => {
-                if composer.held_len() < 16 {
-                    composer.hold(line);
-                } else {
-                    composer.restore(line);
-                }
+                keep_sent(composer, line, true);
                 typed = Typed::Redraw;
             }
             tui::Action::Expand | tui::Action::Submit(_) | tui::Action::Redraw => {

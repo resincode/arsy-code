@@ -373,11 +373,11 @@ pub struct Composer {
     /// Large pastes shown in the line as a placeholder, with the text each
     /// one stands for. The placeholder is swapped back when the line is taken.
     pub(super) pastes: Vec<(String, String)>,
-    /// Lines sent while a turn ran, waiting to run as follow-ups once it
-    /// ends. Kept here rather than in the round's outcome because the composer
-    /// outlives every round of a turn, and drawn above the input while they
-    /// wait.
-    pub(super) held: Vec<String>,
+    /// Lines sent while a turn ran, oldest first, each marked whether it
+    /// steers the running turn or waits for it to end. Kept here rather than
+    /// in the round's outcome because the composer outlives every round of a
+    /// turn, and drawn above the input while they wait.
+    pub(super) held: Vec<(String, bool)>,
     /// The row the caret was drawn on, counted in wrapped rows. The erase
     /// before the next frame moves up by this, not by where the caret is
     /// now: a key has already moved it by then.
@@ -448,7 +448,23 @@ impl Composer {
 
     /// Keep a line to run as a follow-up once the turn ends.
     pub fn hold(&mut self, line: String) {
-        self.held.push(line);
+        self.held.push((line, false));
+    }
+
+    /// Keep a line to steer the running turn: it joins the conversation at
+    /// the next point the turn talks to the model again. A turn that ends
+    /// first runs it as a follow-up, like a held line.
+    pub fn steer(&mut self, line: String) {
+        self.held.push((line, true));
+    }
+
+    /// The steering lines, oldest first, leaving the follow-ups where they are.
+    pub fn take_steering(&mut self) -> Vec<String> {
+        let (steering, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held)
+            .into_iter()
+            .partition(|(_, steer)| *steer);
+        self.held = waiting;
+        steering.into_iter().map(|(line, _)| line).collect()
     }
 
     /// How many lines are waiting.
@@ -459,6 +475,9 @@ impl Composer {
     /// The lines `hold` kept, oldest first.
     pub fn take_held(&mut self) -> Vec<String> {
         std::mem::take(&mut self.held)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect()
     }
 
     pub fn restore(&mut self, text: String) {
@@ -1124,12 +1143,13 @@ impl Composer {
             .held
             .iter()
             .take(QUEUED_SHOWN)
-            .map(|line| {
+            .map(|(line, steer)| {
                 let first = line.lines().next().unwrap_or_default();
+                let label = if *steer { "steer ›" } else { "queued ›" };
                 fit(
                     &format!(
                         "  {} {}",
-                        paint(colour, sgr_dim(), "queued ›"),
+                        paint(colour, sgr_dim(), label),
                         paint(colour, sgr_dim(), first)
                     ),
                     width,

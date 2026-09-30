@@ -1951,6 +1951,15 @@ mod tests {
         let frame = composer.render_turn(80, false, "  ⠋ Working…", "  footer");
         assert!(frame.contains("… 2 more queued"), "{frame}");
         assert_eq!(composer.take_held().len(), 5, "shown or not, all still run");
+
+        // A steering line is labelled apart, and taken without the follow-ups.
+        composer.hold("after the turn".to_owned());
+        composer.steer("into the turn".to_owned());
+        let frame = composer.render_turn(80, false, "  ⠋ Working…", "  footer");
+        assert!(frame.contains("steer › into the turn"), "{frame}");
+        assert!(frame.contains("queued › after the turn"), "{frame}");
+        assert_eq!(composer.take_steering(), vec!["into the turn".to_owned()]);
+        assert_eq!(composer.take_held(), vec!["after the turn".to_owned()]);
     }
 
     #[test]

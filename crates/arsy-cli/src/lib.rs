@@ -4917,15 +4917,15 @@ mod tests {
         assert_eq!(seen, 3, "the repeat did not end the turn");
     }
 
-    /// A follow-up typed while the first round streams survives the rounds
-    /// after it. Each round used to keep its own queue, so a line typed before
-    /// a tool call was dropped when the next round began.
+    /// Run a two-round turn — one read, then an answer — with `typed` already
+    /// on the keyboard, so the first round's drain reads it whatever the
+    /// machine's load. Returns the turn, what is still held, and what the
+    /// second request carried.
     #[cfg(feature = "tui")]
-    #[test]
-    fn a_follow_up_typed_in_an_early_round_outlives_the_later_ones() {
+    fn two_rounds_with_typed(typed: &[u8]) -> (crate::turn::Turn, Vec<String>, String) {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join("notes.txt"), "hello\n").unwrap();
-        let (mut resolved, _scripted) = resolved(vec![
+        let (mut resolved, scripted) = resolved(vec![
             vec![
                 ModelEvent::ToolCallCompleted {
                     index: 0,
@@ -4948,10 +4948,8 @@ mod tests {
         ]);
         let approval =
             std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
-        // On the keyboard before the turn starts, so the first round's drain
-        // reads it whatever the machine's load.
         let (sender, keys) = std::sync::mpsc::channel();
-        for byte in b"compare with rdb too\r" {
+        for byte in typed {
             sender.send(*byte).unwrap();
         }
         let mut composer = tui::Composer::default();
@@ -4981,11 +4979,44 @@ mod tests {
         )
         .unwrap();
         drop(sender);
-
         assert!(turn.failure.is_none(), "{:?}", turn.failure);
+        let second = scripted
+            .seen
+            .lock()
+            .unwrap()
+            .get(1)
+            .map(|request| format!("{:?}", request.messages))
+            .unwrap_or_default();
+        (turn, composer.take_held(), second)
+    }
+
+    /// Enter while a turn runs steers it: the line reaches the model with
+    /// the next round's tool results, instead of waiting for the turn to end.
+    /// It is held by the composer until then, so a line typed in the first
+    /// round is not dropped when the second begins.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn enter_during_a_turn_steers_the_next_round() {
+        let (turn, held, second) = two_rounds_with_typed(b"compare with rdb too\r");
+        assert!(
+            second.contains("The operator added this while you were working: compare with rdb too"),
+            "{second}"
+        );
+        assert!(
+            turn.queued.is_empty() && held.is_empty(),
+            "steered, not queued"
+        );
+    }
+
+    /// Tab while a turn runs queues the line for after the turn instead.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn tab_during_a_turn_queues_for_after_it() {
+        let (turn, held, second) = two_rounds_with_typed(b"then check npm\t");
+        assert!(!second.contains("then check npm"), "{second}");
         let mut queued: Vec<String> = turn.queued.into_iter().collect();
-        queued.extend(composer.take_held());
-        assert_eq!(queued, vec!["compare with rdb too".to_owned()]);
+        queued.extend(held);
+        assert_eq!(queued, vec!["then check npm".to_owned()]);
     }
 
     /// A model that calls the same failing tool forever is stopped after
