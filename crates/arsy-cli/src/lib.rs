@@ -4844,6 +4844,79 @@ mod tests {
         );
     }
 
+    /// A model re-reading what it already read is still exploring: the repeat
+    /// is answered from the memo and the turn goes on to the model's answer,
+    /// rather than ending with a canned line that a plan-mode session then
+    /// shows as the plan.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_repeated_read_is_answered_from_memory_and_the_turn_continues() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("notes.txt"), "hello\n").unwrap();
+        let read = |id: &str| {
+            vec![
+                ModelEvent::ToolCallCompleted {
+                    index: 0,
+                    id: id.to_owned(),
+                    name: "fs.read".to_owned(),
+                    arguments: json!({"path": "notes.txt"}),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::ToolUse,
+                },
+            ]
+        };
+        let (mut resolved, scripted) = resolved(vec![
+            read("call-1"),
+            read("call-2"),
+            vec![
+                ModelEvent::TextDelta {
+                    text: "the plan\n".to_owned(),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
+        let (_keys_sender, keys) = std::sync::mpsc::channel();
+        let mut conversation = vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: "read it".to_owned(),
+            }],
+        }];
+        let turn = native_turn(
+            &mut resolved,
+            &arsy_kernel::config::Config::default(),
+            &test_runtime(workspace.path()),
+            &mut conversation,
+            &arsy_code::agent::budget::History::default(),
+            &route(),
+            None,
+            arsy_kernel::domain::TurnId::new(),
+            false,
+            &crate::turn::Footer::fixed("  footer"),
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+            &mut tui::Transcript::default(),
+            &approval,
+            None,
+        )
+        .unwrap();
+
+        assert!(turn.failure.is_none(), "{:?}", turn.failure);
+        assert!(turn.response.contains("the plan"), "{}", turn.response);
+        let seen = scripted
+            .seen
+            .lock()
+            .map(|seen| seen.len())
+            .unwrap_or_default();
+        assert_eq!(seen, 3, "the repeat did not end the turn");
+    }
+
     /// A model that calls the same failing tool forever is stopped after
     /// three identical failures — with a message that names the loop, not
     /// the provider — instead of burning the whole round budget on it.

@@ -611,6 +611,11 @@ pub(crate) fn native_turn(
     // failing identically.
     const FAILURE_LOOP_LIMIT: usize = 3;
     let mut identical_failures: Option<(String, usize)> = None;
+    // Consecutive rounds made only of repeated calls. A repeated read is the
+    // model re-checking what it saw, which is still exploring, so it is
+    // answered from the memo and the turn goes on; the same bound as a
+    // failure loop stops a model that only ever repeats itself.
+    let mut repeated_rounds = 0usize;
     let mut reported_trim = (0, 0);
     // What each new compaction recorded, for the turn to append once it has
     // the session open.
@@ -752,7 +757,15 @@ pub(crate) fn native_turn(
             role: ModelRole::User,
             content: results,
         });
-        if all_repeated && !calls.is_empty() {
+        let ends;
+        (repeated_rounds, ends) = repeated_round(
+            &runtime,
+            &calls,
+            all_repeated,
+            repeated_rounds,
+            FAILURE_LOOP_LIMIT,
+        );
+        if ends {
             outcome.response =
                 "The requested operation already completed; a repeated tool call was skipped."
                     .to_owned();
@@ -953,6 +966,31 @@ fn show_event(
         }
     }
     Ok(())
+}
+
+/// Count a round made only of repeated calls, and say whether the run of
+/// them ends the turn.
+///
+/// A repeated effect ends it at once: running it again is what the memo
+/// exists to prevent. A repeated read is the model re-checking what it saw,
+/// so the turn goes on until `limit` such rounds in a row. Any round that ran
+/// something new resets the count.
+#[cfg(feature = "tui")]
+fn repeated_round(
+    runtime: &arsy_code::agent::ToolRuntime,
+    calls: &[(String, String, Value)],
+    all_repeated: bool,
+    rounds: usize,
+    limit: usize,
+) -> (usize, bool) {
+    if !all_repeated || calls.is_empty() {
+        return (0, false);
+    }
+    let rounds = rounds + 1;
+    let reads_only = calls
+        .iter()
+        .all(|(_, name, arguments)| runtime.is_observational(name, arguments));
+    (rounds, rounds >= limit || !reads_only)
 }
 
 /// Say in the answer that a repeated Git command was stopped.
