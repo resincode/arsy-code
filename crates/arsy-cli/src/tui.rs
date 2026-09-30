@@ -1920,6 +1920,40 @@ mod tests {
     }
 
     #[test]
+    fn queued_follow_ups_wait_above_the_status_and_are_erased_with_it() {
+        set_render_style(RenderStyle::Classic);
+        let mut composer = Composer::default();
+        composer.hold("compare with rdb too\nsecond line stays hidden".to_owned());
+        composer.hold("then check npm".to_owned());
+        let frame = composer.render_turn(80, false, "  ⠋ Working… · 3s", "  footer");
+        let rows: Vec<&str> = frame.split('\n').collect();
+        assert_eq!(
+            rows.len(),
+            7,
+            "two queued, loading, pad, input, pad, footer"
+        );
+        assert!(rows[0].contains("queued ›") && rows[0].contains("compare with rdb too"));
+        assert!(
+            !frame.contains("second line stays hidden"),
+            "one row per follow-up"
+        );
+        assert!(rows[1].contains("then check npm"));
+        assert!(rows[2].contains("Working…"));
+        assert_eq!(
+            composer.clear(),
+            format!("{RESET}\x1b[4A\r{CLEAR_BELOW}"),
+            "the erase climbs past the queued rows too"
+        );
+
+        for extra in 0..3 {
+            composer.hold(format!("more {extra}"));
+        }
+        let frame = composer.render_turn(80, false, "  ⠋ Working…", "  footer");
+        assert!(frame.contains("… 2 more queued"), "{frame}");
+        assert_eq!(composer.take_held().len(), 5, "shown or not, all still run");
+    }
+
+    #[test]
     fn thinking_box_renders_bordered_and_fitted_lines() {
         set_render_style(RenderStyle::Classic);
         let box_out = thinking_box(80, false, "first thought\nsecond thought that is longer");

@@ -1156,7 +1156,7 @@ fn absorb_live_keys(
             if call.cancellable {
                 arsy_code::process::cancel(call.operation_id);
                 if *drawn_rows > 0 {
-                    write!(terminal, "\x1b[{}A\r\x1b[J", drawn_rows)?;
+                    write!(terminal, "{}", erase_card(composer, *drawn_rows))?;
                     *drawn_rows = 0;
                 }
                 write!(terminal, "\r\x1b[K  ✦ Cancelling {}…\n", call.name)?;
@@ -1175,11 +1175,33 @@ fn absorb_live_keys(
         match composer.press(key) {
             action if live_control(&action, approval) => {}
             tui::Action::Expand => *expanded = !*expanded,
-            tui::Action::Submit(line) if !line.trim().is_empty() => composer.hold(line),
+            tui::Action::Submit(line) if !line.trim().is_empty() => {
+                // Bounded as `drain_keys` bounds it; past it the draft stays.
+                if composer.held_len() < 16 {
+                    composer.hold(line);
+                } else {
+                    composer.restore(line);
+                }
+            }
             _ => {}
         }
     }
     Ok(cancelled)
+}
+
+/// Erase a running tool's card and the composer drawn under it, leaving the
+/// cursor where the card began.
+///
+/// The cursor rests in the composer, below everything it draws above its input
+/// — the live status and any queued follow-ups — so the composer is erased by
+/// its own count first and only then is the card climbed over. Climbing the
+/// card's height from the input row stopped short by those rows and left them,
+/// and the card's first rows, in the scrollback.
+#[cfg(feature = "tui")]
+fn erase_card(composer: &mut tui::Composer, card_rows: usize) -> String {
+    let mut erase = composer.clear();
+    erase.push_str(&format!("\x1b[{card_rows}A\r\x1b[J"));
+    erase
 }
 
 /// Take whatever a running command has printed since the last pass.
@@ -2351,17 +2373,14 @@ pub(crate) fn drain_keys(
     outcome: &mut Turn,
 ) -> Typed {
     let mut typed = Typed::Quiet;
-    // Lines sent while a tool call ran join the queue in the order sent.
-    for line in composer.take_held() {
-        if outcome.queued.len() < 16 {
-            outcome.queued.push_back(line);
-        }
-    }
     while let Ok(byte) = keys.try_recv() {
         let Some(key) = decoder.feed(byte) else {
             continue;
         };
         if key == tui::Key::Interrupt {
+            // A follow-up was queued to run after this turn, not instead of
+            // stopping it, so the stop takes the queue with it.
+            composer.take_held();
             outcome.queued.clear();
             outcome.interrupted = true;
             return Typed::Interrupted;
@@ -2370,14 +2389,19 @@ pub(crate) fn drain_keys(
             // Shift+Tab changes authority immediately; it never becomes a
             // model prompt or a queued follow-up. Nor do Ctrl+T or `/effort`.
             action if live_control(&action, approval) => typed = Typed::Redraw,
-            // Bounded as on the Codex route, so a held Enter cannot grow the
-            // queue without limit; past the bound the draft is handed back.
+            // Held by the composer, not this round's outcome: the composer
+            // outlives every round of the turn, so a line sent while one round
+            // streams is still there when the turn ends, and it is drawn above
+            // the input while it waits. Bounded as on the Codex route, so a
+            // held Enter cannot grow the queue without limit; past the bound
+            // the draft is handed back.
             tui::Action::Submit(line) if !line.trim().is_empty() => {
-                if outcome.queued.len() < 16 {
-                    outcome.queued.push_back(line);
+                if composer.held_len() < 16 {
+                    composer.hold(line);
                 } else {
                     composer.restore(line);
                 }
+                typed = Typed::Redraw;
             }
             tui::Action::Expand | tui::Action::Submit(_) | tui::Action::Redraw => {
                 typed = Typed::Redraw
@@ -3372,7 +3396,7 @@ fn dispatch_tool_live(
                 // The card is erased; the composer the next frame draws is
                 // positioned above where the card used to be.
                 if last_rendered_lines > 0 {
-                    write!(terminal, "\x1b[{}A\r\x1b[J", last_rendered_lines)?;
+                    write!(terminal, "{}", erase_card(composer, last_rendered_lines))?;
                     terminal.flush()?;
                 }
                 composer.invalidate();
@@ -4555,6 +4579,25 @@ mod tests {
         assert_ne!(approval.get(), before);
         assert_eq!(approval.effort(), Some(Effort::Low));
         assert_eq!(composer.take_held(), vec!["next step".to_owned()]);
+    }
+
+    /// Erasing a finished tool's card climbs past everything the composer drew
+    /// above its input — the status and the queued follow-ups — before the
+    /// card, so none of it is left behind in the scrollback.
+    #[test]
+    fn a_finished_card_is_erased_with_every_row_the_composer_drew_over_it() {
+        tui::set_render_style(tui::RenderStyle::Classic);
+        let mut composer = tui::Composer::default();
+        composer.hold("lu analisa aja ya".to_owned());
+        composer.hold("jgn edit".to_owned());
+        let _ = composer.render_turn(80, false, "  ⠋ Working…", "  footer");
+
+        let erase = erase_card(&mut composer, 2);
+        // Two queued rows, the status, and the pad: four up to the top of the
+        // composer, then the card's two.
+        assert!(erase.contains("\x1b[4A"), "{erase:?}");
+        assert!(erase.ends_with("\x1b[2A\r\x1b[J"), "{erase:?}");
+        assert_eq!(composer.held_len(), 2, "erasing the view keeps the queue");
     }
 
     /// The Codex CLI answers its own tool calls, so a mode that promises to

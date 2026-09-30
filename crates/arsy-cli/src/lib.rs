@@ -4917,6 +4917,77 @@ mod tests {
         assert_eq!(seen, 3, "the repeat did not end the turn");
     }
 
+    /// A follow-up typed while the first round streams survives the rounds
+    /// after it. Each round used to keep its own queue, so a line typed before
+    /// a tool call was dropped when the next round began.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_follow_up_typed_in_an_early_round_outlives_the_later_ones() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("notes.txt"), "hello\n").unwrap();
+        let (mut resolved, _scripted) = resolved(vec![
+            vec![
+                ModelEvent::ToolCallCompleted {
+                    index: 0,
+                    id: "call-1".to_owned(),
+                    name: "fs.read".to_owned(),
+                    arguments: json!({"path": "notes.txt"}),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::ToolUse,
+                },
+            ],
+            vec![
+                ModelEvent::TextDelta {
+                    text: "done\n".to_owned(),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
+        // On the keyboard before the turn starts, so the first round's drain
+        // reads it whatever the machine's load.
+        let (sender, keys) = std::sync::mpsc::channel();
+        for byte in b"compare with rdb too\r" {
+            sender.send(*byte).unwrap();
+        }
+        let mut composer = tui::Composer::default();
+        let mut conversation = vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: "read it".to_owned(),
+            }],
+        }];
+        let turn = native_turn(
+            &mut resolved,
+            &arsy_kernel::config::Config::default(),
+            &test_runtime(workspace.path()),
+            &mut conversation,
+            &arsy_code::agent::budget::History::default(),
+            &route(),
+            None,
+            arsy_kernel::domain::TurnId::new(),
+            false,
+            &crate::turn::Footer::fixed("  footer"),
+            &keys,
+            &mut tui::Keys::default(),
+            &mut composer,
+            &mut tui::Transcript::default(),
+            &approval,
+            None,
+        )
+        .unwrap();
+        drop(sender);
+
+        assert!(turn.failure.is_none(), "{:?}", turn.failure);
+        let mut queued: Vec<String> = turn.queued.into_iter().collect();
+        queued.extend(composer.take_held());
+        assert_eq!(queued, vec!["compare with rdb too".to_owned()]);
+    }
+
     /// A model that calls the same failing tool forever is stopped after
     /// three identical failures — with a message that names the loop, not
     /// the provider — instead of burning the whole round budget on it.
