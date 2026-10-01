@@ -1172,6 +1172,7 @@ impl Supervisor<'_> {
             config: self.config.clone(),
             provider: Arc::clone(&self.resolved.provider),
             endpoint: self.resolved.endpoint.id.clone(),
+            endpoint_config: self.resolved.endpoint.clone(),
             max_output_tokens: self.resolved.endpoint.max_output_tokens,
             model: self.model.clone(),
             mode: self.mode,
@@ -1389,6 +1390,7 @@ struct Worker {
     config: Config,
     provider: Arc<dyn arsy_kernel::provider::ModelProvider>,
     endpoint: String,
+    endpoint_config: arsy_kernel::config::Endpoint,
     max_output_tokens: u32,
     model: String,
     mode: ExecutionMode,
@@ -1602,6 +1604,7 @@ impl Worker {
         let graph = std::cell::RefCell::new(&mut self.graph);
         crate::child_turn(
             self.provider.as_ref(),
+            &self.endpoint_config,
             &runtime,
             &request,
             &mut |projection| watch(observer, interventions, projection),

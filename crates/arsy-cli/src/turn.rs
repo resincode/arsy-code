@@ -2,7 +2,7 @@
 //! with its tool calls and approvals, the external Codex CLI projection, and
 //! the recording of what the turn left behind.
 
-use crate::run::{charge_turn, context_budget, is_stale_oauth_token, merge, prepare_task};
+use crate::run::{charge_turn, is_stale_oauth_token, merge, prepare_task, task_budget};
 #[cfg(feature = "tui")]
 use crate::*;
 #[cfg(feature = "tui")]
@@ -26,6 +26,7 @@ fn record_turn(
     invocation: &Invocation,
     session: SessionId,
     task: String,
+    budget: arsy_kernel::orchestration::Budget,
     emitter: &mut Emitter,
 ) -> Result<RecordedTurn, Diagnostic> {
     let store: Arc<dyn EventStore> = open_store(&workspace_root(&invocation.workspace)?)?;
@@ -44,7 +45,7 @@ fn record_turn(
             assignee: Some(agent),
             required_output: "an answer to the task".to_owned(),
             workspace: WorkspaceRequirement::IsolatedWriter,
-            budget: TASK_BUDGET,
+            budget,
             authority: Vec::new(),
             state: TaskState::Pending,
             lease_expires_at_ms: None,
@@ -334,7 +335,27 @@ pub(crate) fn run_turn(
         session,
         task: node,
         store,
-    } = record_turn(invocation, session_id, task.clone(), emitter)?;
+    } = record_turn(
+        invocation,
+        session_id,
+        task.clone(),
+        native
+            .as_ref()
+            .map_or(Ok(crate::run::EXTERNAL_TASK_BUDGET), |resolved| {
+                task_budget(
+                    &resolved.endpoint,
+                    &tui::variant_for(&resolved.endpoint.models, &route.model, effort),
+                )
+                .map_err(|reason| {
+                    Diagnostic::error(
+                        ARSY_PRV_1000,
+                        reason,
+                        "configure the selected model's context window",
+                    )
+                })
+            })?,
+        emitter,
+    )?;
     // Where the conversation stood before this turn. A turn that fails or is
     // stopped rewinds to here, which is more than one message once the turn
     // has run tools.
@@ -634,7 +655,18 @@ pub(crate) fn native_turn(
         //
         // A compaction draws a live row while it runs, so the turn never
         // goes quiet between the prompt and the model's first word.
-        let budget = context_budget(resolved);
+        let sizing = round_request(
+            resolved,
+            config,
+            &runtime,
+            conversation,
+            route,
+            approval.effort(),
+            turn,
+            round,
+        )?;
+        let budget =
+            crate::run::request_budget(&resolved.endpoint, &sizing).map_err(io::Error::other)?;
         let mut progress = CompactionProgress::new(
             arsy_code::agent::budget::conversation_tokens(conversation),
             Some(budget),
@@ -652,6 +684,12 @@ pub(crate) fn native_turn(
                 );
             },
         );
+        if trimmed.after > budget {
+            return Err(io::Error::other(format!(
+                "model `{}` input still exceeds its context budget after compaction",
+                sizing.model.model
+            )));
+        }
         // Every round re-trims the same history, so only a trim that took
         // something new is worth a row; the live row goes either way.
         let new_trim = (trimmed.elided, trimmed.summarized) != reported_trim;

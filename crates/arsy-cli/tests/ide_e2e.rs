@@ -69,6 +69,7 @@ fn the_thin_client_drives_a_turn_through_the_protocol_and_nothing_else() {
          kind = \"openai\"\n\
          base_url = \"http://127.0.0.1:{port}\"\n\
          model = \"test-model\"\n\
+         context_windows = {{ test-model = 128000 }}\n\
          api_key_env = \"ARSY_TEST_KEY\"\n"
     );
     // Written as TOML here and converted: the schema reads more clearly that

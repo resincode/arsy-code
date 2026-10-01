@@ -72,6 +72,7 @@ Authority classes are:
 | `provider.endpoint.<id>.api_key_env` | environment variable name | none | replace | user |
 | `provider.endpoint.<id>.model` | string | none | replace | user |
 | `provider.endpoint.<id>.max_output_tokens` | positive integer | `8192` | replace | user |
+| `provider.endpoint.<id>.context_windows.<model>` | positive integer, total input and output tokens | unknown | replace | user |
 | `provider.endpoint.<id>.pricing.<model>.input_micros_per_million` | non-negative integer | none | replace | user |
 | `provider.endpoint.<id>.pricing.<model>.output_micros_per_million` | non-negative integer | none | replace | user |
 | `provider.endpoint.<id>.oauth.authorize_url` | HTTPS URL | none | replace | user |
@@ -121,6 +122,12 @@ Authority classes are:
 For boolean `intersection`, every authoritative layer must permit `true`; an absent layer does not veto. Restriction order for `policy.default_effect` is `allow < ask < deny`; durability order is `fast < balanced < strict`. Empty allowlists deny the corresponding capability unless enterprise policy explicitly defines an unconstrained set.
 
 ## Provider endpoints
+
+Native compaction reads `context_windows` for the exact selected model and reserves
+`max_output_tokens` from that window. Model discovery saves a provider's numeric
+`context_window` metadata when supplied. If the provider omits it, set the
+window explicitly, for example `"context_windows": {"qwen3-coder": 128000}`.
+ARSY rejects an unknown or too-small window instead of assuming a model limit.
 
 An endpoint names a wire dialect and an API root, so one adapter serves the vendor's own API, a
 gateway such as LiteLLM or OpenRouter, and a local runtime such as Ollama or LM Studio:

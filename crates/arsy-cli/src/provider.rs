@@ -123,6 +123,7 @@ pub fn resolve_with_route(
                 model: preset.models.first().map(|s| (*s).to_owned()),
                 models: preset.models.iter().map(|s| (*s).to_owned()).collect(),
                 max_output_tokens: arsy_kernel::config::DEFAULT_MAX_OUTPUT_TOKENS,
+                context_windows: std::collections::BTreeMap::new(),
                 oauth: Some(preset.oauth()),
             };
             return Ok((endpoint, None));
@@ -169,6 +170,10 @@ fn route(config: &Config) -> routing::Decision {
                 .clone()
                 .or_else(|| config.model_default().map(str::to_owned))
                 .or_else(|| config.compat_model(endpoint).map(str::to_owned))?;
+            let context_window = endpoint
+                .context_windows
+                .get(&model)
+                .map(|tokens| u64::from(*tokens));
             Some(routing::Candidate {
                 key: arsy_kernel::provider::ModelKey {
                     provider: endpoint.id.clone(),
@@ -179,7 +184,7 @@ fn route(config: &Config) -> routing::Decision {
                 ))),
                 residency: None,
                 cost_micros_per_1k: None,
-                context_window: None,
+                context_window,
                 modalities: std::collections::BTreeSet::new(),
                 provider_features: std::collections::BTreeSet::new(),
             })
@@ -712,10 +717,17 @@ fn human_models(report: &serde_json::Value) -> String {
 /// Returns the model IDs and the endpoint's config-file name (for the write
 /// step), or an error string the caller can surface as a dialog notice.
 #[cfg(feature = "tui")]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DiscoveredModels {
+    pub models: Vec<String>,
+    pub context_windows: std::collections::BTreeMap<String, u32>,
+}
+
+#[cfg(feature = "tui")]
 pub(crate) fn fetch_endpoint_models(
     invocation: &crate::Invocation,
     endpoint_id: &str,
-) -> Result<(String, Vec<String>), String> {
+) -> Result<(String, DiscoveredModels), String> {
     let config = configuration(invocation).map_err(|d| d.message)?;
     let endpoint = config
         .all_endpoints()
@@ -740,7 +752,7 @@ pub(crate) fn fetch_endpoint_models(
 #[cfg(feature = "tui")]
 pub(crate) fn fetch_oauth_preset_models(
     preset: &arsy_kernel::oauth::presets::Preset,
-) -> Option<Vec<String>> {
+) -> Option<DiscoveredModels> {
     fetch_preset_models(preset, true)
 }
 
@@ -752,7 +764,7 @@ pub(crate) fn fetch_oauth_preset_models(
 #[cfg(feature = "tui")]
 pub(crate) fn fetch_oauth_preset_models_quietly(
     preset: &arsy_kernel::oauth::presets::Preset,
-) -> Option<Vec<String>> {
+) -> Option<DiscoveredModels> {
     fetch_preset_models(preset, false)
 }
 
@@ -760,7 +772,7 @@ pub(crate) fn fetch_oauth_preset_models_quietly(
 fn fetch_preset_models(
     preset: &arsy_kernel::oauth::presets::Preset,
     may_refresh: bool,
-) -> Option<Vec<String>> {
+) -> Option<DiscoveredModels> {
     let handle_name = format!("{}.key", preset.id);
     let raw = FileCredentialStore.resolve(&handle_name).ok()?;
     let tokens = serde_json::from_str::<TokenSet>(&raw).ok()?;
@@ -794,7 +806,7 @@ fn fetch_models_http(
     kind: &str,
     base_url: &str,
     api_key: Option<&str>,
-) -> Option<Vec<String>> {
+) -> Option<DiscoveredModels> {
     let bearer = |headers: &mut Vec<(String, String)>| {
         if let Some(token) = api_key {
             headers.push(("Authorization".to_owned(), format!("Bearer {token}")));
@@ -814,7 +826,7 @@ fn fetch_models_http(
                 headers.push(("x-api-key".to_owned(), token.to_owned()));
             }
             let body = fetch_json(transport.get("https://api.anthropic.com/v1/models", headers))?;
-            extract_ids(&body["data"])
+            extract_models(&body["data"], "id")
         }
         "openai_responses" => {
             let url = format!(
@@ -833,7 +845,7 @@ fn fetch_models_http(
             bearer(&mut headers);
             let body = fetch_json(transport.get(url, headers))?;
             let arr = body.get("models").or_else(|| body.get("data"))?;
-            let ids: Vec<String> = arr
+            let visible: Vec<serde_json::Value> = arr
                 .as_array()?
                 .iter()
                 .filter(|model| {
@@ -842,15 +854,9 @@ fn fetch_models_http(
                         Some("hide" | "hidden")
                     )
                 })
-                .filter_map(|model| {
-                    model
-                        .get("slug")
-                        .or_else(|| model.get("id"))
-                        .and_then(|value| value.as_str())
-                        .map(str::to_owned)
-                })
+                .cloned()
                 .collect();
-            (!ids.is_empty()).then_some(ids)
+            extract_models(&serde_json::Value::Array(visible), "slug")
         }
         "google_code_assist" => {
             let url = format!(
@@ -876,7 +882,10 @@ fn fetch_models_http(
                 .map(|(id, _)| id.clone())
                 .collect();
             ids.sort();
-            (!ids.is_empty()).then_some(ids)
+            (!ids.is_empty()).then_some(DiscoveredModels {
+                models: ids,
+                context_windows: std::collections::BTreeMap::new(),
+            })
         }
         _ => {
             let mut headers = Vec::new();
@@ -885,7 +894,7 @@ fn fetch_models_http(
                 format!("{}/models", base_url.trim_end_matches('/')),
                 headers,
             ))?;
-            extract_ids(&body["data"])
+            extract_models(&body["data"], "id")
         }
     }
 }
@@ -904,16 +913,31 @@ fn fetch_json(
 }
 
 #[cfg(feature = "tui")]
-fn extract_ids(data: &serde_json::Value) -> Option<Vec<String>> {
+fn extract_models(data: &serde_json::Value, id_key: &str) -> Option<DiscoveredModels> {
+    let mut context_windows = std::collections::BTreeMap::new();
     let ids: Vec<String> = data
         .as_array()?
         .iter()
-        .filter_map(|m| m["id"].as_str().map(str::to_owned))
+        .filter_map(|model| {
+            let id = model.get(id_key).or_else(|| model.get("id"))?.as_str()?;
+            if let Some(window) = model
+                .get("context_window")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|window| u32::try_from(window).ok())
+                .filter(|window| *window > 0)
+            {
+                context_windows.insert(id.to_owned(), window);
+            }
+            Some(id.to_owned())
+        })
         .collect();
     if ids.is_empty() {
         None
     } else {
-        Some(ids)
+        Some(DiscoveredModels {
+            models: ids,
+            context_windows,
+        })
     }
 }
 
@@ -921,6 +945,21 @@ fn extract_ids(data: &serde_json::Value) -> Option<Vec<String>> {
 mod tests {
     use super::*;
     use arsy_kernel::config::Layer;
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn discovery_keeps_provider_context_windows_by_model() {
+        let data = serde_json::json!([
+            {"slug":"small", "context_window":128000},
+            {"slug":"large", "context_window":1000000},
+            {"slug":"unknown"}
+        ]);
+        let found = extract_models(&data, "slug").unwrap();
+        assert_eq!(found.models, ["small", "large", "unknown"]);
+        assert_eq!(found.context_windows.get("small"), Some(&128_000));
+        assert_eq!(found.context_windows.get("large"), Some(&1_000_000));
+        assert!(!found.context_windows.contains_key("unknown"));
+    }
 
     /// A configuration file holding `body`.
     ///

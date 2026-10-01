@@ -498,6 +498,8 @@ pub struct Endpoint {
     /// Anthropic dialect requires a value, so it is configurable rather than
     /// fixed.
     pub max_output_tokens: u32,
+    /// Total context window by exact model ID. A missing entry is unknown.
+    pub context_windows: BTreeMap<String, u32>,
     pub oauth: Option<OAuth>,
     /// What this endpoint charges, per model.
     ///
@@ -2851,6 +2853,7 @@ impl Config {
                     | "model"
                     | "models"
                     | "max_output_tokens"
+                    | "context_windows"
                     | "oauth"
                     | "pricing"
             ) {
@@ -2887,6 +2890,7 @@ impl Config {
             model: None,
             models: Vec::new(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            context_windows: BTreeMap::new(),
             oauth: None,
             pricing: BTreeMap::new(),
         });
@@ -2975,6 +2979,19 @@ impl Config {
                 .ok_or_else(|| reject(format!("`{key}` must be a positive integer")))?;
             self.record(layer, path, &key, tokens.to_string());
             endpoint.max_output_tokens = tokens;
+        }
+        if let Some(value) = table.get("context_windows") {
+            let prefix = format!("{prefix}.context_windows");
+            for (model, value) in as_table(value, &prefix, path)? {
+                let key = format!("{prefix}.{model}");
+                let tokens = value
+                    .as_integer()
+                    .and_then(|tokens| u32::try_from(tokens).ok())
+                    .filter(|tokens| *tokens > 0)
+                    .ok_or_else(|| reject(format!("`{key}` must be a positive integer")))?;
+                self.record(layer, path, &key, tokens.to_string());
+                endpoint.context_windows.insert(model.clone(), tokens);
+            }
         }
         if let Some(oauth) = table.get("oauth") {
             endpoint.oauth = Some(self.apply_oauth(layer, path, &prefix, oauth)?);
@@ -4230,6 +4247,40 @@ output_micros_per_million = 75000000
                 Config::load(&[(Layer::User, path)]).is_err(),
                 "accepted `{bad}`"
             );
+        }
+    }
+
+    #[test]
+    fn context_windows_are_read_per_model_and_reject_invalid_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write(
+            directory.path(),
+            "windows.json",
+            r#"
+schema_version = 1
+[provider.endpoint.p]
+kind = "openai"
+model = "small"
+[provider.endpoint.p.context_windows]
+small = 128000
+large = 1000000
+"#,
+        );
+        let endpoint = load(&[(Layer::User, path)]).endpoint(None).unwrap().clone();
+        assert_eq!(endpoint.context_windows.get("small"), Some(&128_000));
+        assert_eq!(endpoint.context_windows.get("large"), Some(&1_000_000));
+        assert!(!endpoint.context_windows.contains_key("unknown"));
+
+        for bad in ["0", "-1", "\"128000\""] {
+            let path = write(
+                directory.path(),
+                "bad-window.json",
+                &format!(
+                    "schema_version = 1\n[provider.endpoint.p]\nkind = \"openai\"\n\
+                     [provider.endpoint.p.context_windows]\nsmall = {bad}\n"
+                ),
+            );
+            assert!(Config::load(&[(Layer::User, path)]).is_err());
         }
     }
 

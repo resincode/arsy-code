@@ -418,6 +418,7 @@ fn configure(home: &Path, port: u16) {
              kind = \"openai\"\n\
              base_url = \"http://127.0.0.1:{port}\"\n\
              model = \"test-model\"\n\
+             context_windows = {{ test-model = 128000 }}\n\
              api_key_env = \"ARSY_TEST_KEY\"\n\
              [policy]\n\
              default_effect = \"allow\"\n"
@@ -827,6 +828,7 @@ fn configure_delegating(home: &Path, port: u16) {
              kind = \"openai\"\n\
              base_url = \"http://127.0.0.1:{port}\"\n\
              model = \"test-model\"\n\
+             context_windows = {{ test-model = 128000 }}\n\
              api_key_env = \"ARSY_TEST_KEY\"\n\
              # Delegation is off unless a rule says otherwise, so the depth is\n\
              # what makes a subagent possible at all.\n\
@@ -1114,6 +1116,7 @@ fn configure_delegating_writers(home: &Path, port: u16) {
              kind = \"openai\"\n\
              base_url = \"http://127.0.0.1:{port}\"\n\
              model = \"test-model\"\n\
+             context_windows = {{ test-model = 128000 }}\n\
              api_key_env = \"ARSY_TEST_KEY\"\n\
              [[policy.rules]]\n\
              id = \"delegate-reads\"\n\

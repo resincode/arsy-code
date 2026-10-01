@@ -70,10 +70,7 @@ use picker::wizard::configured_default;
 #[cfg(feature = "tui")]
 use picker::wizard::write_config;
 use run as run_mod;
-use run::{
-    doctor, graph_failed, merge, prepare_task, resume, TaskRun, CONTEXT_BUDGET_TOKENS, TASK_BUDGET,
-    TASK_LEASE_MS,
-};
+use run::{doctor, graph_failed, merge, prepare_task, resume, TaskRun, TASK_LEASE_MS};
 use run_mod::run as run_command;
 #[cfg(feature = "tui")]
 use turn::modern_gap;
@@ -3322,6 +3319,7 @@ fn summary_number(record: &Value, key: &str) -> u64 {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn child_turn(
     provider: &dyn ModelProvider,
+    endpoint: &arsy_kernel::config::Endpoint,
     runtime: &arsy_code::agent::ToolRuntime,
     request: &CanonicalModelRequest,
     watch: &mut dyn FnMut(
@@ -3335,7 +3333,7 @@ pub(crate) fn child_turn(
 ) -> Result<String, String> {
     let mut request = request.clone();
     let base = request.idempotency_key.as_str().to_owned();
-    let budget = CONTEXT_BUDGET_TOKENS.saturating_sub(request.max_output_tokens);
+    let budget = crate::run::request_budget(endpoint, &request)?;
     let mut consecutive_failures = 0u64;
     // Tool calls this child has made, so an intervention can be correlated
     // with the call that caused it.
@@ -3347,6 +3345,13 @@ pub(crate) fn child_turn(
             return Err(CHILD_CANCELLED.to_owned());
         }
         absorb_steering(&mut request.messages, steer(), trace);
+        let trimmed = arsy_code::agent::budget::fit(&mut request.messages, budget, None);
+        if trimmed.after > budget {
+            return Err(format!(
+                "model `{}` input still exceeds its context budget after compaction",
+                request.model.model
+            ));
+        }
         request.idempotency_key =
             IdempotencyKey::new(format!("{base}-{round}")).map_err(|error| error.to_string())?;
         answer.clear();
@@ -3361,8 +3366,6 @@ pub(crate) fn child_turn(
                 answer
             });
         }
-        arsy_code::agent::budget::fit(&mut request.messages, budget, None);
-
         let mut content: Vec<ModelContent> = Vec::new();
         if !answer.trim().is_empty() {
             content.push(ModelContent::Text {
@@ -4305,12 +4308,51 @@ mod tests {
                 model: Some("m".to_owned()),
                 models: vec!["m".to_owned()],
                 max_output_tokens: 64,
+                context_windows: [("m".to_owned(), 128_000)].into(),
                 oauth: None,
             },
             source: provider::CredentialSource::DefaultEnv,
             route: None,
         };
         (resolved, scripted)
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn context_budget_follows_the_selected_model() {
+        let (mut resolved, _) = resolved(Vec::new());
+        resolved
+            .endpoint
+            .context_windows
+            .insert("small".to_owned(), 128_000);
+        resolved
+            .endpoint
+            .context_windows
+            .insert("large".to_owned(), 1_000_000);
+        assert_eq!(
+            crate::run::context_budget(&resolved.endpoint, "small"),
+            Ok(127_936)
+        );
+        assert_eq!(
+            crate::run::context_budget(&resolved.endpoint, "large"),
+            Ok(999_936)
+        );
+        assert!(crate::run::context_budget(&resolved.endpoint, "unknown").is_err());
+        let request = CanonicalModelRequest {
+            model: ModelKey {
+                provider: "stub".to_owned(),
+                model: "small".to_owned(),
+            },
+            system: Some("a".repeat(400)),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            max_output_tokens: 64,
+            effort: None,
+            idempotency_key: IdempotencyKey::new("budget-test").unwrap(),
+        };
+        assert!(crate::run::request_budget(&resolved.endpoint, &request).unwrap() < 127_936);
+        resolved.endpoint.max_output_tokens = 1_000_000;
+        assert!(crate::run::context_budget(&resolved.endpoint, "small").is_err());
     }
 
     /// Like [`resolved`], but the provider fails its first `stream` call
