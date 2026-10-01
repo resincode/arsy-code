@@ -38,8 +38,9 @@ const MAX_RESULT_BYTES: usize = 4 * 1024;
 
 /// Leave room for the `turn_id` wrapper and JSON escaping under the event
 /// store's 64 KiB inline payload limit. A turn past this keeps its earliest
-/// messages — the prompt and what the model decided to do — and drops the tail
-/// of its tool traffic, which is the part still recoverable from artifacts.
+/// messages that fit and drops the tail of its tool traffic, which is the part
+/// still recoverable from artifacts. An oversized first message is already
+/// present in `turn.started` if it is the prompt.
 const MAX_TURN_BYTES: usize = 48 * 1024;
 
 /// The turn's exchange, compacted, as the value recorded on `turn.completed`.
@@ -52,7 +53,7 @@ pub fn persistable(messages: &[ModelMessage]) -> Value {
             content: message.content.iter().map(compact).collect(),
         };
         let cost = serde_json::to_vec(&compacted).map_or(usize::MAX, |bytes| bytes.len());
-        if cost > budget && !kept.is_empty() {
+        if cost > budget {
             break;
         }
         budget = budget.saturating_sub(cost);
@@ -220,6 +221,17 @@ mod tests {
                 <= arsy_kernel::event::MAX_INLINE_EVENT_BYTES
         );
         assert!(restore(&payload["transcript"]).len() < exchange.len());
+    }
+
+    #[test]
+    fn an_oversized_first_message_does_not_overflow_the_event() {
+        let exchange = vec![text(ModelRole::User, &"x".repeat(MAX_TURN_BYTES + 1))];
+        let payload = serde_json::json!({"turn_id": "00000000-0000-0000-0000-000000000000", "transcript": persistable(&exchange)});
+        assert!(restore(&payload["transcript"]).is_empty());
+        assert!(
+            serde_json::to_vec(&payload).unwrap().len()
+                <= arsy_kernel::event::MAX_INLINE_EVENT_BYTES
+        );
     }
 
     /// A stream from a build that recorded no transcript, and a corrupted one,
