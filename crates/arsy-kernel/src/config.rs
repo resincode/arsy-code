@@ -498,6 +498,11 @@ pub struct Endpoint {
     /// Anthropic dialect requires a value, so it is configurable rather than
     /// fixed.
     pub max_output_tokens: u32,
+    /// Total context window by exact model ID. A missing entry is unknown.
+    pub context_windows: BTreeMap<String, u32>,
+    /// Input-only limits discovered from provider metadata during this run.
+    #[serde(skip)]
+    pub input_limits: BTreeMap<String, u32>,
     pub oauth: Option<OAuth>,
     /// What this endpoint charges, per model.
     ///
@@ -2948,6 +2953,7 @@ impl Config {
                     | "model"
                     | "models"
                     | "max_output_tokens"
+                    | "context_windows"
                     | "oauth"
                     | "pricing"
             ) {
@@ -2984,6 +2990,8 @@ impl Config {
             model: None,
             models: Vec::new(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            context_windows: BTreeMap::new(),
+            input_limits: BTreeMap::new(),
             oauth: None,
             pricing: BTreeMap::new(),
         });
@@ -3029,25 +3037,7 @@ impl Config {
                 &endpoint.base_url,
             );
         }
-        if let Some(raw) = string(table, "credential", &format!("{prefix}.credential"), path)? {
-            // The rejected value is never quoted back. This key is where an
-            // operator is most likely to paste a real API key by mistake, and
-            // a diagnostic travels to stdout, logs, and CI output long before
-            // any redaction pipeline is holding that value.
-            let handle = SecretHandle::try_from(raw.clone()).map_err(|_| {
-                reject(format!(
-                    "`{prefix}.credential` must be a handle such as \"secret://os/{id}\", not a \
-                     credential; store the value with `arsy auth set {id}` instead"
-                ))
-            })?;
-            self.record(
-                layer,
-                path,
-                &format!("{prefix}.credential"),
-                handle.to_string(),
-            );
-            endpoint.credential = Some(handle);
-        }
+        self.apply_endpoint_credential(layer, path, id, &prefix, table, &mut endpoint)?;
         if let Some(name) = string(table, "api_key_env", &format!("{prefix}.api_key_env"), path)? {
             self.record(layer, path, &format!("{prefix}.api_key_env"), name);
             endpoint.api_key_env = Some(name.clone());
@@ -3063,6 +3053,60 @@ impl Config {
             endpoint.models = models;
         }
         endpoint.offer_default_first();
+        self.apply_endpoint_limits(layer, path, &prefix, table, &mut endpoint)?;
+        if let Some(oauth) = table.get("oauth") {
+            endpoint.oauth = Some(self.apply_oauth(layer, path, &prefix, oauth)?);
+        }
+        self.apply_endpoint_pricing(layer, path, &prefix, table, &mut endpoint)?;
+
+        self.endpoints.insert(id.to_owned(), endpoint);
+        Ok(())
+    }
+
+    fn apply_endpoint_credential(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        id: &str,
+        prefix: &str,
+        table: &toml::Table,
+        endpoint: &mut Endpoint,
+    ) -> Result<(), ConfigError> {
+        if let Some(raw) = string(table, "credential", &format!("{prefix}.credential"), path)? {
+            // The rejected value is never quoted back. This key is where an
+            // operator is most likely to paste a real API key by mistake, and
+            // a diagnostic travels to stdout, logs, and CI output long before
+            // any redaction pipeline is holding that value.
+            let handle = SecretHandle::try_from(raw.clone()).map_err(|_| ConfigError {
+                path: path.to_path_buf(),
+                message: format!(
+                    "`{prefix}.credential` must be a handle such as \"secret://os/{id}\", not a \
+                     credential; store the value with `arsy auth set {id}` instead"
+                ),
+            })?;
+            self.record(
+                layer,
+                path,
+                &format!("{prefix}.credential"),
+                handle.to_string(),
+            );
+            endpoint.credential = Some(handle);
+        }
+        Ok(())
+    }
+
+    fn apply_endpoint_limits(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        prefix: &str,
+        table: &toml::Table,
+        endpoint: &mut Endpoint,
+    ) -> Result<(), ConfigError> {
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
         if let Some(value) = table.get("max_output_tokens") {
             let key = format!("{prefix}.max_output_tokens");
             let tokens = value
@@ -3073,9 +3117,34 @@ impl Config {
             self.record(layer, path, &key, tokens.to_string());
             endpoint.max_output_tokens = tokens;
         }
-        if let Some(oauth) = table.get("oauth") {
-            endpoint.oauth = Some(self.apply_oauth(layer, path, &prefix, oauth)?);
+        if let Some(value) = table.get("context_windows") {
+            let prefix = format!("{prefix}.context_windows");
+            for (model, value) in as_table(value, &prefix, path)? {
+                let key = format!("{prefix}.{model}");
+                let tokens = value
+                    .as_integer()
+                    .and_then(|tokens| u32::try_from(tokens).ok())
+                    .filter(|tokens| *tokens > 0)
+                    .ok_or_else(|| reject(format!("`{key}` must be a positive integer")))?;
+                self.record(layer, path, &key, tokens.to_string());
+                endpoint.context_windows.insert(model.clone(), tokens);
+            }
         }
+        Ok(())
+    }
+
+    fn apply_endpoint_pricing(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        prefix: &str,
+        table: &toml::Table,
+        endpoint: &mut Endpoint,
+    ) -> Result<(), ConfigError> {
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
         if let Some(pricing) = table.get("pricing") {
             let prefix = format!("{prefix}.pricing");
             for (model, value) in as_table(pricing, &prefix, path)? {
@@ -3114,8 +3183,6 @@ impl Config {
                 endpoint.pricing.insert(model.clone(), priced);
             }
         }
-
-        self.endpoints.insert(id.to_owned(), endpoint);
         Ok(())
     }
 
@@ -4363,6 +4430,40 @@ output_micros_per_million = 75000000
                 Config::load(&[(Layer::User, path)]).is_err(),
                 "accepted `{bad}`"
             );
+        }
+    }
+
+    #[test]
+    fn context_windows_are_read_per_model_and_reject_invalid_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write(
+            directory.path(),
+            "windows.json",
+            r#"
+schema_version = 1
+[provider.endpoint.p]
+kind = "openai"
+model = "small"
+[provider.endpoint.p.context_windows]
+small = 128000
+large = 1000000
+"#,
+        );
+        let endpoint = load(&[(Layer::User, path)]).endpoint(None).unwrap().clone();
+        assert_eq!(endpoint.context_windows.get("small"), Some(&128_000));
+        assert_eq!(endpoint.context_windows.get("large"), Some(&1_000_000));
+        assert!(!endpoint.context_windows.contains_key("unknown"));
+
+        for bad in ["0", "-1", "\"128000\""] {
+            let path = write(
+                directory.path(),
+                "bad-window.json",
+                &format!(
+                    "schema_version = 1\n[provider.endpoint.p]\nkind = \"openai\"\n\
+                     [provider.endpoint.p.context_windows]\nsmall = {bad}\n"
+                ),
+            );
+            assert!(Config::load(&[(Layer::User, path)]).is_err());
         }
     }
 

@@ -97,11 +97,22 @@ pub(crate) const TASK_LEASE_MS: u64 = 30 * 60 * 1000;
 /// Wall time matches the lease, because a task that outlives its lease is one
 /// another process may already have taken. Tokens are several turns' worth of
 /// transcript: the point is to stop a runaway, not to second-guess a long task.
-pub(crate) const TASK_BUDGET: Budget = Budget {
-    tokens: CONTEXT_BUDGET_TOKENS as u64 * 4,
+pub(crate) const EXTERNAL_TASK_BUDGET: Budget = Budget {
+    tokens: 384_000,
     cost_micros: u64::MAX,
     wall_ms: TASK_LEASE_MS,
 };
+
+pub(crate) fn task_budget(
+    endpoint: &arsy_kernel::config::Endpoint,
+    model: &str,
+) -> Result<Budget, String> {
+    Ok(Budget {
+        tokens: u64::from(context_budget(endpoint, model)?) * 4,
+        cost_micros: u64::MAX,
+        wall_ms: TASK_LEASE_MS,
+    })
+}
 
 /// One session's execution: the store, the provider it dispatches to, and the
 /// durable graph of tasks it is working through.
@@ -138,8 +149,15 @@ impl TaskRun {
         let root = workspace_root(&invocation.workspace)?;
         let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
         let config = load_session_config(&root, &working, invocation)?;
-        let resolved = provider::resolve(&config, invocation.provider.as_deref())?;
+        let mut resolved = provider::resolve(&config, invocation.provider.as_deref())?;
         let model = selected_model(&config, &resolved.endpoint, invocation.model.as_deref())?;
+        provider::ensure_context_window(&mut resolved, &model).map_err(|reason| {
+            Diagnostic::error(
+                ARSY_PRV_1000,
+                reason,
+                "use provider model metadata or a verified per-model limit",
+            )
+        })?;
 
         let store = open_store(&root)?;
         let session = session.unwrap_or_default();
@@ -174,7 +192,13 @@ impl TaskRun {
                 // One process, one working tree: a scripted run edits the
                 // workspace it was pointed at.
                 workspace: WorkspaceRequirement::IsolatedWriter,
-                budget: TASK_BUDGET,
+                budget: task_budget(&self.resolved.endpoint, &self.model).map_err(|reason| {
+                    Diagnostic::error(
+                        ARSY_PRV_1000,
+                        reason,
+                        "configure the selected model's context window",
+                    )
+                })?,
                 // Authority comes from policy at dispatch, not from the node:
                 // a grant recorded here would be a second, stale answer to the
                 // question `RuleSet::evaluate` already answers per call.
@@ -468,19 +492,52 @@ pub(crate) fn graph_failed(error: arsy_kernel::orchestration::GraphError) -> Dia
     )
 }
 
-/// The transcript budget, in tokens, before the model's own output is reserved.
-///
-/// Deliberately below the smallest window the supported models offer rather
-/// than read from configuration: the cost of being wrong low is a re-read, and
-/// the cost of being wrong high is a rejected request in the middle of a turn.
-/// A per-model window belongs in `provider.endpoint` when a model that needs a
-/// different number actually appears.
-pub(crate) const CONTEXT_BUDGET_TOKENS: u32 = 96_000;
+/// The selected model's context available for input after reserving output.
+pub(crate) fn context_budget(
+    endpoint: &arsy_kernel::config::Endpoint,
+    model: &str,
+) -> Result<u32, String> {
+    if let Some(input) = endpoint.input_limits.get(model) {
+        return Ok(*input);
+    }
+    let key = format!("provider.endpoint.{}.context_windows.{model}", endpoint.id);
+    let window = endpoint
+        .context_windows
+        .get(model)
+        .ok_or_else(|| format!("model `{model}` has no context window; set `{key}`"))?;
+    window
+        .checked_sub(endpoint.max_output_tokens)
+        .filter(|budget| *budget > 0)
+        .ok_or_else(|| {
+            format!(
+                "`{key}` must exceed max_output_tokens ({})",
+                endpoint.max_output_tokens
+            )
+        })
+}
 
-/// What one turn's transcript may grow to on this endpoint.
-#[cfg(feature = "tui")]
-pub(crate) fn context_budget(resolved: &provider::Resolved) -> u32 {
-    CONTEXT_BUDGET_TOKENS.saturating_sub(resolved.endpoint.max_output_tokens)
+/// Account for instructions and tool schemas, which are sent beside messages.
+pub(crate) fn request_budget(
+    endpoint: &arsy_kernel::config::Endpoint,
+    request: &CanonicalModelRequest,
+) -> Result<u32, String> {
+    let limit = context_budget(endpoint, &request.model.model)?;
+    let system = request
+        .system
+        .as_deref()
+        .map(arsy_code::agent::budget::estimate_tokens)
+        .unwrap_or(0);
+    let schemas = serde_json::to_string(&request.tools).map_err(|error| error.to_string())?;
+    let tools = arsy_code::agent::budget::estimate_tokens(&schemas);
+    limit
+        .checked_sub(system.saturating_add(tools))
+        .filter(|budget| *budget > 0)
+        .ok_or_else(|| {
+            format!(
+                "model `{}` has no room for messages after instructions and tools",
+                request.model.model
+            )
+        })
 }
 
 /// Dispatch a scripted turn, and once more if a stale OAuth access token is
@@ -528,6 +585,7 @@ pub(crate) fn dispatch_with_refresh(
     let mut supervising = Some((supervisor, &mut *graph));
     let outcome = dispatch(
         config,
+        &resolved.endpoint,
         resolved.provider.as_ref(),
         agent,
         request,
@@ -557,9 +615,17 @@ pub(crate) fn dispatch_with_refresh(
     if !stale {
         return (outcome, interventions);
     }
-    let Ok(refreshed) = provider::resolve(config, requested_provider) else {
+    let Ok(mut refreshed) = provider::resolve(config, requested_provider) else {
         return (outcome, interventions);
     };
+    refreshed
+        .endpoint
+        .context_windows
+        .extend(resolved.endpoint.context_windows.clone());
+    refreshed
+        .endpoint
+        .input_limits
+        .extend(resolved.endpoint.input_limits.clone());
     *resolved = refreshed;
     emitter.trace(
         "credential.refreshed",
@@ -576,6 +642,7 @@ pub(crate) fn dispatch_with_refresh(
     let mut supervising = Some((supervisor, graph));
     let outcome = dispatch(
         config,
+        &resolved.endpoint,
         resolved.provider.as_ref(),
         agent,
         request,
@@ -621,6 +688,7 @@ pub(crate) fn is_stale_oauth_token(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch(
     config: &Config,
+    endpoint: &arsy_kernel::config::Endpoint,
     provider: &dyn ModelProvider,
     runtime: &arsy_code::agent::ToolRuntime,
     request: &CanonicalModelRequest,
@@ -633,9 +701,28 @@ pub(crate) fn dispatch(
     let max_rounds = config.max_tool_rounds();
     let mut request = request.clone();
     let base = request.idempotency_key.as_str().to_owned();
-    let budget = CONTEXT_BUDGET_TOKENS.saturating_sub(request.max_output_tokens);
+    let budget = request_budget(endpoint, &request).map_err(ProviderError::InvalidRequest)?;
     let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
     for round in 0..max_rounds {
+        let trimmed = arsy_code::agent::budget::fit(&mut request.messages, budget, None);
+        if trimmed.after > budget {
+            return Err(ProviderError::InvalidRequest(format!(
+                "model `{}` input still exceeds its context budget after compaction",
+                request.model.model
+            )));
+        }
+        if trimmed.changed() {
+            emitter.trace(
+                "context.compacted",
+                json!({
+                    "trigger": "budget",
+                    "messages": trimmed.summarized,
+                    "elided": trimmed.elided,
+                    "before_tokens": trimmed.before,
+                    "after_tokens": trimmed.after,
+                }),
+            );
+        }
         // Each round is its own request, so a retry repeats that round rather
         // than collapsing into the one before it.
         request.idempotency_key = IdempotencyKey::new(format!("{base}-{round}"))
@@ -732,22 +819,6 @@ pub(crate) fn dispatch(
             );
             return Ok(usage);
         }
-        let trimmed = arsy_code::agent::budget::fit(&mut request.messages, budget, None);
-        // Said in the trace, so a headless run that shrank its context is
-        // not mistaken for a model that forgot on its own.
-        if trimmed.changed() {
-            emitter.trace(
-                "context.compacted",
-                json!({
-                    "trigger": "budget",
-                    "messages": trimmed.summarized,
-                    "elided": trimmed.elided,
-                    "before_tokens": trimmed.before,
-                    "after_tokens": trimmed.after,
-                }),
-            );
-        }
-
         // The calls are history now, whatever running them produced: a provider
         // that sent a call and never sees its result rejects the next request.
         let mut content: Vec<ModelContent> = Vec::new();

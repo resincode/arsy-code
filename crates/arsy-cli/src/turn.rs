@@ -2,7 +2,7 @@
 //! with its tool calls and approvals, the external Codex CLI projection, and
 //! the recording of what the turn left behind.
 
-use crate::run::{charge_turn, context_budget, is_stale_oauth_token, merge, prepare_task};
+use crate::run::{charge_turn, is_stale_oauth_token, merge, prepare_task, task_budget};
 #[cfg(feature = "tui")]
 use crate::*;
 #[cfg(feature = "tui")]
@@ -26,6 +26,7 @@ fn record_turn(
     invocation: &Invocation,
     session: SessionId,
     task: String,
+    budget: arsy_kernel::orchestration::Budget,
     emitter: &mut Emitter,
 ) -> Result<RecordedTurn, Diagnostic> {
     let store: Arc<dyn EventStore> = open_store(&workspace_root(&invocation.workspace)?)?;
@@ -44,7 +45,7 @@ fn record_turn(
             assignee: Some(agent),
             required_output: "an answer to the task".to_owned(),
             workspace: WorkspaceRequirement::IsolatedWriter,
-            budget: TASK_BUDGET,
+            budget,
             authority: Vec::new(),
             state: TaskState::Pending,
             lease_expires_at_ms: None,
@@ -176,10 +177,9 @@ fn persist_completed_turn(
         json!({
             "cost_micros": priced,
             "cost_source": if priced.is_some() { "configured" } else { "unknown" },
-            "response": turn.response.clone(),
-            "transcript": transcript::persistable(&conversation[base..]),
         }),
     );
+    let exchange = transcript::persistable(&conversation[base..]);
     service
         .record_usage(
             actor.clone(),
@@ -191,11 +191,7 @@ fn persist_completed_turn(
         )
         .map_err(storage_failed)?;
     service
-        .record_transcript(
-            actor.clone(),
-            turn_id,
-            &transcript::persistable(&conversation[base..]),
-        )
+        .record_transcript(actor.clone(), turn_id, &exchange)
         .map_err(storage_failed)?;
     service
         .complete_turn(actor.clone(), turn_id, &outcome)
@@ -291,6 +287,32 @@ fn persist_turn(
 }
 
 #[cfg(feature = "tui")]
+fn selected_turn_budget(
+    native: Option<&mut provider::Resolved>,
+    route: &tui::ModelRoute,
+    effort: Option<Effort>,
+) -> Result<arsy_kernel::orchestration::Budget, Diagnostic> {
+    let Some(resolved) = native else {
+        return Ok(crate::run::EXTERNAL_TASK_BUDGET);
+    };
+    let model = tui::variant_for(&resolved.endpoint.models, &route.model, effort);
+    provider::ensure_context_window(resolved, &model).map_err(|reason| {
+        Diagnostic::error(
+            ARSY_PRV_1000,
+            reason,
+            "use provider model metadata or a verified per-model limit",
+        )
+    })?;
+    task_budget(&resolved.endpoint, &model).map_err(|reason| {
+        Diagnostic::error(
+            ARSY_PRV_1000,
+            reason,
+            "configure the selected model's context window",
+        )
+    })
+}
+
+#[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_turn(
     invocation: &Invocation,
@@ -331,6 +353,7 @@ pub(crate) fn run_turn(
             "the hook that refused it is listed by `/hooks`",
         )
     })?;
+    let budget = selected_turn_budget(native.as_deref_mut(), route, effort)?;
     let RecordedTurn {
         service,
         mut graph,
@@ -339,7 +362,7 @@ pub(crate) fn run_turn(
         session,
         task: node,
         store,
-    } = record_turn(invocation, session_id, task.clone(), emitter)?;
+    } = record_turn(invocation, session_id, task.clone(), budget, emitter)?;
     // Where the conversation stood before this turn. A turn that fails or is
     // stopped rewinds to here, which is more than one message once the turn
     // has run tools.
@@ -467,6 +490,8 @@ pub(crate) fn run_turn(
             .record_compaction(actor.clone(), &detail)
             .map_err(storage_failed)?;
     }
+    turn.failure = turn.failure.or((conversation.len() < base)
+        .then(|| "the conversation changed while the turn was running".to_owned()));
     if !turn.interrupted && turn.failure.is_none() {
         transcript.push_assistant(&turn.response);
     }
@@ -569,6 +594,59 @@ fn user_intent_digest(conversation: &[ModelMessage]) -> arsy_kernel::domain::Sta
 
 #[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
+fn compact_round_view(
+    conversation: &[ModelMessage],
+    history: &arsy_code::agent::budget::History,
+    budget: u32,
+    model: &str,
+    colour: bool,
+    transcript: &mut tui::Transcript,
+    composer: &mut tui::Composer,
+    reported_trim: &mut (usize, usize),
+) -> io::Result<(Vec<ModelMessage>, Option<Value>)> {
+    let mut progress = CompactionProgress::new(
+        arsy_code::agent::budget::conversation_tokens(conversation),
+        Some(budget),
+    );
+    let (view, trimmed) = arsy_code::agent::budget::view_reporting(
+        conversation,
+        budget,
+        Some(history),
+        &mut |stage| {
+            let _ = progress.show(
+                &mut io::stdout(),
+                Some(&mut *composer),
+                colour,
+                compaction_step(stage),
+            );
+        },
+    );
+    if trimmed.after > budget {
+        return Err(io::Error::other(format!(
+            "model `{model}` input still exceeds its context budget after compaction"
+        )));
+    }
+    let new_trim = (trimmed.elided, trimmed.summarized) != *reported_trim;
+    *reported_trim = (trimmed.elided, trimmed.summarized);
+    let shown = if new_trim {
+        trimmed
+    } else {
+        arsy_code::agent::budget::Trimmed::default()
+    };
+    let detail = report_trim(
+        &mut io::stdout(),
+        colour,
+        &shown,
+        false,
+        transcript,
+        composer,
+        &mut progress,
+    )?;
+    Ok((view, detail))
+}
+
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn native_turn(
     resolved: &mut provider::Resolved,
     config: &arsy_kernel::config::Config,
@@ -636,6 +714,8 @@ pub(crate) fn native_turn(
             runtime = runtime.with_execution_mode(mode);
         }
         steer_into(conversation, composer, transcript, colour)?;
+        let model = tui::variant_for(&resolved.endpoint.models, &route.model, approval.effort());
+        provider::ensure_context_window(resolved, &model).map_err(io::Error::other)?;
         // Before the request, not after: a transcript that has outgrown the
         // window fails at the provider, and the operator is told what was
         // elided rather than watching the turn shrink invisibly. The request
@@ -644,42 +724,29 @@ pub(crate) fn native_turn(
         //
         // A compaction draws a live row while it runs, so the turn never
         // goes quiet between the prompt and the model's first word.
-        let budget = context_budget(resolved);
-        let mut progress = CompactionProgress::new(
-            arsy_code::agent::budget::conversation_tokens(conversation),
-            Some(budget),
-        );
-        let (view, trimmed) = arsy_code::agent::budget::view_reporting(
+        let sizing = round_request(
+            resolved,
+            config,
+            &runtime,
             conversation,
+            route,
+            approval.effort(),
+            turn,
+            round,
+        )?;
+        let budget =
+            crate::run::request_budget(&resolved.endpoint, &sizing).map_err(io::Error::other)?;
+        let (view, detail) = compact_round_view(
+            conversation,
+            history,
             budget,
-            Some(history),
-            &mut |stage| {
-                let _ = progress.show(
-                    &mut io::stdout(),
-                    Some(&mut *composer),
-                    colour,
-                    compaction_step(stage),
-                );
-            },
-        );
-        // Every round re-trims the same history, so only a trim that took
-        // something new is worth a row; the live row goes either way.
-        let new_trim = (trimmed.elided, trimmed.summarized) != reported_trim;
-        reported_trim = (trimmed.elided, trimmed.summarized);
-        let shown = if new_trim {
-            trimmed.clone()
-        } else {
-            arsy_code::agent::budget::Trimmed::default()
-        };
-        compactions.extend(report_trim(
-            &mut io::stdout(),
+            &sizing.model.model,
             colour,
-            &shown,
-            false,
             transcript,
             composer,
-            &mut progress,
-        )?);
+            &mut reported_trim,
+        )?;
+        compactions.extend(detail);
         let mut outcome = native_status_with_refresh(
             resolved,
             config,
@@ -3738,12 +3805,43 @@ fn native_status_with_refresh(
     let Some(error) = &outcome.provider_error else {
         return Ok(outcome);
     };
+    if matches!(
+        error,
+        arsy_kernel::provider::ProviderError::IncompleteToolArguments(_)
+    ) {
+        // No tool calls from a failed stream are dispatched. Give a malformed
+        // provider completion one fresh request before failing the turn.
+        return native_status(
+            resolved,
+            config,
+            runtime,
+            conversation,
+            route,
+            effort,
+            turn,
+            round + config.max_tool_rounds(),
+            colour,
+            footer,
+            keys,
+            decoder,
+            composer,
+            approval,
+        );
+    }
     if !is_stale_oauth_token(error, resolved.source) {
         return Ok(outcome);
     }
-    let Ok(refreshed) = provider::resolve(config, Some(&resolved.endpoint.id)) else {
+    let Ok(mut refreshed) = provider::resolve(config, Some(&resolved.endpoint.id)) else {
         return Ok(outcome);
     };
+    refreshed
+        .endpoint
+        .context_windows
+        .extend(resolved.endpoint.context_windows.clone());
+    refreshed
+        .endpoint
+        .input_limits
+        .extend(resolved.endpoint.input_limits.clone());
     *resolved = refreshed;
     native_status(
         resolved,

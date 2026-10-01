@@ -201,8 +201,7 @@ fn a_truncated_tool_call_yields_no_completed_call() {
 
     assert!(matches!(
         events.last(),
-        Some(Err(ProviderError::Decode(message)))
-            if message.contains("never completed")
+        Some(Err(ProviderError::IncompleteToolArguments(_)))
     ));
     assert!(
         !events

@@ -36,10 +36,12 @@ use serde_json::Value;
 /// and the live one is already bounded for the turn that saw it.
 const MAX_RESULT_BYTES: usize = 4 * 1024;
 
-/// The most a whole turn may contribute. A turn past this keeps its earliest
-/// messages — the prompt and what the model decided to do — and drops the tail
-/// of its tool traffic, which is the part still recoverable from artifacts.
-const MAX_TURN_BYTES: usize = 128 * 1024;
+/// Leave room for the `turn_id` wrapper and JSON escaping under the event
+/// store's 64 KiB inline payload limit. A turn past this keeps its earliest
+/// messages that fit and drops the tail of its tool traffic, which is the part
+/// still recoverable from artifacts. An oversized first message is already
+/// present in `turn.started` if it is the prompt.
+const MAX_TURN_BYTES: usize = 48 * 1024;
 
 /// The turn's exchange, compacted, as the value recorded on `turn.completed`.
 pub fn persistable(messages: &[ModelMessage]) -> Value {
@@ -50,8 +52,15 @@ pub fn persistable(messages: &[ModelMessage]) -> Value {
             role: message.role,
             content: message.content.iter().map(compact).collect(),
         };
-        let cost = weight(&compacted);
-        if cost > budget && !kept.is_empty() {
+        let cost = serde_json::to_vec(&compacted).map_or(usize::MAX, |bytes| bytes.len());
+        if cost > budget {
+            if let Some(last) = kept.last_mut() {
+                last.content
+                    .retain(|item| !matches!(item, ModelContent::ToolCall { .. }));
+            }
+            if kept.last().is_some_and(|last| last.content.is_empty()) {
+                kept.pop();
+            }
             break;
         }
         budget = budget.saturating_sub(cost);
@@ -117,25 +126,6 @@ fn boundary_after(text: &str, mut index: usize) -> usize {
         index += 1;
     }
     index
-}
-
-fn weight(message: &ModelMessage) -> usize {
-    message
-        .content
-        .iter()
-        .map(|content| match content {
-            ModelContent::Text { text } => text.len(),
-            ModelContent::ToolCall {
-                name, arguments, ..
-            } => name.len() + arguments.to_string().len(),
-            ModelContent::ToolResult { content, .. } => content.len(),
-            // An attached image is recorded whole. It is bounded at the point
-            // it was accepted, and a transcript that kept the prompt but
-            // dropped the picture the prompt was about would restore a
-            // question nobody could answer.
-            ModelContent::Image { data, .. } => data.len(),
-        })
-        .sum()
 }
 
 #[cfg(test)]
@@ -225,6 +215,62 @@ mod tests {
         let restored = restore(&persistable(&exchange));
         assert_eq!(restored.len(), 2);
         assert_eq!(restored[0], exchange[0], "the prompt is never the part cut");
+    }
+
+    #[test]
+    fn a_long_turn_fits_in_one_inline_event() {
+        let exchange = (0..100)
+            .map(|_| text(ModelRole::Assistant, &"x".repeat(1024)))
+            .collect::<Vec<_>>();
+        let payload = serde_json::json!({"turn_id": "00000000-0000-0000-0000-000000000000", "transcript": persistable(&exchange)});
+        assert!(
+            serde_json::to_vec(&payload).unwrap().len()
+                <= arsy_kernel::event::MAX_INLINE_EVENT_BYTES
+        );
+        assert!(restore(&payload["transcript"]).len() < exchange.len());
+    }
+
+    #[test]
+    fn an_oversized_first_message_does_not_overflow_the_event() {
+        let exchange = vec![text(ModelRole::User, &"x".repeat(MAX_TURN_BYTES + 1))];
+        let payload = serde_json::json!({"turn_id": "00000000-0000-0000-0000-000000000000", "transcript": persistable(&exchange)});
+        assert!(restore(&payload["transcript"]).is_empty());
+        assert!(
+            serde_json::to_vec(&payload).unwrap().len()
+                <= arsy_kernel::event::MAX_INLINE_EVENT_BYTES
+        );
+    }
+
+    #[test]
+    fn cutting_a_result_also_removes_its_unanswered_call() {
+        let exchange = vec![
+            text(ModelRole::User, "inspect the failure"),
+            text(ModelRole::Assistant, &"x".repeat(MAX_TURN_BYTES - 2000)),
+            ModelMessage {
+                role: ModelRole::Assistant,
+                content: vec![
+                    ModelContent::Text {
+                        text: "checking".to_owned(),
+                    },
+                    ModelContent::ToolCall {
+                        id: "call-1".to_owned(),
+                        name: "bash".to_owned(),
+                        arguments: serde_json::json!({"command": "cargo test"}),
+                    },
+                ],
+            },
+            ModelMessage {
+                role: ModelRole::User,
+                content: vec![ModelContent::ToolResult {
+                    id: "call-1".to_owned(),
+                    content: "z".repeat(MAX_RESULT_BYTES),
+                    is_error: false,
+                }],
+            },
+        ];
+        let restored = restore(&persistable(&exchange));
+        assert_eq!(restored.len(), 3);
+        assert_eq!(restored[2], text(ModelRole::Assistant, "checking"));
     }
 
     /// A stream from a build that recorded no transcript, and a corrupted one,

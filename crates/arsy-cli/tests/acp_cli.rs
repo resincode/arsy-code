@@ -155,6 +155,7 @@ fn an_editor_initializes_opens_a_session_prompts_and_sees_the_answer_stream() {
              kind = \"openai\"\n\
              base_url = \"http://127.0.0.1:{port}\"\n\
              model = \"test-model\"\n\
+             context_windows = {{ test-model = 128000 }}\n\
              api_key_env = \"ARSY_TEST_KEY\"\n\
              [policy]\n\
              default_effect = \"allow\"\n"
@@ -238,6 +239,7 @@ fn a_credential_the_model_echoes_is_masked_before_it_reaches_the_editor() {
              kind = \"openai\"\n\
              base_url = \"http://127.0.0.1:{port}\"\n\
              model = \"test-model\"\n\
+             context_windows = {{ test-model = 128000 }}\n\
              api_key_env = \"ARSY_TEST_KEY\"\n"
         ),
     );

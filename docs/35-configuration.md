@@ -72,6 +72,7 @@ Authority classes are:
 | `provider.endpoint.<id>.api_key_env` | environment variable name | none | replace | user |
 | `provider.endpoint.<id>.model` | string | none | replace | user |
 | `provider.endpoint.<id>.max_output_tokens` | positive integer | `8192` | replace | user |
+| `provider.endpoint.<id>.context_windows.<model>` | positive integer, total input and output tokens | unknown | replace | user |
 | `provider.endpoint.<id>.pricing.<model>.input_micros_per_million` | non-negative integer | none | replace | user |
 | `provider.endpoint.<id>.pricing.<model>.output_micros_per_million` | non-negative integer | none | replace | user |
 | `provider.endpoint.<id>.oauth.authorize_url` | HTTPS URL | none | replace | user |
@@ -122,6 +123,17 @@ Authority classes are:
 For boolean `intersection`, every authoritative layer must permit `true`; an absent layer does not veto. Restriction order for `policy.default_effect` is `allow < ask < deny`; durability order is `fast < balanced < strict`. Empty allowlists deny the corresponding capability unless enterprise policy explicitly defines an unconstrained set.
 
 ## Provider endpoints
+
+When a native turn selects a model, ARSY reads its limit from provider model
+metadata if the endpoint has no limit for that model. It accepts numeric
+`context_window`, `max_input_tokens`, or `inputTokenLimit` values. It reserves
+`max_output_tokens` from a total context window; an input-only limit is used
+directly. Request instructions and tool schemas are reserved before fitting
+conversation history. The selected model may change between turns or rounds;
+each selection uses its own reported limit. A provider that exposes no numeric
+limit cannot be inferred from its model ID. ARSY reports that gap instead of
+assuming a fixed window. An explicit verified override remains available as
+`"context_windows": {"qwen3-coder": 128000}`.
 
 An endpoint names a wire dialect and an API root, so one adapter serves the vendor's own API, a
 gateway such as LiteLLM or OpenRouter, and a local runtime such as Ollama or LM Studio:

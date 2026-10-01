@@ -338,6 +338,8 @@ pub enum ProviderError {
     Transport(String),
     /// A response arrived but did not match the provider's own wire contract.
     Decode(String),
+    /// A streamed tool call ended with incomplete JSON arguments.
+    IncompleteToolArguments(String),
 }
 
 impl ProviderError {
@@ -350,7 +352,7 @@ impl ProviderError {
             Self::RateLimited { .. } => "provider_rate_limited",
             Self::Server { .. } => "provider_server",
             Self::Transport(_) => "provider_transport",
-            Self::Decode(_) => "provider_decode",
+            Self::Decode(_) | Self::IncompleteToolArguments(_) => "provider_decode",
         }
     }
 
@@ -391,7 +393,9 @@ impl fmt::Display for ProviderError {
                 write!(formatter, "provider server error {status}: {message}")
             }
             Self::Transport(message) => write!(formatter, "provider transport failed: {message}"),
-            Self::Decode(message) => write!(formatter, "provider response undecodable: {message}"),
+            Self::Decode(message) | Self::IncompleteToolArguments(message) => {
+                write!(formatter, "provider response undecodable: {message}")
+            }
         }
     }
 }
