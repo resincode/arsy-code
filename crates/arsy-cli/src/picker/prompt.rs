@@ -1851,15 +1851,14 @@ pub(crate) fn take_turn(
             return Ok(Pass::Go);
         }
     };
-    // A stopped turn takes the queue with it: a follow-up was queued to run
-    // after this one, not instead of the stop.
-    if turn.interrupted {
-        running.queued.clear();
-    }
-    running.queued.extend(turn.queued);
-    // A line sent during the turn's last tool call, with no stream after it
-    // to collect it.
-    running.queued.extend(composer.take_held());
+    // The lines the composer still holds — sent during the turn's last tool
+    // call, or steered into a turn that ended first — join the queue.
+    carry_follow_ups(
+        running.queued,
+        turn.interrupted,
+        turn.queued,
+        composer.take_held(),
+    );
     // Mode and effort changes made while the turn ran happen through the
     // shared cell; refresh the visible projection before deciding whether a
     // plan dialog is still appropriate.
@@ -1867,10 +1866,12 @@ pub(crate) fn take_turn(
         .state
         .set_approval_mode(running.approval.get().label());
     running.state.set_effort(running.approval.effort());
-    if running.approval.get() == approval::ApprovalMode::Plan
-        && !turn.interrupted
-        && turn.failure.is_none()
-    {
+    if plan_is_ready(
+        running.approval.get(),
+        turn.interrupted,
+        turn.failure.is_some(),
+        running.queued.len(),
+    ) {
         settle_plan(
             running.workspace,
             &turn.response,
@@ -1884,6 +1885,43 @@ pub(crate) fn take_turn(
         )?;
     }
     Ok(Pass::Go)
+}
+
+/// Add a finished turn's follow-ups to the queue, in the order they were sent.
+///
+/// A stopped turn takes the queue with it, whichever way it was stopped: a
+/// follow-up was queued to run after this turn, not instead of the stop, and a
+/// line steered into it was meant for the work the operator just stopped.
+#[cfg(feature = "tui")]
+fn carry_follow_ups(
+    queue: &mut std::collections::VecDeque<String>,
+    interrupted: bool,
+    queued: std::collections::VecDeque<String>,
+    held: Vec<String>,
+) {
+    if interrupted {
+        queue.clear();
+        return;
+    }
+    queue.extend(queued);
+    queue.extend(held);
+}
+
+/// Whether a finished turn should put the plan to the operator.
+///
+/// Only in Plan Mode, after a turn that ran to its end. And not while the
+/// operator has follow-ups queued: those were typed into the planning, so the
+/// next planning turn takes them first, and the plan is offered once the
+/// queue is empty. Offering it now would put "implement" ahead of them, or
+/// drop them on cancel.
+#[cfg(feature = "tui")]
+fn plan_is_ready(
+    mode: approval::ApprovalMode,
+    interrupted: bool,
+    failed: bool,
+    queued: usize,
+) -> bool {
+    mode == approval::ApprovalMode::Plan && !interrupted && !failed && queued == 0
 }
 
 /// Answer a slash command that only reads: help, or one of the inspections
@@ -2299,4 +2337,43 @@ pub(crate) enum TaskPass {
     /// Collect the next answer at this prompt instead.
     Ask(Prompt),
     Stop,
+}
+
+#[cfg(all(test, feature = "tui"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stopped_turn_drops_every_follow_up_it_was_holding() {
+        let mut queue = std::collections::VecDeque::from(["earlier".to_owned()]);
+        carry_follow_ups(
+            &mut queue,
+            false,
+            std::collections::VecDeque::from(["queued".to_owned()]),
+            vec!["held".to_owned()],
+        );
+        assert_eq!(queue, ["earlier", "queued", "held"]);
+
+        carry_follow_ups(
+            &mut queue,
+            true,
+            std::collections::VecDeque::new(),
+            vec!["steered before the stop".to_owned()],
+        );
+        assert!(queue.is_empty(), "{queue:?}");
+    }
+
+    #[test]
+    fn a_queued_follow_up_runs_before_the_plan_is_offered() {
+        use approval::ApprovalMode::{Default, Plan};
+
+        assert!(plan_is_ready(Plan, false, false, 0));
+        assert!(
+            !plan_is_ready(Plan, false, false, 1),
+            "a message typed during planning is planned first"
+        );
+        assert!(!plan_is_ready(Plan, true, false, 0));
+        assert!(!plan_is_ready(Plan, false, true, 0));
+        assert!(!plan_is_ready(Default, false, false, 0));
+    }
 }

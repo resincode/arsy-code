@@ -191,6 +191,10 @@ pub struct ApprovalCell {
     /// through them: every level and `off`, or only the levels a model
     /// listed once per effort offers.
     effort_choices: Mutex<Vec<Option<Effort>>>,
+    /// Directories outside the workspace the operator allowed "always" this
+    /// session. Each turn builds a new runtime, so they are carried here and
+    /// handed to it, as `session_commands` are.
+    directories: arsy_code::operations::Directories,
 }
 
 impl Default for ApprovalCell {
@@ -212,6 +216,29 @@ impl ApprovalCell {
             bypass: AtomicBool::new(false),
             effort: AtomicU8::new(0),
             effort_choices: Mutex::new(crate::tui::effort_choices()),
+            directories: arsy_code::operations::Directories::default(),
+        }
+    }
+
+    /// Allow a directory outside the workspace for the rest of the session,
+    /// in this turn's runtime and every later one.
+    pub fn allow_directory(
+        &self,
+        runtime: &arsy_code::agent::ToolRuntime,
+        directory: &std::path::Path,
+        access: arsy_code::operations::DirectoryAccess,
+    ) {
+        runtime.allow_directory(directory, access);
+        if let Ok(canonical) = std::fs::canonicalize(directory) {
+            self.directories.allow(canonical, access);
+        }
+    }
+
+    /// Hand the directories allowed so far this session to a new turn's
+    /// runtime.
+    pub fn carry_directories(&self, runtime: &arsy_code::agent::ToolRuntime) {
+        for (directory, access) in self.directories.entries() {
+            runtime.allow_directory(&directory, access);
         }
     }
 
@@ -532,6 +559,25 @@ pub fn command_allowed(command: &str, allowed: &[String]) -> bool {
         })
 }
 
+/// What `mode` says about a call that reaches outside the workspace and every
+/// added directory, or `None` when the mode's ordinary answer stands.
+///
+/// Claude Code's rule: an approval mode is a standing answer about the places
+/// the operator chose to work in, so a path anywhere else is asked about even
+/// in Accept Edits and Auto. Bypass asks about nothing, and Don't Ask cannot
+/// ask, so it refuses. Plan never reaches here with a write — the runtime
+/// refuses that first — so an outside read in Plan is asked about too.
+pub fn decide_outside(mode: ApprovalMode) -> Option<Decision> {
+    match mode {
+        ApprovalMode::BypassPermissions => None,
+        ApprovalMode::DontAsk => Some(Decision::Refuse),
+        ApprovalMode::Default
+        | ApprovalMode::AcceptEdits
+        | ApprovalMode::Plan
+        | ApprovalMode::Auto => Some(Decision::Ask),
+    }
+}
+
 /// Whether `name` runs, asks, or is refused, under `mode`. Called only once
 /// policy has already said the call needs an answer — a call policy allows
 /// or denies outright never reaches this.
@@ -616,6 +662,23 @@ mod tests {
             decide(ApprovalMode::AcceptEdits, "fs.delete"),
             Decision::Ask
         );
+    }
+
+    #[test]
+    fn a_path_outside_every_directory_is_asked_about_unless_bypassed() {
+        for mode in [
+            ApprovalMode::Default,
+            ApprovalMode::AcceptEdits,
+            ApprovalMode::Plan,
+            ApprovalMode::Auto,
+        ] {
+            assert_eq!(decide_outside(mode), Some(Decision::Ask), "{mode:?}");
+        }
+        assert_eq!(
+            decide_outside(ApprovalMode::DontAsk),
+            Some(Decision::Refuse)
+        );
+        assert_eq!(decide_outside(ApprovalMode::BypassPermissions), None);
     }
 
     #[test]

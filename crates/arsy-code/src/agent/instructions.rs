@@ -261,6 +261,30 @@ fn skill_listing(skills: &[Skill]) -> Option<String> {
     Some(listing)
 }
 
+/// The prompt's listing of the directories added beside the workspace, or
+/// `None` when there are none.
+///
+/// Without it the model has no way to learn that `../project-b` is open to it
+/// and would either never try or try every path the operator mentions.
+fn directory_listing(directories: &[std::path::PathBuf]) -> Option<String> {
+    if directories.is_empty() {
+        return None;
+    }
+    let mut listing = String::from(
+        "## Additional directories\n\n\
+         The operator added these directories beside the workspace. Work in \
+         them as in the workspace, under the same approval mode: the `fs.*` \
+         tools take a path inside one (absolute, or relative to the \
+         workspace), and `search.text` and `search.files` search one when \
+         given it as `path`. Any other path outside the workspace needs the \
+         operator's approval each time.\n\n",
+    );
+    for directory in directories {
+        listing.push_str(&format!("- `{}`\n", directory.display()));
+    }
+    Some(listing)
+}
+
 /// Build the system prompt for one turn.
 ///
 /// `recalled` is context the caller retrieved — what this workspace remembers,
@@ -277,6 +301,7 @@ pub fn system_prompt(
     instructions: &[Instruction],
     extensions: &[ExtensionTool],
     skills: &[Skill],
+    directories: &[std::path::PathBuf],
     recalled: Option<&str>,
     mode: super::ExecutionMode,
     redactor: &Redactor,
@@ -329,6 +354,14 @@ pub fn system_prompt(
         // A permission-state fragment, for the same reason the extension
         // listing is: the set of skills changes at a turn boundary, and a
         // prefix a provider is caching must not be the thing that moves.
+        fragments.push(PromptFragment {
+            id: FragmentId::new(),
+            kind: PromptFragmentKind::PermissionState,
+            content: listing,
+        });
+    }
+    if let Some(listing) = directory_listing(directories) {
+        // Permission state: the set is the operator's grant for this session.
         fragments.push(PromptFragment {
             id: FragmentId::new(),
             kind: PromptFragmentKind::PermissionState,

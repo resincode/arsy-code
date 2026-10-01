@@ -211,10 +211,9 @@ fn encode_message(message: &ModelMessage, out: &mut Vec<Value>) {
             ModelContent::ToolResult { .. } => {}
         }
     }
-    if !text.is_empty() || !images.is_empty() {
-        let parts = super::content_parts(text_type, &text, &mut images);
-        out.push(json!({"type": "message", "role": role, "content": parts}));
-    }
+    // Tool outputs first: each answers the `function_call` just before it,
+    // and the API expects nothing between a call and its output. Text in the
+    // same message — an operator steering the turn mid-way — follows them.
     for content in &message.content {
         if let ModelContent::ToolResult {
             id,
@@ -233,6 +232,10 @@ fn encode_message(message: &ModelMessage, out: &mut Vec<Value>) {
                 "output": output,
             }));
         }
+    }
+    if !text.is_empty() || !images.is_empty() {
+        let parts = super::content_parts(text_type, &text, &mut images);
+        out.push(json!({"type": "message", "role": role, "content": parts}));
     }
 }
 
@@ -580,6 +583,35 @@ mod tests {
         fn send(&self, _request: WireRequest) -> Result<WireResponse, ProviderError> {
             Ok(self.0.lock().unwrap().take().expect("one send"))
         }
+    }
+
+    /// A user message carrying tool results and text — the operator steering
+    /// a running turn — sends every output before the text, so nothing sits
+    /// between a `function_call` and its `function_call_output`.
+    #[test]
+    fn tool_outputs_come_before_text_in_the_same_user_message() {
+        let mut items = Vec::new();
+        encode_message(
+            &ModelMessage {
+                role: ModelRole::User,
+                content: vec![
+                    ModelContent::ToolResult {
+                        id: "call-1".to_owned(),
+                        content: "listing".to_owned(),
+                        is_error: false,
+                    },
+                    ModelContent::Text {
+                        text: "compare with rdb too".to_owned(),
+                    },
+                ],
+            },
+            &mut items,
+        );
+        let kinds: Vec<&str> = items
+            .iter()
+            .map(|item| item["type"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(kinds, ["function_call_output", "message"]);
     }
 
     fn sse(status: u16, body: &str) -> Canned {

@@ -141,6 +141,34 @@ checks: a lexical one that refuses `..`, absolute paths, and prefixes, and the
 syscall-level one cap-std performs, which is what catches a symlink whose name
 looks local. Nothing else in the crate opens a workspace path.
 
+An additional directory is one the operator added beside the workspace, with
+`--add-dir` or `execution.additional_directories` (user or enterprise layer
+only — a repository cannot widen its own reach). `resource::locate` sorts a
+path into the workspace, an added directory (opened as its own `Workspace`, so
+both confinement checks still apply inside it), or neither. File and search
+operations work in an added directory as in the workspace, and the approval
+mode decides as it does there. A path outside both is turned into a question
+by `ToolRuntime::authorize` whatever policy allows, and its executor runs it
+only under a grant that names that exact path (`CapabilityGrant::names_exactly`):
+
+| Mode | added directory | anywhere else |
+|---|---|---|
+| Plan | read; writes refused | read asks; writes refused |
+| Default | read; edits ask | asks |
+| Accept Edits / Auto | read and edit | asks |
+| Don't Ask | read; edits refused | refused |
+| Bypass | everything | everything |
+
+Approving such a call "always" (`[r]`) allows its repository — the nearest
+ancestor holding `.git`, never the home directory or a root, else the path's
+own directory — for the rest of the session: for reading when every outside
+requirement was a read, otherwise as an added directory. `ApprovalCell`
+carries it into each later turn's runtime.
+
+`apply_patch`, git, and the shell stay workspace-only. The prompt lists the
+added directories, and an effect outside the workspace is recorded as
+`file:<absolute path>`.
+
 `resource::walk` is the one traversal: `.gitignore` filters plus a skip of
 `.arsy` (configuration and `.arsy/state/` alike), so a listing, a text search, and a file find agree about what the
 workspace contains.

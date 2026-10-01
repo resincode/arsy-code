@@ -348,7 +348,9 @@ pub struct Composer {
     pub(super) buffer: String,
     pub(super) caret: usize,
     pub(super) drawn: bool,
-    pub(super) top_status: bool,
+    /// Rows drawn above the input box in the last frame: the live status and
+    /// the queued follow-ups over it. The erase moves up past all of them.
+    pub(super) top_rows: usize,
     pub(super) history: std::collections::VecDeque<String>,
     pub(super) history_index: Option<usize>,
     pub(super) draft: String,
@@ -371,9 +373,11 @@ pub struct Composer {
     /// Large pastes shown in the line as a placeholder, with the text each
     /// one stands for. The placeholder is swapped back when the line is taken.
     pub(super) pastes: Vec<(String, String)>,
-    /// Lines sent while a tool call held the keyboard, waiting for the turn
-    /// to queue them as follow-ups.
-    pub(super) held: Vec<String>,
+    /// Lines sent while a turn ran, oldest first, each marked whether it
+    /// steers the running turn or waits for it to end. Kept here rather than
+    /// in the round's outcome because the composer outlives every round of a
+    /// turn, and drawn above the input while they wait.
+    pub(super) held: Vec<(String, bool)>,
     /// The row the caret was drawn on, counted in wrapped rows. The erase
     /// before the next frame moves up by this, not by where the caret is
     /// now: a key has already moved it by then.
@@ -442,14 +446,38 @@ impl Composer {
         self.buffer.is_empty()
     }
 
-    /// Keep a line sent where no queue is at hand, for the turn to take.
+    /// Keep a line to run as a follow-up once the turn ends.
     pub fn hold(&mut self, line: String) {
-        self.held.push(line);
+        self.held.push((line, false));
+    }
+
+    /// Keep a line to steer the running turn: it joins the conversation at
+    /// the next point the turn talks to the model again. A turn that ends
+    /// first runs it as a follow-up, like a held line.
+    pub fn steer(&mut self, line: String) {
+        self.held.push((line, true));
+    }
+
+    /// The steering lines, oldest first, leaving the follow-ups where they are.
+    pub fn take_steering(&mut self) -> Vec<String> {
+        let (steering, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held)
+            .into_iter()
+            .partition(|(_, steer)| *steer);
+        self.held = waiting;
+        steering.into_iter().map(|(line, _)| line).collect()
+    }
+
+    /// How many lines are waiting.
+    pub fn held_len(&self) -> usize {
+        self.held.len()
     }
 
     /// The lines `hold` kept, oldest first.
     pub fn take_held(&mut self) -> Vec<String> {
         std::mem::take(&mut self.held)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect()
     }
 
     pub fn restore(&mut self, text: String) {
@@ -932,7 +960,7 @@ impl Composer {
 
     /// Move back to the top of the block last drawn, and clear it.
     fn erase_drawn(&self) -> String {
-        let lines_above = self.caret_row + if self.top_status { 2 } else { 1 };
+        let lines_above = self.caret_row + 1 + self.top_rows;
         format!("{RESET}\x1b[{lines_above}A\r{CLEAR_BELOW}")
     }
 
@@ -983,15 +1011,16 @@ impl Composer {
             frame.push_str(&self.erase_drawn());
         }
         self.drawn = true;
-        self.top_status = status.is_some();
         self.caret_row = input.caret_row;
+        let top = self.top_block(width, colour, status);
+        self.top_rows = top.len();
         let surface = if colour {
             format!("{}{CLEAR_EOL}", sgr_input_bg())
         } else {
             String::new()
         };
-        if let Some(status) = status {
-            frame.push_str(status);
+        for row in &top {
+            frame.push_str(row);
             frame.push('\n');
         }
         // Top surface pad
@@ -1045,11 +1074,11 @@ impl Composer {
             frame.push_str(&self.erase_drawn());
         }
         self.drawn = true;
-        self.top_status = status.is_some();
         self.caret_row = input.caret_row;
-
-        if let Some(status) = status {
-            frame.push_str(&fit(status, width));
+        let top = self.top_block(width, colour, status);
+        self.top_rows = top.len();
+        for row in &top {
+            frame.push_str(row);
             frame.push('\n');
         }
 
@@ -1095,6 +1124,47 @@ impl Composer {
             input.caret_col + 4
         ));
         frame
+    }
+
+    /// The rows above the input box while a turn runs: every follow-up the
+    /// operator queued, oldest first, then the live status.
+    ///
+    /// A queued line is shown where it waits, so the operator can see it was
+    /// taken and what will run next; without it a line sent mid-turn simply
+    /// vanished until the turn ended. Only the first row of each is shown, and
+    /// at most `QUEUED_SHOWN` of them, so the block cannot push the input off
+    /// a short terminal.
+    fn top_block(&self, width: usize, colour: bool, status: Option<&str>) -> Vec<String> {
+        const QUEUED_SHOWN: usize = 3;
+        let Some(status) = status else {
+            return Vec::new();
+        };
+        let mut rows: Vec<String> = self
+            .held
+            .iter()
+            .take(QUEUED_SHOWN)
+            .map(|(line, steer)| {
+                let first = line.lines().next().unwrap_or_default();
+                let label = if *steer { "steer ›" } else { "queued ›" };
+                fit(
+                    &format!(
+                        "  {} {}",
+                        paint(colour, sgr_dim(), label),
+                        paint(colour, sgr_dim(), first)
+                    ),
+                    width,
+                )
+            })
+            .collect();
+        if self.held.len() > QUEUED_SHOWN {
+            rows.push(paint(
+                colour,
+                sgr_dim(),
+                &format!("  … {} more queued", self.held.len() - QUEUED_SHOWN),
+            ));
+        }
+        rows.push(fit(status, width));
+        rows
     }
 
     /// One row per offered command, marked at the selection.
@@ -1165,7 +1235,7 @@ impl Composer {
     /// Forget terminal coordinates after a display rebuild.
     pub fn invalidate(&mut self) {
         self.drawn = false;
-        self.top_status = false;
+        self.top_rows = 0;
         self.caret_row = 0;
     }
 

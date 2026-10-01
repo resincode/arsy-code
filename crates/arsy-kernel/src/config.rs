@@ -941,6 +941,10 @@ pub struct Config {
     /// `execution.allow_commands`, from a trusted layer only: command prefixes
     /// Accept Edits mode runs without asking.
     allow_commands: Vec<String>,
+    /// `execution.additional_directories`, from a trusted layer only: canonical
+    /// directories the agent works in beside the workspace, under the same
+    /// approval mode.
+    additional_directories: Vec<PathBuf>,
     /// Policy rules keyed by their stable `id`, so a later layer amends a rule
     /// rather than appending a second one with the same meaning.
     policy_rules: BTreeMap<String, PolicyRule>,
@@ -1340,6 +1344,30 @@ impl Config {
         &self.allow_commands
     }
 
+    /// Directories the agent works in beside the workspace, canonical.
+    pub fn additional_directories(&self) -> &[PathBuf] {
+        &self.additional_directories
+    }
+
+    /// Add a directory the operator named for this invocation (`--add-dir`).
+    ///
+    /// The operator typed it, so it needs no trust check; it must name an
+    /// existing directory, and relative paths resolve against the current
+    /// directory as a shell would.
+    pub fn add_directory(&mut self, path: &Path) -> std::io::Result<()> {
+        let canonical = std::fs::canonicalize(path)?;
+        if !canonical.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "not a directory",
+            ));
+        }
+        if !self.additional_directories.contains(&canonical) {
+            self.additional_directories.push(canonical);
+        }
+        Ok(())
+    }
+
     pub fn endpoints(&self) -> impl Iterator<Item = &Endpoint> {
         self.endpoints.values()
     }
@@ -1707,6 +1735,9 @@ impl Config {
                 "max_parallel" => self.apply_max_parallel(layer, path, value)?,
                 "max_tool_rounds" => self.apply_max_tool_rounds(layer, path, value)?,
                 "allow_commands" => self.apply_allow_commands(layer, path, value)?,
+                "additional_directories" => {
+                    self.apply_additional_directories(layer, path, value)?
+                }
                 _ => {}
             }
         }
@@ -1797,6 +1828,72 @@ impl Config {
         for command in commands.into_iter().filter(|command| !command.is_empty()) {
             if !self.allow_commands.contains(&command) {
                 self.allow_commands.push(command);
+            }
+        }
+        Ok(())
+    }
+
+    /// `execution.additional_directories`: directories the agent works in
+    /// beside the workspace — a sibling project to compare against or change —
+    /// under the same approval mode as the workspace itself.
+    ///
+    /// Reaching outside the workspace is authority, so, like `allow_commands`,
+    /// only a layer under the operator's own control may grant it: a
+    /// repository naming `~/.ssh` would be untrusted content widening what the
+    /// agent can touch. A path must be absolute or start with
+    /// `~/`, since a user file has no workspace to be relative to; one that
+    /// does not exist is reported and skipped rather than failing the load.
+    fn apply_additional_directories(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let key = "execution.additional_directories";
+        let invalid = || ConfigError {
+            path: path.to_path_buf(),
+            message: format!("`{key}` must be an array of absolute or `~/` paths"),
+        };
+        let entries = value
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .map(|item| item.as_str().map(str::trim).map(str::to_owned))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .ok_or_else(invalid)?;
+        if !layer.is_trusted() {
+            self.diagnostics.push(Diagnostic {
+                key: key.to_owned(),
+                layer,
+                path: path.to_path_buf(),
+                message: "directories outside the workspace may only be added by the \
+                          enterprise or user configuration"
+                    .to_owned(),
+            });
+            return Ok(());
+        }
+        self.record(layer, path, key, entries.join(", "));
+        for entry in entries.into_iter().filter(|entry| !entry.is_empty()) {
+            let expanded = match entry.strip_prefix("~/") {
+                Some(rest) => home_directory().map(|home| home.join(rest)),
+                None => Some(PathBuf::from(&entry)),
+            }
+            .filter(|expanded| expanded.is_absolute())
+            .ok_or_else(invalid)?;
+            match std::fs::canonicalize(&expanded) {
+                Ok(canonical) if canonical.is_dir() => {
+                    if !self.additional_directories.contains(&canonical) {
+                        self.additional_directories.push(canonical);
+                    }
+                }
+                _ => self.diagnostics.push(Diagnostic {
+                    key: key.to_owned(),
+                    layer,
+                    path: path.to_path_buf(),
+                    message: format!("`{entry}` is not a directory; skipped"),
+                }),
             }
         }
         Ok(())
@@ -4113,6 +4210,42 @@ default_effect = \"allow\"\n",
             .diagnostics()
             .iter()
             .any(|diagnostic| diagnostic.key == "execution.allow_commands"));
+    }
+
+    /// An added directory widens what the agent can touch, so a repository
+    /// must not be able to add its own.
+    #[test]
+    fn only_a_trusted_layer_may_add_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let reference = directory.path().join("project-b");
+        std::fs::create_dir(&reference).unwrap();
+        let user = write(
+            directory.path(),
+            "user.json",
+            &format!(
+                "schema_version = 1\n\n[execution]\nadditional_directories = [{:?}, {:?}]\n",
+                reference.display().to_string(),
+                directory.path().join("missing").display().to_string(),
+            ),
+        );
+        let repository = write(
+            directory.path(),
+            "repo.json",
+            "schema_version = 1\n\n[execution]\nadditional_directories = [\"/\"]\n",
+        );
+
+        let config = load(&[(Layer::User, user), (Layer::Workspace, repository)]);
+
+        assert_eq!(
+            config.additional_directories(),
+            [std::fs::canonicalize(&reference).unwrap()]
+        );
+        let diagnostics = config
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.key == "execution.additional_directories")
+            .count();
+        assert_eq!(diagnostics, 2, "the missing path and the repository layer");
     }
 
     /// `execution.max_tool_rounds` is the key `docs/35-configuration.md`

@@ -6,7 +6,7 @@
 //! status` that decides whether the working tree is dirty, because that input
 //! changes the answer.
 
-use crate::{load_config, usage, Command, Diagnostic, Emitter, Invocation, Output};
+use crate::{load_session_config, usage, Command, Diagnostic, Emitter, Invocation, Output};
 use arsy_kernel::{
     capability::{CapabilityAction, CapabilityRequirement},
     config::effect_name,
@@ -41,7 +41,7 @@ pub fn explain(
 ) -> Result<i32, Diagnostic> {
     let root = crate::workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    let config = load_config(&root, &working, invocation.config.as_deref())?;
+    let config = load_session_config(&root, &working, invocation)?;
 
     let kind = OperationKind::new(operation)
         .map_err(|_| usage(format!("`{operation}` is not a canonical operation kind")))?;

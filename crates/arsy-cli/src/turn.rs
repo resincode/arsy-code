@@ -313,7 +313,7 @@ pub(crate) fn run_turn(
     let task = prepare_task(task, emitter)?;
     let root = workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    let config = load_config(&root, &working, invocation.config.as_deref())?;
+    let config = load_session_config(&root, &working, invocation)?;
     // Loaded once per turn, as `arsy run` loads them: a turn finishes with the
     // hooks it began with.
     let loaded = hook_engine(&root, &config);
@@ -374,6 +374,7 @@ pub(crate) fn run_turn(
                 &prompt_skills(&root, &config),
             )?
             .with_execution_mode(approval.get().execution_mode());
+            approval.carry_directories(&runtime);
             let outcome = native_turn(
                 resolved,
                 &config,
@@ -610,6 +611,11 @@ pub(crate) fn native_turn(
     // failing identically.
     const FAILURE_LOOP_LIMIT: usize = 3;
     let mut identical_failures: Option<(String, usize)> = None;
+    // Consecutive rounds made only of repeated calls. A repeated read is the
+    // model re-checking what it saw, which is still exploring, so it is
+    // answered from the memo and the turn goes on; the same bound as a
+    // failure loop stops a model that only ever repeats itself.
+    let mut repeated_rounds = 0usize;
     let mut reported_trim = (0, 0);
     // What each new compaction recorded, for the turn to append once it has
     // the session open.
@@ -629,6 +635,7 @@ pub(crate) fn native_turn(
         if runtime.execution_mode() != mode {
             runtime = runtime.with_execution_mode(mode);
         }
+        steer_into(conversation, composer, transcript, colour)?;
         // Before the request, not after: a transcript that has outgrown the
         // window fails at the provider, and the operator is told what was
         // elided rather than watching the turn shrink invisibly. The request
@@ -751,7 +758,15 @@ pub(crate) fn native_turn(
             role: ModelRole::User,
             content: results,
         });
-        if all_repeated && !calls.is_empty() {
+        let ends;
+        (repeated_rounds, ends) = repeated_round(
+            &runtime,
+            &calls,
+            all_repeated,
+            repeated_rounds,
+            FAILURE_LOOP_LIMIT,
+        );
+        if ends {
             outcome.response =
                 "The requested operation already completed; a repeated tool call was skipped."
                     .to_owned();
@@ -954,6 +969,31 @@ fn show_event(
     Ok(())
 }
 
+/// Count a round made only of repeated calls, and say whether the run of
+/// them ends the turn.
+///
+/// A repeated effect ends it at once: running it again is what the memo
+/// exists to prevent. A repeated read is the model re-checking what it saw,
+/// so the turn goes on until `limit` such rounds in a row. Any round that ran
+/// something new resets the count.
+#[cfg(feature = "tui")]
+fn repeated_round(
+    runtime: &arsy_code::agent::ToolRuntime,
+    calls: &[(String, String, Value)],
+    all_repeated: bool,
+    rounds: usize,
+    limit: usize,
+) -> (usize, bool) {
+    if !all_repeated || calls.is_empty() {
+        return (0, false);
+    }
+    let rounds = rounds + 1;
+    let reads_only = calls
+        .iter()
+        .all(|(_, name, arguments)| runtime.is_observational(name, arguments));
+    (rounds, rounds >= limit || !reads_only)
+}
+
 /// Say in the answer that a repeated Git command was stopped.
 ///
 /// The turn ends here, so the reason has to reach the model in the answer
@@ -1117,9 +1157,12 @@ fn absorb_live_keys(
             if call.cancellable {
                 arsy_code::process::cancel(call.operation_id);
                 if *drawn_rows > 0 {
-                    write!(terminal, "\x1b[{}A\r\x1b[J", drawn_rows)?;
+                    write!(terminal, "{}", erase_card(composer, *drawn_rows))?;
                     *drawn_rows = 0;
                 }
+                // Stopping the command stops the turn, and the lines waiting
+                // on it go with it, as Esc takes them while the model streams.
+                composer.take_held();
                 write!(terminal, "\r\x1b[K  ✦ Cancelling {}…\n", call.name)?;
                 terminal.flush()?;
                 cancelled = true;
@@ -1133,14 +1176,105 @@ fn absorb_live_keys(
             *expanded = !*expanded;
             continue;
         }
+        if key == tui::Key::Tab {
+            queue_draft(composer);
+            continue;
+        }
         match composer.press(key) {
             action if live_control(&action, approval) => {}
             tui::Action::Expand => *expanded = !*expanded,
-            tui::Action::Submit(line) if !line.trim().is_empty() => composer.hold(line),
+            tui::Action::Submit(line) if !line.trim().is_empty() => keep_sent(composer, line, true),
             _ => {}
         }
     }
     Ok(cancelled)
+}
+
+/// Keep a line sent while a turn runs: steering it into the turn (Enter) or
+/// queueing it for after (Tab). Bounded, so a held key cannot grow the queue
+/// without limit; past the bound the draft is handed back.
+#[cfg(feature = "tui")]
+fn keep_sent(composer: &mut tui::Composer, line: String, steer: bool) {
+    if composer.held_len() >= 16 {
+        composer.restore(line);
+    } else if steer {
+        composer.steer(line);
+    } else {
+        composer.hold(line);
+    }
+}
+
+/// Tab while a turn runs: queue the draft for after the turn instead of
+/// steering it in, as the Codex CLI does. Taken through the same submit Enter
+/// uses, so pastes and history behave alike. Answers whether a line was taken.
+#[cfg(feature = "tui")]
+fn queue_draft(composer: &mut tui::Composer) -> bool {
+    if composer.is_empty() {
+        return false;
+    }
+    match composer.press(tui::Key::Enter) {
+        tui::Action::Submit(line) if !line.trim().is_empty() => {
+            keep_sent(composer, line, false);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Put the lines the operator steered in while the turn ran into the
+/// conversation, beside the tool results the model is about to read.
+///
+/// Only where the conversation ends in those results — the start of a later
+/// round — so a model request always follows and answers them; a turn that
+/// ends first leaves them held, and they run as follow-ups instead. Each is
+/// drawn as a prompt and recorded in the transcript, as a typed prompt is.
+#[cfg(feature = "tui")]
+fn steer_into(
+    conversation: &mut [ModelMessage],
+    composer: &mut tui::Composer,
+    transcript: &mut tui::Transcript,
+    colour: bool,
+) -> io::Result<()> {
+    let Some(results) = conversation
+        .last_mut()
+        .filter(|message| message.role == ModelRole::User)
+        .filter(|message| {
+            message
+                .content
+                .iter()
+                .any(|content| matches!(content, ModelContent::ToolResult { .. }))
+        })
+    else {
+        return Ok(());
+    };
+    let steering = composer.take_steering();
+    if steering.is_empty() {
+        return Ok(());
+    }
+    let mut terminal = io::stdout();
+    for line in steering {
+        write!(terminal, "{}", composer.commit(&line, colour))?;
+        transcript.push_user(&line);
+        results.content.push(ModelContent::Text {
+            text: format!("The operator added this while you were working: {line}"),
+        });
+    }
+    terminal.flush()
+}
+
+/// Erase a running tool's card and the composer drawn under it, leaving the
+/// cursor where the card began.
+///
+/// The cursor rests in the composer, below everything it draws above its input
+/// — the live status and any queued follow-ups — so the composer is erased by
+/// its own count first and only then is the card climbed over. Climbing the
+/// card's height from the input row stopped short by those rows and left them,
+/// and the card's first rows, in the scrollback.
+#[cfg(feature = "tui")]
+fn erase_card(composer: &mut tui::Composer, card_rows: usize) -> String {
+    let mut erase = composer.clear();
+    erase.push_str(&format!("\x1b[{card_rows}A\r\x1b[J"));
+    erase
 }
 
 /// Take whatever a running command has printed since the last pass.
@@ -2312,33 +2446,35 @@ pub(crate) fn drain_keys(
     outcome: &mut Turn,
 ) -> Typed {
     let mut typed = Typed::Quiet;
-    // Lines sent while a tool call ran join the queue in the order sent.
-    for line in composer.take_held() {
-        if outcome.queued.len() < 16 {
-            outcome.queued.push_back(line);
-        }
-    }
     while let Ok(byte) = keys.try_recv() {
         let Some(key) = decoder.feed(byte) else {
             continue;
         };
         if key == tui::Key::Interrupt {
+            // A follow-up was queued to run after this turn, not instead of
+            // stopping it, so the stop takes the queue with it.
+            composer.take_held();
             outcome.queued.clear();
             outcome.interrupted = true;
             return Typed::Interrupted;
+        }
+        if key == tui::Key::Tab {
+            if queue_draft(composer) {
+                typed = Typed::Redraw;
+            }
+            continue;
         }
         match composer.press(key) {
             // Shift+Tab changes authority immediately; it never becomes a
             // model prompt or a queued follow-up. Nor do Ctrl+T or `/effort`.
             action if live_control(&action, approval) => typed = Typed::Redraw,
-            // Bounded as on the Codex route, so a held Enter cannot grow the
-            // queue without limit; past the bound the draft is handed back.
+            // Enter steers the running turn. Held by the composer, not this
+            // round's outcome: the composer outlives every round of the turn,
+            // so the line is still there for the next round, and it is drawn
+            // above the input while it waits.
             tui::Action::Submit(line) if !line.trim().is_empty() => {
-                if outcome.queued.len() < 16 {
-                    outcome.queued.push_back(line);
-                } else {
-                    composer.restore(line);
-                }
+                keep_sent(composer, line, true);
+                typed = Typed::Redraw;
             }
             tui::Action::Expand | tui::Action::Submit(_) | tui::Action::Redraw => {
                 typed = Typed::Redraw
@@ -2800,6 +2936,9 @@ fn execute_call(
                     keys,
                     decoder: &mut *decoder,
                     approval,
+                    // A hook's question is about the hook, not the path.
+                    outside: None,
+                    runtime,
                 };
                 match hooked_arguments(terminal, colour, hooked, asking, &notes)? {
                     Ok(run) => run,
@@ -2840,6 +2979,8 @@ fn execute_call(
             keys,
             decoder,
             approval,
+            outside: runtime.outside_directory(&request),
+            runtime,
         },
         authorization,
         safety.as_ref(),
@@ -2941,6 +3082,11 @@ struct Asking<'a> {
     keys: &'a std::sync::mpsc::Receiver<u8>,
     decoder: &'a mut tui::Keys,
     approval: &'a approval::ApprovalCell,
+    /// The directory, and how much of it, that approving "always" allows for
+    /// the session, when the call reaches outside the workspace and every
+    /// added directory.
+    outside: Option<(PathBuf, arsy_code::operations::DirectoryAccess)>,
+    runtime: &'a arsy_code::agent::ToolRuntime,
 }
 
 #[cfg(feature = "tui")]
@@ -3070,7 +3216,13 @@ fn authorize(
     let command = (name == "bash")
         .then(|| asking.arguments["command"].as_str())
         .flatten();
-    match mode_decision(asking.approval, name, command, force_approval) {
+    match mode_decision(
+        asking.approval,
+        name,
+        command,
+        force_approval,
+        asking.outside.is_some(),
+    ) {
         approval::Decision::Approve => Ok(granted(authorization, name, None)),
         approval::Decision::Refuse => Ok(refused(
             name,
@@ -3082,7 +3234,10 @@ fn authorize(
         )),
         approval::Decision::Ask => {
             let preview = format_tool_preview(name, asking.arguments);
-            let facts = policy_approval_facts(name, asking.summary, &authorization);
+            let facts = outside_facts(
+                policy_approval_facts(name, asking.summary, &authorization),
+                asking.outside.as_ref(),
+            );
             if let Some(grants) = asking.approval.cached(&authorization) {
                 return Ok(Granted::Run { grants, note: None });
             }
@@ -3097,7 +3252,7 @@ fn authorize(
             )? {
                 Answer::Yes { note } => Ok(granted(authorization, name, note)),
                 Answer::Rule { note } => {
-                    asking.approval.remember(&authorization);
+                    remember_always(&asking, &authorization);
                     if let Some(command) = command {
                         asking.approval.remember_command(command);
                     }
@@ -3117,6 +3272,38 @@ fn authorize(
     }
 }
 
+/// Outside every directory, "always" is an answer about the directory, so the
+/// card shows the directory it would allow rather than one file's grant.
+#[cfg(feature = "tui")]
+fn outside_facts(
+    mut facts: ApprovalFacts,
+    outside: Option<&(PathBuf, arsy_code::operations::DirectoryAccess)>,
+) -> ApprovalFacts {
+    if let Some((directory, access)) = outside {
+        let access = match access {
+            arsy_code::operations::DirectoryAccess::Read => "read",
+            arsy_code::operations::DirectoryAccess::Full => "read and edit",
+        };
+        facts.scope = format!("{} for this session ({access})", directory.display());
+        facts.rule_approval = true;
+    }
+    facts
+}
+
+/// Keep an "always" answer: the directory for an outside call, the exact
+/// grants otherwise.
+#[cfg(feature = "tui")]
+fn remember_always(asking: &Asking<'_>, authorization: &arsy_code::agent::Authorization) {
+    match &asking.outside {
+        Some((directory, access)) => {
+            asking
+                .approval
+                .allow_directory(asking.runtime, directory, *access)
+        }
+        None => asking.approval.remember(authorization),
+    }
+}
+
 /// What the approval mode says about a call policy left for approval.
 ///
 /// A safety review that requires approval always asks. Otherwise Accept
@@ -3128,11 +3315,18 @@ fn mode_decision(
     name: &str,
     command: Option<&str>,
     force_approval: bool,
+    outside: bool,
 ) -> approval::Decision {
+    let mode = approval.get();
+    // Outside the workspace and every added directory, the mode's standing
+    // answer does not apply; `requested` already names the path, so a
+    // refusal here says why.
+    if let Some(decision) = outside.then(|| approval::decide_outside(mode)).flatten() {
+        return decision;
+    }
     if force_approval {
         return approval::Decision::Ask;
     }
-    let mode = approval.get();
     match approval::decide(mode, name) {
         approval::Decision::Ask
             if mode == approval::ApprovalMode::AcceptEdits
@@ -3275,7 +3469,7 @@ fn dispatch_tool_live(
                 // The card is erased; the composer the next frame draws is
                 // positioned above where the card used to be.
                 if last_rendered_lines > 0 {
-                    write!(terminal, "\x1b[{}A\r\x1b[J", last_rendered_lines)?;
+                    write!(terminal, "{}", erase_card(composer, last_rendered_lines))?;
                     terminal.flush()?;
                 }
                 composer.invalidate();
@@ -4458,6 +4652,25 @@ mod tests {
         assert_ne!(approval.get(), before);
         assert_eq!(approval.effort(), Some(Effort::Low));
         assert_eq!(composer.take_held(), vec!["next step".to_owned()]);
+    }
+
+    /// Erasing a finished tool's card climbs past everything the composer drew
+    /// above its input — the status and the queued follow-ups — before the
+    /// card, so none of it is left behind in the scrollback.
+    #[test]
+    fn a_finished_card_is_erased_with_every_row_the_composer_drew_over_it() {
+        tui::set_render_style(tui::RenderStyle::Classic);
+        let mut composer = tui::Composer::default();
+        composer.hold("lu analisa aja ya".to_owned());
+        composer.hold("jgn edit".to_owned());
+        let _ = composer.render_turn(80, false, "  ⠋ Working…", "  footer");
+
+        let erase = erase_card(&mut composer, 2);
+        // Two queued rows, the status, and the pad: four up to the top of the
+        // composer, then the card's two.
+        assert!(erase.contains("\x1b[4A"), "{erase:?}");
+        assert!(erase.ends_with("\x1b[2A\r\x1b[J"), "{erase:?}");
+        assert_eq!(composer.held_len(), 2, "erasing the view keeps the queue");
     }
 
     /// The Codex CLI answers its own tool calls, so a mode that promises to

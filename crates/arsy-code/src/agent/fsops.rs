@@ -11,7 +11,10 @@
 use crate::{
     agent::instructions::Skill,
     edit::{self, EditAddress, EditOperation},
-    resource::{DirEntry, ResolveError, Workspace},
+    operations::Directories,
+    resource::{
+        absolute, escapes, locate, open_outside, DirEntry, Location, ResolveError, Workspace,
+    },
 };
 use arsy_kernel::{
     artifact::ArtifactStore,
@@ -181,6 +184,10 @@ pub struct FileExecutor {
     /// the listing pointed at. Empty for every operation but `fs.read`, and
     /// empty is fine there: a read of a path resolves as a path.
     skills: Vec<Skill>,
+    /// Directories the operator added beside the workspace. Every operation
+    /// works in them as it does in the workspace; the approval mode, not the
+    /// executor, decides whether it may.
+    directories: Directories,
 }
 
 impl FileExecutor {
@@ -190,6 +197,7 @@ impl FileExecutor {
         artifacts: Arc<dyn ArtifactStore>,
         retain_until_ms: u64,
         skills: Vec<Skill>,
+        directories: Directories,
     ) -> Arc<Self> {
         Arc::new(Self {
             operation,
@@ -208,12 +216,65 @@ impl FileExecutor {
             artifacts,
             retain_until_ms,
             skills,
+            directories,
         })
     }
 
     fn open(&self) -> Result<Workspace, OperationError> {
         Workspace::open(&self.workspace)
             .map_err(|error| OperationError::Execution(error.to_string()))
+    }
+
+    /// The root a path lives under, opened, and the path relative to it.
+    ///
+    /// The workspace and every added directory are open to the operation; a
+    /// path outside all of them runs only when the operator approved that
+    /// exact path, which arrives as a grant naming it. A broad rule such as
+    /// `file:**` is not that approval — the runtime asks before such a call,
+    /// and this is the check that holds if a caller skipped asking.
+    /// `directory` opens an approved outside path as a root of its own, for
+    /// listing or searching it, rather than as a file under its parent.
+    fn target(
+        &self,
+        path: &str,
+        grants: &[CapabilityGrant],
+        directory: bool,
+    ) -> Result<(Workspace, PathBuf), OperationError> {
+        let reading = self.operation.action() == CapabilityAction::FsRead;
+        let roots = self.directories.roots(reading);
+        match locate(&roots, &self.workspace, path).map_err(resolve)? {
+            Location::Inside => Ok((self.open()?, PathBuf::from(path))),
+            Location::Rooted(root, relative) => Ok((root, relative)),
+            Location::Undeclared(absolute) => {
+                if !approved(grants, self.operation.action(), path) {
+                    return Err(resolve(ResolveError::OutsideWorkspace));
+                }
+                open_outside(&absolute, directory).map_err(resolve)
+            }
+        }
+    }
+
+    /// Read a file, or a skill the prompt listed by name.
+    ///
+    /// A home-declared skill is absolute and outside the workspace, and the
+    /// listing already named it, so it is read where it lives; anything else,
+    /// including an absolute path the model typed itself, goes through
+    /// [`Self::target`].
+    fn read(
+        &self,
+        requested: &str,
+        grants: &[CapabilityGrant],
+        offset: Option<u64>,
+        limit: Option<u64>,
+    ) -> Result<(ReadResult, String), OperationError> {
+        let declared = skill_path(requested, &self.skills).transpose()?;
+        let path = declared.clone().unwrap_or_else(|| requested.to_owned());
+        if let Some(declared) = declared.filter(|declared| Path::new(declared).is_absolute()) {
+            return Ok((read_declared(&declared, offset, limit)?, path));
+        }
+        let (root, relative) = self.target(&path, grants, false)?;
+        let content = root.read(relative, MAX_FILE_BYTES).map_err(resolve)?;
+        Ok((window(&path, content, offset, limit)?, path))
     }
 
     fn put(
@@ -238,9 +299,8 @@ impl OperationExecutor for FileExecutor {
     fn execute(
         &self,
         request: &OperationRequest,
-        _grants: &[CapabilityGrant],
+        grants: &[CapabilityGrant],
     ) -> Result<OperationOutcome, OperationError> {
-        let workspace = self.open()?;
         let input = &request.input;
         let string = |key: &str| input.get(key).and_then(Value::as_str).unwrap_or_default();
         let number = |key: &str| input.get(key).and_then(Value::as_u64);
@@ -248,7 +308,8 @@ impl OperationExecutor for FileExecutor {
         let (value, touched, state) = match self.operation {
             FileOperation::List => {
                 let path = input.get("path").and_then(Value::as_str).unwrap_or(".");
-                let entries = workspace.list(path).map_err(resolve)?;
+                let (root, relative) = self.target(path, grants, true)?;
+                let entries = root.list(relative).map_err(resolve)?;
                 (
                     self.put(
                         &ListResult {
@@ -262,18 +323,8 @@ impl OperationExecutor for FileExecutor {
                 )
             }
             FileOperation::Read => {
-                let requested = string("path");
-                let declared = skill_path(requested, &self.skills).transpose()?;
-                let path = declared.clone().unwrap_or_else(|| requested.to_owned());
-                // A home-declared skill is absolute and outside the workspace;
-                // anything else, including an absolute path the model typed
-                // itself, still goes through confinement.
-                let result = match &declared {
-                    Some(declared) if Path::new(declared).is_absolute() => {
-                        read_declared(declared, number("offset"), number("limit"))?
-                    }
-                    _ => read(&workspace, &path, number("offset"), number("limit"))?,
-                };
+                let (result, path) =
+                    self.read(string("path"), grants, number("offset"), number("limit"))?;
                 let digest = result.digest.clone();
                 (
                     self.put(&result, request.actor.clone())?,
@@ -284,13 +335,14 @@ impl OperationExecutor for FileExecutor {
             FileOperation::Write | FileOperation::Create => {
                 let path = string("path");
                 let content = string("content");
+                let (root, relative) = self.target(path, grants, false)?;
                 // Metadata, not a read: asking whether a file is there by
                 // reading it costs the whole file before overwriting it.
-                let existed = workspace.exists(path);
+                let existed = root.exists(&relative);
                 let digest = if self.operation == FileOperation::Create {
-                    workspace.create_new(path, content.as_bytes())
+                    root.create_new(&relative, content.as_bytes())
                 } else {
-                    workspace.write(path, content.as_bytes())
+                    root.write(&relative, content.as_bytes())
                 }
                 .map_err(resolve)?;
                 (
@@ -312,8 +364,10 @@ impl OperationExecutor for FileExecutor {
             }
             FileOperation::Edit => {
                 let path = string("path");
+                let (root, relative) = self.target(path, grants, false)?;
                 let result = apply_edit(
-                    &workspace,
+                    &root,
+                    &relative,
                     path,
                     string("old_text"),
                     string("new_text"),
@@ -328,7 +382,8 @@ impl OperationExecutor for FileExecutor {
             }
             FileOperation::Delete => {
                 let path = string("path");
-                workspace.remove(path).map_err(resolve)?;
+                let (root, relative) = self.target(path, grants, false)?;
+                root.remove(relative).map_err(resolve)?;
                 (
                     self.put(
                         &json!({"path": path, "deleted": true}),
@@ -341,7 +396,15 @@ impl OperationExecutor for FileExecutor {
             FileOperation::Move => {
                 let from = string("from");
                 let to = string("to");
-                workspace.rename(from, to).map_err(resolve)?;
+                // Each end is its own requirement, so policy and an approval
+                // answer about both. They must still resolve to one root: a
+                // rename cannot cross capability directories.
+                let (root, source) = self.target(from, grants, false)?;
+                let (other, destination) = self.target(to, grants, false)?;
+                if root.path() != other.path() {
+                    return Err(resolve(ResolveError::OutsideWorkspace));
+                }
+                root.rename(source, destination).map_err(resolve)?;
                 (
                     self.put(&json!({"from": from, "to": to}), request.actor.clone())?,
                     to.to_owned(),
@@ -350,11 +413,24 @@ impl OperationExecutor for FileExecutor {
             }
         };
 
+        // A path that leaves the workspace is recorded by where it actually
+        // is, so the audit trail names the other directory rather than a
+        // workspace path that does not exist.
+        let (scheme, touched) = if escapes(Path::new(&touched)) {
+            (
+                "file",
+                absolute(&self.workspace, &touched)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        } else {
+            ("workspace", touched)
+        };
         Ok(OperationOutcome {
             value: Some(value),
             observed_effects: vec![Effect {
                 action: self.operation.action(),
-                resource: ResourceRef::new("workspace", touched)
+                resource: ResourceRef::new(scheme, touched)
                     .map_err(|error| OperationError::Execution(error.to_string()))?,
             }],
             evidence: Vec::new(),
@@ -404,21 +480,6 @@ fn skill_path(path: &str, skills: &[Skill]) -> Option<Result<String, OperationEr
     )
 }
 
-/// Read a file, optionally a window of it.
-///
-/// The window is in lines rather than bytes because that is the unit a model
-/// asks in and the unit an error message reports in; a byte offset would let a
-/// second read start mid-character.
-fn read(
-    workspace: &Workspace,
-    path: &str,
-    offset: Option<u64>,
-    limit: Option<u64>,
-) -> Result<ReadResult, OperationError> {
-    let content = workspace.read(path, MAX_FILE_BYTES).map_err(resolve)?;
-    window(path, content, offset, limit)
-}
-
 /// Read a skill the operator's own home declared.
 ///
 /// Its `SKILL.md` is outside the workspace, so [`Workspace`] refuses the
@@ -437,6 +498,10 @@ fn read_declared(
 
 /// The window of a file's content a read returns, shared by both readers so a
 /// skill and a workspace file are reported the same way.
+///
+/// The window is in lines rather than bytes because that is the unit a model
+/// asks in and the unit an error message reports in; a byte offset would let a
+/// second read start mid-character.
 fn window(
     path: &str,
     content: crate::resource::FileContent,
@@ -490,6 +555,7 @@ fn window(
 /// here for the same reason it is there, rather than silently taking the first.
 fn apply_edit(
     workspace: &Workspace,
+    relative: &Path,
     path: &str,
     old_text: &str,
     new_text: &str,
@@ -509,13 +575,16 @@ fn apply_edit(
         ),
         None => None,
     };
-    let before_bytes = workspace.read(path, MAX_FILE_BYTES).map_err(resolve)?.bytes;
+    let before_bytes = workspace
+        .read(relative, MAX_FILE_BYTES)
+        .map_err(resolve)?
+        .bytes;
     let before_text = String::from_utf8_lossy(&before_bytes);
     let first_line = line_number(&before_text, old_text, occurrence);
     let edits = edit::apply_unversioned(
         workspace.path(),
         &[EditOperation {
-            path: PathBuf::from(path),
+            path: relative.to_path_buf(),
             address: EditAddress::TextAnchor {
                 needle: old_text.to_owned(),
                 occurrence,
@@ -531,7 +600,7 @@ fn apply_edit(
         path: path.to_owned(),
         created: false,
         bytes: workspace
-            .read(path, MAX_FILE_BYTES)
+            .read(relative, MAX_FILE_BYTES)
             .map(|content| content.bytes.len() as u64)
             .unwrap_or_default(),
         digest: applied.after.to_string(),
@@ -554,6 +623,15 @@ fn line_number(text: &str, needle: &str, occurrence: Option<NonZeroU32>) -> u64 
         + 1
 }
 
+/// Whether the operator approved this exact path for this action.
+fn approved(grants: &[CapabilityGrant], action: CapabilityAction, path: &str) -> bool {
+    ResourceRef::new(action.default_scheme(), path).is_ok_and(|resource| {
+        grants
+            .iter()
+            .any(|grant| grant.action == action && grant.names_exactly(&resource))
+    })
+}
+
 /// A resolve failure the model can act on.
 ///
 /// `OutsideWorkspace` and `AlreadyExists` are decisions, not faults, so they
@@ -561,9 +639,10 @@ fn line_number(text: &str, needle: &str, occurrence: Option<NonZeroU32>) -> u64 
 /// happened.
 fn resolve(error: ResolveError) -> OperationError {
     match error {
-        ResolveError::OutsideWorkspace | ResolveError::EmptyPath | ResolveError::AlreadyExists => {
-            OperationError::Schema(error.to_string())
-        }
+        ResolveError::OutsideWorkspace
+        | ResolveError::EmptyPath
+        | ResolveError::AlreadyExists
+        | ResolveError::Symlinked(_) => OperationError::Schema(error.to_string()),
         other => OperationError::Execution(other.to_string()),
     }
 }
@@ -574,6 +653,7 @@ pub fn executors(
     artifacts: &Arc<dyn ArtifactStore>,
     retain_until_ms: u64,
     skills: &[Skill],
+    directories: &Directories,
 ) -> Vec<Arc<dyn OperationExecutor>> {
     FileOperation::ALL
         .into_iter()
@@ -584,6 +664,7 @@ pub fn executors(
                 Arc::clone(artifacts),
                 retain_until_ms,
                 skills.to_vec(),
+                directories.clone(),
             ) as Arc<dyn OperationExecutor>
         })
         .collect()
