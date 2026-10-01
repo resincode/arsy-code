@@ -341,14 +341,31 @@ pub fn absolute(workspace: &Path, path: impl AsRef<Path>) -> PathBuf {
     absolute
 }
 
-/// Open an approved path outside every root: its parent directory as the
-/// capability root, and the file name under it. The name still resolves
-/// through cap-std, so a symlink named there cannot redirect the effect.
-pub fn open_parent(absolute: &Path) -> Result<(Workspace, PathBuf), ResolveError> {
-    let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) else {
-        return Err(ResolveError::EmptyPath);
+/// Open an approved path outside every root: the directory itself when
+/// `directory`, otherwise its parent with the file name under it.
+///
+/// The operator approved the path they were shown, so a directory that
+/// resolves somewhere else — a symlink anywhere along it — is refused and the
+/// real path named, rather than opened: approving `/tmp/link` must not list
+/// whatever it points at. The file name still resolves through cap-std, so a
+/// symlink named there cannot redirect the effect either.
+pub fn open_outside(
+    absolute: &Path,
+    directory: bool,
+) -> Result<(Workspace, PathBuf), ResolveError> {
+    let (root, relative) = if directory {
+        (absolute, PathBuf::from("."))
+    } else {
+        let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) else {
+            return Err(ResolveError::EmptyPath);
+        };
+        (parent, PathBuf::from(name))
     };
-    Ok((Workspace::open(parent)?, PathBuf::from(name)))
+    let real = std::fs::canonicalize(root)?;
+    if real != root {
+        return Err(ResolveError::Symlinked(real.join(&relative)));
+    }
+    Ok((Workspace::open(root)?, relative))
 }
 
 /// Whether a path names something outside the workspace lexically.
@@ -398,6 +415,8 @@ pub enum ResolveError {
     EmptyPath,
     NonUtf8,
     AlreadyExists,
+    /// An approved outside path resolves through a symlink to this one.
+    Symlinked(PathBuf),
     Io(io::Error),
     Resource(ResourceRefError),
 }
@@ -409,6 +428,11 @@ impl fmt::Display for ResolveError {
             Self::EmptyPath => formatter.write_str("path must name a workspace file"),
             Self::NonUtf8 => formatter.write_str("canonical workspace path is not UTF-8"),
             Self::AlreadyExists => formatter.write_str("a file already exists at that path"),
+            Self::Symlinked(real) => write!(
+                formatter,
+                "that path resolves through a symlink to {}; name that path instead",
+                real.display()
+            ),
             Self::Io(error) => error.fmt(formatter),
             Self::Resource(error) => error.fmt(formatter),
         }
@@ -570,12 +594,45 @@ mod tests {
     #[test]
     fn an_approved_outside_path_opens_under_its_parent() {
         let parent = tempfile::tempdir().unwrap();
-        let file = parent.path().join("notes.txt");
+        let parent = std::fs::canonicalize(parent.path()).unwrap();
+        let file = parent.join("notes.txt");
         std::fs::write(&file, "outside").unwrap();
 
-        let (root, name) = open_parent(&file).unwrap();
+        let (root, name) = open_outside(&file, false).unwrap();
         assert_eq!(root.read(&name, 64).unwrap().bytes, b"outside");
-        assert!(open_parent(Path::new("/")).is_err());
+        let (root, here) = open_outside(&parent, true).unwrap();
+        assert!(root
+            .list(here)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.name == "notes.txt"));
+        assert!(open_outside(Path::new("/"), false).is_err());
+    }
+
+    /// Approving `/tmp/link` approves that path, not whatever it points at.
+    #[cfg(unix)]
+    #[test]
+    fn an_approved_outside_symlink_is_refused_with_its_real_path() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let parent = std::fs::canonicalize(parent.path()).unwrap();
+        std::fs::create_dir(parent.join("secret")).unwrap();
+        std::fs::write(parent.join("secret/key"), "key").unwrap();
+        symlink(parent.join("secret"), parent.join("link")).unwrap();
+
+        for (path, directory) in [
+            (parent.join("link"), true),
+            (parent.join("link/key"), false),
+        ] {
+            match open_outside(&path, directory) {
+                Err(ResolveError::Symlinked(real)) => {
+                    assert!(real.starts_with(parent.join("secret")), "{real:?}")
+                }
+                Err(other) => panic!("{path:?}: {other}"),
+                Ok(_) => panic!("{path:?} was opened through the link"),
+            }
+        }
     }
 
     #[cfg(unix)]

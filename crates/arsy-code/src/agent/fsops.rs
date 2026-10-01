@@ -13,7 +13,7 @@ use crate::{
     edit::{self, EditAddress, EditOperation},
     operations::Directories,
     resource::{
-        absolute, escapes, locate, open_parent, DirEntry, Location, ResolveError, Workspace,
+        absolute, escapes, locate, open_outside, DirEntry, Location, ResolveError, Workspace,
     },
 };
 use arsy_kernel::{
@@ -249,14 +249,7 @@ impl FileExecutor {
                 if !approved(grants, self.operation.action(), path) {
                     return Err(resolve(ResolveError::OutsideWorkspace));
                 }
-                let opened = if directory {
-                    Workspace::open(&absolute)
-                        .map(|root| (root, PathBuf::from(".")))
-                        .map_err(ResolveError::from)
-                } else {
-                    open_parent(&absolute)
-                };
-                opened.map_err(resolve)
+                open_outside(&absolute, directory).map_err(resolve)
             }
         }
     }
@@ -646,9 +639,10 @@ fn approved(grants: &[CapabilityGrant], action: CapabilityAction, path: &str) ->
 /// happened.
 fn resolve(error: ResolveError) -> OperationError {
     match error {
-        ResolveError::OutsideWorkspace | ResolveError::EmptyPath | ResolveError::AlreadyExists => {
-            OperationError::Schema(error.to_string())
-        }
+        ResolveError::OutsideWorkspace
+        | ResolveError::EmptyPath
+        | ResolveError::AlreadyExists
+        | ResolveError::Symlinked(_) => OperationError::Schema(error.to_string()),
         other => OperationError::Execution(other.to_string()),
     }
 }

@@ -250,7 +250,8 @@ impl SearchExecutor {
                 }) {
                     return Err(refused());
                 }
-                let searched = Workspace::open(&absolute).map_err(execution)?;
+                let (searched, _) = crate::resource::open_outside(&absolute, true)
+                    .map_err(|error| OperationError::Schema(error.to_string()))?;
                 (absolute, searched)
             }
         };

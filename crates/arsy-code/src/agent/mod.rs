@@ -1243,7 +1243,13 @@ impl ToolRuntime {
         } else {
             crate::operations::DirectoryAccess::Full
         };
-        Some((repository_of(&path), access))
+        // Shown on the card as it resolves, so "always" allows the directory
+        // the operator saw rather than whatever a symlink in the path names.
+        let repository = repository_of(&path);
+        Some((
+            std::fs::canonicalize(&repository).unwrap_or(repository),
+            access,
+        ))
     }
 
     pub fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
