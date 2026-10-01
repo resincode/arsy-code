@@ -2940,25 +2940,7 @@ impl Config {
                 &endpoint.base_url,
             );
         }
-        if let Some(raw) = string(table, "credential", &format!("{prefix}.credential"), path)? {
-            // The rejected value is never quoted back. This key is where an
-            // operator is most likely to paste a real API key by mistake, and
-            // a diagnostic travels to stdout, logs, and CI output long before
-            // any redaction pipeline is holding that value.
-            let handle = SecretHandle::try_from(raw.clone()).map_err(|_| {
-                reject(format!(
-                    "`{prefix}.credential` must be a handle such as \"secret://os/{id}\", not a \
-                     credential; store the value with `arsy auth set {id}` instead"
-                ))
-            })?;
-            self.record(
-                layer,
-                path,
-                &format!("{prefix}.credential"),
-                handle.to_string(),
-            );
-            endpoint.credential = Some(handle);
-        }
+        self.apply_endpoint_credential(layer, path, id, &prefix, table, &mut endpoint)?;
         if let Some(name) = string(table, "api_key_env", &format!("{prefix}.api_key_env"), path)? {
             self.record(layer, path, &format!("{prefix}.api_key_env"), name);
             endpoint.api_key_env = Some(name.clone());
@@ -2974,6 +2956,60 @@ impl Config {
             endpoint.models = models;
         }
         endpoint.offer_default_first();
+        self.apply_endpoint_limits(layer, path, &prefix, table, &mut endpoint)?;
+        if let Some(oauth) = table.get("oauth") {
+            endpoint.oauth = Some(self.apply_oauth(layer, path, &prefix, oauth)?);
+        }
+        self.apply_endpoint_pricing(layer, path, &prefix, table, &mut endpoint)?;
+
+        self.endpoints.insert(id.to_owned(), endpoint);
+        Ok(())
+    }
+
+    fn apply_endpoint_credential(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        id: &str,
+        prefix: &str,
+        table: &toml::Table,
+        endpoint: &mut Endpoint,
+    ) -> Result<(), ConfigError> {
+        if let Some(raw) = string(table, "credential", &format!("{prefix}.credential"), path)? {
+            // The rejected value is never quoted back. This key is where an
+            // operator is most likely to paste a real API key by mistake, and
+            // a diagnostic travels to stdout, logs, and CI output long before
+            // any redaction pipeline is holding that value.
+            let handle = SecretHandle::try_from(raw.clone()).map_err(|_| ConfigError {
+                path: path.to_path_buf(),
+                message: format!(
+                    "`{prefix}.credential` must be a handle such as \"secret://os/{id}\", not a \
+                     credential; store the value with `arsy auth set {id}` instead"
+                ),
+            })?;
+            self.record(
+                layer,
+                path,
+                &format!("{prefix}.credential"),
+                handle.to_string(),
+            );
+            endpoint.credential = Some(handle);
+        }
+        Ok(())
+    }
+
+    fn apply_endpoint_limits(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        prefix: &str,
+        table: &toml::Table,
+        endpoint: &mut Endpoint,
+    ) -> Result<(), ConfigError> {
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
         if let Some(value) = table.get("max_output_tokens") {
             let key = format!("{prefix}.max_output_tokens");
             let tokens = value
@@ -2997,9 +3033,21 @@ impl Config {
                 endpoint.context_windows.insert(model.clone(), tokens);
             }
         }
-        if let Some(oauth) = table.get("oauth") {
-            endpoint.oauth = Some(self.apply_oauth(layer, path, &prefix, oauth)?);
-        }
+        Ok(())
+    }
+
+    fn apply_endpoint_pricing(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        prefix: &str,
+        table: &toml::Table,
+        endpoint: &mut Endpoint,
+    ) -> Result<(), ConfigError> {
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
         if let Some(pricing) = table.get("pricing") {
             let prefix = format!("{prefix}.pricing");
             for (model, value) in as_table(pricing, &prefix, path)? {
@@ -3038,8 +3086,6 @@ impl Config {
                 endpoint.pricing.insert(model.clone(), priced);
             }
         }
-
-        self.endpoints.insert(id.to_owned(), endpoint);
         Ok(())
     }
 

@@ -287,6 +287,32 @@ fn persist_turn(
 }
 
 #[cfg(feature = "tui")]
+fn selected_turn_budget(
+    native: Option<&mut provider::Resolved>,
+    route: &tui::ModelRoute,
+    effort: Option<Effort>,
+) -> Result<arsy_kernel::orchestration::Budget, Diagnostic> {
+    let Some(resolved) = native else {
+        return Ok(crate::run::EXTERNAL_TASK_BUDGET);
+    };
+    let model = tui::variant_for(&resolved.endpoint.models, &route.model, effort);
+    provider::ensure_context_window(resolved, &model).map_err(|reason| {
+        Diagnostic::error(
+            ARSY_PRV_1000,
+            reason,
+            "use provider model metadata or a verified per-model limit",
+        )
+    })?;
+    task_budget(&resolved.endpoint, &model).map_err(|reason| {
+        Diagnostic::error(
+            ARSY_PRV_1000,
+            reason,
+            "configure the selected model's context window",
+        )
+    })
+}
+
+#[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_turn(
     invocation: &Invocation,
@@ -327,16 +353,7 @@ pub(crate) fn run_turn(
             "the hook that refused it is listed by `/hooks`",
         )
     })?;
-    if let Some(resolved) = native.as_deref_mut() {
-        let model = tui::variant_for(&resolved.endpoint.models, &route.model, effort);
-        provider::ensure_context_window(resolved, &model).map_err(|reason| {
-            Diagnostic::error(
-                ARSY_PRV_1000,
-                reason,
-                "use provider model metadata or a verified per-model limit",
-            )
-        })?;
-    }
+    let budget = selected_turn_budget(native.as_deref_mut(), route, effort)?;
     let RecordedTurn {
         service,
         mut graph,
@@ -345,27 +362,7 @@ pub(crate) fn run_turn(
         session,
         task: node,
         store,
-    } = record_turn(
-        invocation,
-        session_id,
-        task.clone(),
-        native
-            .as_ref()
-            .map_or(Ok(crate::run::EXTERNAL_TASK_BUDGET), |resolved| {
-                task_budget(
-                    &resolved.endpoint,
-                    &tui::variant_for(&resolved.endpoint.models, &route.model, effort),
-                )
-                .map_err(|reason| {
-                    Diagnostic::error(
-                        ARSY_PRV_1000,
-                        reason,
-                        "configure the selected model's context window",
-                    )
-                })
-            })?,
-        emitter,
-    )?;
+    } = record_turn(invocation, session_id, task.clone(), budget, emitter)?;
     // Where the conversation stood before this turn. A turn that fails or is
     // stopped rewinds to here, which is more than one message once the turn
     // has run tools.
@@ -596,6 +593,59 @@ fn user_intent_digest(conversation: &[ModelMessage]) -> arsy_kernel::domain::Sta
 
 #[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
+fn compact_round_view(
+    conversation: &[ModelMessage],
+    history: &arsy_code::agent::budget::History,
+    budget: u32,
+    model: &str,
+    colour: bool,
+    transcript: &mut tui::Transcript,
+    composer: &mut tui::Composer,
+    reported_trim: &mut (usize, usize),
+) -> io::Result<(Vec<ModelMessage>, Option<Value>)> {
+    let mut progress = CompactionProgress::new(
+        arsy_code::agent::budget::conversation_tokens(conversation),
+        Some(budget),
+    );
+    let (view, trimmed) = arsy_code::agent::budget::view_reporting(
+        conversation,
+        budget,
+        Some(history),
+        &mut |stage| {
+            let _ = progress.show(
+                &mut io::stdout(),
+                Some(&mut *composer),
+                colour,
+                compaction_step(stage),
+            );
+        },
+    );
+    if trimmed.after > budget {
+        return Err(io::Error::other(format!(
+            "model `{model}` input still exceeds its context budget after compaction"
+        )));
+    }
+    let new_trim = (trimmed.elided, trimmed.summarized) != *reported_trim;
+    *reported_trim = (trimmed.elided, trimmed.summarized);
+    let shown = if new_trim {
+        trimmed
+    } else {
+        arsy_code::agent::budget::Trimmed::default()
+    };
+    let detail = report_trim(
+        &mut io::stdout(),
+        colour,
+        &shown,
+        false,
+        transcript,
+        composer,
+        &mut progress,
+    )?;
+    Ok((view, detail))
+}
+
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn native_turn(
     resolved: &mut provider::Resolved,
     config: &arsy_kernel::config::Config,
@@ -679,47 +729,17 @@ pub(crate) fn native_turn(
         )?;
         let budget =
             crate::run::request_budget(&resolved.endpoint, &sizing).map_err(io::Error::other)?;
-        let mut progress = CompactionProgress::new(
-            arsy_code::agent::budget::conversation_tokens(conversation),
-            Some(budget),
-        );
-        let (view, trimmed) = arsy_code::agent::budget::view_reporting(
+        let (view, detail) = compact_round_view(
             conversation,
+            history,
             budget,
-            Some(history),
-            &mut |stage| {
-                let _ = progress.show(
-                    &mut io::stdout(),
-                    Some(&mut *composer),
-                    colour,
-                    compaction_step(stage),
-                );
-            },
-        );
-        if trimmed.after > budget {
-            return Err(io::Error::other(format!(
-                "model `{}` input still exceeds its context budget after compaction",
-                sizing.model.model
-            )));
-        }
-        // Every round re-trims the same history, so only a trim that took
-        // something new is worth a row; the live row goes either way.
-        let new_trim = (trimmed.elided, trimmed.summarized) != reported_trim;
-        reported_trim = (trimmed.elided, trimmed.summarized);
-        let shown = if new_trim {
-            trimmed.clone()
-        } else {
-            arsy_code::agent::budget::Trimmed::default()
-        };
-        compactions.extend(report_trim(
-            &mut io::stdout(),
+            &sizing.model.model,
             colour,
-            &shown,
-            false,
             transcript,
             composer,
-            &mut progress,
-        )?);
+            &mut reported_trim,
+        )?;
+        compactions.extend(detail);
         let mut outcome = native_status_with_refresh(
             resolved,
             config,
