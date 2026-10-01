@@ -176,10 +176,9 @@ fn persist_completed_turn(
         json!({
             "cost_micros": priced,
             "cost_source": if priced.is_some() { "configured" } else { "unknown" },
-            "response": turn.response.clone(),
-            "transcript": transcript::persistable(&conversation[base..]),
         }),
     );
+    let exchange = transcript::persistable(&conversation[base..]);
     service
         .record_usage(
             actor.clone(),
@@ -191,11 +190,7 @@ fn persist_completed_turn(
         )
         .map_err(storage_failed)?;
     service
-        .record_transcript(
-            actor.clone(),
-            turn_id,
-            &transcript::persistable(&conversation[base..]),
-        )
+        .record_transcript(actor.clone(), turn_id, &exchange)
         .map_err(storage_failed)?;
     service
         .complete_turn(actor.clone(), turn_id, &outcome)
@@ -465,6 +460,9 @@ pub(crate) fn run_turn(
         service
             .record_compaction(actor.clone(), &detail)
             .map_err(storage_failed)?;
+    }
+    if conversation.len() < base {
+        turn.failure = Some("the conversation changed while the turn was running".to_owned());
     }
     if !turn.interrupted && turn.failure.is_none() {
         transcript.push_assistant(&turn.response);
@@ -3544,6 +3542,27 @@ fn native_status_with_refresh(
     let Some(error) = &outcome.provider_error else {
         return Ok(outcome);
     };
+    if matches!(error, arsy_kernel::provider::ProviderError::Decode(message) if message.starts_with("tool arguments for block "))
+    {
+        // No tool calls from a failed stream are dispatched. Give a malformed
+        // provider completion one fresh request before failing the turn.
+        return native_status(
+            resolved,
+            config,
+            runtime,
+            conversation,
+            route,
+            effort,
+            turn,
+            round + config.max_tool_rounds(),
+            colour,
+            footer,
+            keys,
+            decoder,
+            composer,
+            approval,
+        );
+    }
     if !is_stale_oauth_token(error, resolved.source) {
         return Ok(outcome);
     }
