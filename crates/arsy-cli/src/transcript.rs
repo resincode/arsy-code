@@ -54,6 +54,13 @@ pub fn persistable(messages: &[ModelMessage]) -> Value {
         };
         let cost = serde_json::to_vec(&compacted).map_or(usize::MAX, |bytes| bytes.len());
         if cost > budget {
+            if let Some(last) = kept.last_mut() {
+                last.content
+                    .retain(|item| !matches!(item, ModelContent::ToolCall { .. }));
+            }
+            if kept.last().is_some_and(|last| last.content.is_empty()) {
+                kept.pop();
+            }
             break;
         }
         budget = budget.saturating_sub(cost);
@@ -232,6 +239,38 @@ mod tests {
             serde_json::to_vec(&payload).unwrap().len()
                 <= arsy_kernel::event::MAX_INLINE_EVENT_BYTES
         );
+    }
+
+    #[test]
+    fn cutting_a_result_also_removes_its_unanswered_call() {
+        let exchange = vec![
+            text(ModelRole::User, "inspect the failure"),
+            text(ModelRole::Assistant, &"x".repeat(MAX_TURN_BYTES - 2000)),
+            ModelMessage {
+                role: ModelRole::Assistant,
+                content: vec![
+                    ModelContent::Text {
+                        text: "checking".to_owned(),
+                    },
+                    ModelContent::ToolCall {
+                        id: "call-1".to_owned(),
+                        name: "bash".to_owned(),
+                        arguments: serde_json::json!({"command": "cargo test"}),
+                    },
+                ],
+            },
+            ModelMessage {
+                role: ModelRole::User,
+                content: vec![ModelContent::ToolResult {
+                    id: "call-1".to_owned(),
+                    content: "z".repeat(MAX_RESULT_BYTES),
+                    is_error: false,
+                }],
+            },
+        ];
+        let restored = restore(&persistable(&exchange));
+        assert_eq!(restored.len(), 3);
+        assert_eq!(restored[2], text(ModelRole::Assistant, "checking"));
     }
 
     /// A stream from a build that recorded no transcript, and a corrupted one,
