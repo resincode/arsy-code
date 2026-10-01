@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.8.0](https://github.com/suiflex/arsy-code/compare/v0.7.1...v0.8.0) (2026-10-01)
+
+
+### Features
+
+* **cli:** steer a running turn with Enter, queue with Tab ([9c99efa](https://github.com/suiflex/arsy-code/commit/9c99efaab7730e982840b093237c6149c315c80f))
+
+
+### Bug Fixes
+
+* **cli:** add --add-dir and ask before paths outside it ([58d5cb4](https://github.com/suiflex/arsy-code/commit/58d5cb4ac87f6ee38164c2cb7770fba4f2e2ad3f))
+* **cli:** avoid unmatched calls in bounded transcripts ([1c56892](https://github.com/suiflex/arsy-code/commit/1c5689284ae57a5e6bf44cfdf716ed5feab60aad))
+* **cli:** bound turn transcripts and recover malformed tool streams ([0fe6f16](https://github.com/suiflex/arsy-code/commit/0fe6f1603e355a45ed7d01933193fd7ad0e21606))
+* **cli:** classify incomplete tool arguments for retry ([fcd1444](https://github.com/suiflex/arsy-code/commit/fcd14447bbacb6de97c85862d94957ef545acd2b))
+* **cli:** discover selected model limits at runtime ([d8b251b](https://github.com/suiflex/arsy-code/commit/d8b251b6d2d2ed0c0f04f71c18d29726d72dd78c))
+* **cli:** drop held lines when a turn is stopped ([89f9eb9](https://github.com/suiflex/arsy-code/commit/89f9eb9287a5d62dcca0e0c7c7072115c29afe17))
+* **cli:** keep a turn going when the model re-reads ([3207546](https://github.com/suiflex/arsy-code/commit/32075463b8d274ba99cb6b8c99302ff4cba35041))
+* **cli:** keep and show follow-ups queued during a turn ([e54c6d9](https://github.com/suiflex/arsy-code/commit/e54c6d91b96378203694c131e401083ba11c47d6))
+* **cli:** keep turn guard within complexity limit ([e7a67f0](https://github.com/suiflex/arsy-code/commit/e7a67f04f3c4c49901aa6c7774e708ffa826cc0a))
+* **cli:** reject oversized first transcript message ([7f5d813](https://github.com/suiflex/arsy-code/commit/7f5d8133b1be9c79113b3113de2c09cc9c96adc7))
+* **cli:** run queued follow-ups before offering the plan ([6b8f553](https://github.com/suiflex/arsy-code/commit/6b8f55330955c8e843466847789fb88990fec9c8))
+* **cli:** size compaction to selected model context window ([91bd5c1](https://github.com/suiflex/arsy-code/commit/91bd5c1f5172d0cc980513d3c432396a10a24b76))
+* **cli:** stabilize compaction and provider recovery ([af5f893](https://github.com/suiflex/arsy-code/commit/af5f89365d48840829c35179242d97ac53845e35))
+* **code,cli:** add --add-dir directories under the approval mode ([5e3cca1](https://github.com/suiflex/arsy-code/commit/5e3cca144e629a2a5a62a858597d376d9c898fa3))
+* **code:** authorize both ends of a move ([ab9a09c](https://github.com/suiflex/arsy-code/commit/ab9a09cb6d2404412435c00a6e7474ed616addf5))
+* **code:** record the directory a search read ([03052c9](https://github.com/suiflex/arsy-code/commit/03052c92623292ae5c63aa9d2eb1e6f4b59fc3bc))
+* **code:** refuse an approved outside path behind a symlink ([a3ff913](https://github.com/suiflex/arsy-code/commit/a3ff913d7e99ab03a305051edef236aa8feeea02))
+* **code:** work in additional directories and ask outside them ([7fbbae2](https://github.com/suiflex/arsy-code/commit/7fbbae2d35795e77f3ea9757d09660d5c6d29c30))
+* **deps:** update Wasmtime for RustSec advisories ([1cf55f9](https://github.com/suiflex/arsy-code/commit/1cf55f963d00c5ca6ac2cf44982df2a6e9bd576e))
+* **kernel:** add additional directories and exact operator grants ([694616b](https://github.com/suiflex/arsy-code/commit/694616b628b2d95d562bbcb4451a3632725b1697))
+* **kernel:** send tool outputs before text in a Responses message ([5d64dfe](https://github.com/suiflex/arsy-code/commit/5d64dfe6aeed8efa623fe58865eec9b0d55409d7))
+
 ## [0.7.1](https://github.com/suiflex/arsy-code/compare/v0.7.0...v0.7.1) (2026-09-28)
 
 
