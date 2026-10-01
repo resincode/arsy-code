@@ -1160,6 +1160,9 @@ fn absorb_live_keys(
                     write!(terminal, "{}", erase_card(composer, *drawn_rows))?;
                     *drawn_rows = 0;
                 }
+                // Stopping the command stops the turn, and the lines waiting
+                // on it go with it, as Esc takes them while the model streams.
+                composer.take_held();
                 write!(terminal, "\r\x1b[K  ✦ Cancelling {}…\n", call.name)?;
                 terminal.flush()?;
                 cancelled = true;
