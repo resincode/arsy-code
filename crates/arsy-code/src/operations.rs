@@ -32,11 +32,41 @@ pub fn requirements(
     contract
         .actions
         .iter()
-        .map(|action| CapabilityRequirement {
-            action: *action,
-            resource: resource_for(*action, input, workspace),
+        .flat_map(|action| match moved_paths(*action, input) {
+            // A move touches two paths and names neither `path`, so each end
+            // is a requirement of its own; otherwise policy would see only
+            // the workspace root and a rule about either end could not apply.
+            Some(ends) => ends
+                .into_iter()
+                .filter_map(|end| {
+                    ResourceRef::new(action.default_scheme(), end)
+                        .ok()
+                        .map(|resource| CapabilityRequirement {
+                            action: *action,
+                            resource,
+                        })
+                })
+                .collect(),
+            None => vec![CapabilityRequirement {
+                action: *action,
+                resource: resource_for(*action, input, workspace),
+            }],
         })
         .collect()
+}
+
+/// The source and destination of a file write that names them, as `fs.move`
+/// does, rather than one `path`.
+fn moved_paths(action: CapabilityAction, input: &Value) -> Option<[String; 2]> {
+    if !matches!(
+        action,
+        CapabilityAction::FsWrite | CapabilityAction::FsDelete
+    ) || input.get("path").is_some()
+    {
+        return None;
+    }
+    let end = |key: &str| input.get(key).and_then(Value::as_str).map(str::to_owned);
+    Some([end("from")?, end("to")?])
 }
 
 /// What an action is exercised over, read from the call's own input where the
@@ -402,6 +432,31 @@ pub fn registry(
 mod tests {
     use super::*;
     use arsy_kernel::{artifact::FileArtifactStore, operation::OperationKind};
+
+    /// A move is authorized against both of its ends, not the workspace root
+    /// it used to fall back to, so a rule about either end applies.
+    #[test]
+    fn a_move_requires_authority_over_both_ends() {
+        let contract = OperationContract {
+            kind: OperationKind::new("fs.move").unwrap(),
+            input_schema: arsy_kernel::operation::InputSchema {
+                required: Default::default(),
+                optional: Default::default(),
+                allow_extra: true,
+            },
+            actions: vec![CapabilityAction::FsWrite],
+            idempotency: arsy_kernel::operation::Idempotency::Effectful,
+            reversible: true,
+            concurrency: arsy_kernel::operation::ConcurrencyRule::ExclusivePerResource,
+        };
+        let input = serde_json::json!({"from": "../project-b/a.rs", "to": "../project-b/b.rs"});
+
+        let resources: Vec<String> = requirements(&contract, &input, Path::new("/work"))
+            .into_iter()
+            .map(|requirement| requirement.resource.value().to_owned())
+            .collect();
+        assert_eq!(resources, ["../project-b/a.rs", "../project-b/b.rs"]);
+    }
 
     #[test]
     fn every_registered_kind_publishes_the_actions_it_needs() {

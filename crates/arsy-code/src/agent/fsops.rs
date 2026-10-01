@@ -403,9 +403,9 @@ impl OperationExecutor for FileExecutor {
             FileOperation::Move => {
                 let from = string("from");
                 let to = string("to");
-                // A move names two paths and policy sees neither as `path`, so
-                // no approval can name it: both ends must lie in one root the
-                // session already has, and never outside every root.
+                // Each end is its own requirement, so policy and an approval
+                // answer about both. They must still resolve to one root: a
+                // rename cannot cross capability directories.
                 let (root, source) = self.target(from, grants, false)?;
                 let (other, destination) = self.target(to, grants, false)?;
                 if root.path() != other.path() {
