@@ -3805,8 +3805,10 @@ fn native_status_with_refresh(
     let Some(error) = &outcome.provider_error else {
         return Ok(outcome);
     };
-    if matches!(error, arsy_kernel::provider::ProviderError::Decode(message) if message.starts_with("tool arguments for block "))
-    {
+    if matches!(
+        error,
+        arsy_kernel::provider::ProviderError::IncompleteToolArguments(_)
+    ) {
         // No tool calls from a failed stream are dispatched. Give a malformed
         // provider completion one fresh request before failing the turn.
         return native_status(

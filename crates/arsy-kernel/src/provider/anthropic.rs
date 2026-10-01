@@ -500,7 +500,7 @@ impl EventDecoder {
             &block.arguments
         };
         let arguments = serde_json::from_str(raw).map_err(|error| {
-            ProviderError::Decode(format!(
+            ProviderError::IncompleteToolArguments(format!(
                 "tool arguments for block {index} never completed: {error}"
             ))
         })?;
