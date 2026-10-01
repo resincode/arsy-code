@@ -168,6 +168,29 @@ pub(crate) fn load_config(
     arsy_kernel::config::Config::load_with(&layers, &seeds).map_err(unusable)
 }
 
+/// [`load_config`] plus the `--add-dir` directories, for a command that builds
+/// a tool runtime.
+///
+/// Only those commands take it: an added directory is authority for the
+/// agent, and a command that never runs an operation has no use for one.
+pub(crate) fn load_session_config(
+    workspace: &Path,
+    working: &Path,
+    invocation: &crate::Invocation,
+) -> Result<arsy_kernel::config::Config, Diagnostic> {
+    let mut config = load_config(workspace, working, invocation.config.as_deref())?;
+    for directory in &invocation.additional_directories {
+        config.add_directory(directory).map_err(|error| {
+            Diagnostic::error(
+                ARSY_CFG_1000,
+                format!("--add-dir names `{}`: {error}", directory.display()),
+                "pass an existing directory to --add-dir",
+            )
+        })?;
+    }
+    Ok(config)
+}
+
 /// What Claude Code and Codex declare for this workspace, read live.
 pub(crate) fn compat_seeds(
     workspace: &Path,

@@ -7,7 +7,7 @@
 //! tools, and every call goes through the same policy engine a local call does —
 //! a client on the other end of a pipe holds no authority of its own.
 
-use crate::{load_config, storage_failed, usage, Command, Diagnostic, Emitter, Invocation};
+use crate::{load_session_config, storage_failed, usage, Command, Diagnostic, Emitter, Invocation};
 use arsy_code::mcp_server::McpServer;
 use arsy_kernel::policy::{RiskContext, WorkspaceCleanliness};
 use serde_json::{json, Value};
@@ -47,7 +47,7 @@ pub fn parse(arguments: &crate::ParsedArguments) -> Result<Command, Diagnostic> 
 pub fn run(invocation: &Invocation, _emitter: &mut Emitter) -> Result<i32, Diagnostic> {
     let root = crate::workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    let config = load_config(&root, &working, invocation.config.as_deref())?;
+    let config = load_session_config(&root, &working, invocation)?;
     let workspace = arsy_code::resource::Workspace::open(&root)
         .map_err(|error| storage_failed(error.to_string()))?;
     let artifacts = std::sync::Arc::new(

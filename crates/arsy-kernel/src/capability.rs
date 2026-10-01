@@ -348,6 +348,21 @@ impl CapabilityGrant {
         self.expires_at_ms.is_some_and(|expiry| now_ms >= expiry)
     }
 
+    /// Whether an operator granted this exact resource, rather than a pattern
+    /// that happens to cover it.
+    ///
+    /// An approval mints a grant over the escaped value it was shown, so this
+    /// is how an executor tells "the operator said yes to this path" from a
+    /// broad rule such as `file:**` that was written before the path existed.
+    pub fn names_exactly(&self, resource: &ResourceRef) -> bool {
+        self.source.may_grant()
+            && self.scope.admits(resource)
+            && self.scope.patterns().iter().any(|pattern| {
+                pattern.scheme() == resource.scheme()
+                    && pattern.glob() == globset::escape(resource.value())
+            })
+    }
+
     /// Derive a child grant for a delegate.
     ///
     /// The child's scope is this scope narrowed by what was asked for, its
@@ -483,6 +498,33 @@ mod tests {
         let elsewhere = ResourceRef::new("artifact", "/repo/main.rs").unwrap();
 
         assert!(!scope.admits(&elsewhere));
+    }
+
+    #[test]
+    fn only_an_exact_operator_grant_names_a_resource() {
+        let target = resource("../repo-b/a[1].rs");
+        let exact = grant(
+            ResourceScope::single(pattern(&globset::escape(target.value()))),
+            0,
+        );
+        assert!(exact.names_exactly(&target));
+        assert!(!exact.names_exactly(&resource("../repo-b/other.rs")));
+
+        let broad = grant(ResourceScope::single(pattern("**")), 0);
+        assert!(broad.scope.admits(&target));
+        assert!(
+            !broad.names_exactly(&target),
+            "a wildcard is not an answer about this path"
+        );
+
+        let repository = CapabilityGrant {
+            source: PolicySource::Workspace,
+            ..exact
+        };
+        assert!(
+            !repository.names_exactly(&target),
+            "only an operator grants"
+        );
     }
 
     #[test]

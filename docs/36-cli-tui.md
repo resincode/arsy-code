@@ -169,6 +169,13 @@ model request carries it. Ctrl+T steps the level `off` → `low` → `medium` �
 `high` → `off` at the prompt or mid-turn, and the footer shows the new level
 immediately; the Codex CLI route takes it from the next turn.
 
+A line sent while a turn runs waits above the input, labelled by what it will
+do. Enter steers the turn (`steer ›`): the line reaches the model with the next
+round's tool results, so it lands in the same context rather than after the
+turn ends; a turn that ends first runs it as a follow-up. Tab queues it
+(`queued ›`) to run once the turn ends. Esc stops the turn and drops both. The
+Codex CLI route cannot take a line mid-turn, so Enter queues there.
+
 An endpoint that lists a model once per effort — Antigravity's
 `gemini-3.8-flash-low`, `-medium` and `-high` — offers it once, by its base
 name, and the effort chooses the variant a request is sent to. Such a model
@@ -399,6 +406,7 @@ Global flags apply before or after a subcommand:
 |---|---|---|
 | `--workspace <PATH>` | current directory | workspace root |
 | `--config <PATH>` | discovered native config | use one additional session-scoped config file; it cannot weaken policy |
+| `--add-dir <PATH>` | none; repeatable | another directory to work in beside the workspace, under the same approval mode |
 | `--provider <ID>` | resolved default | select an allowed provider |
 | `--model <ID>` | resolved default | select an allowed model |
 | `--output <MODE>` | `human` on a TTY, `ci` otherwise | `human`, `json`, or `ci` |
