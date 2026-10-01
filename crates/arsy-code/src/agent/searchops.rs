@@ -204,7 +204,7 @@ impl OperationExecutor for SearchExecutor {
             value: Some(value),
             observed_effects: vec![Effect {
                 action: CapabilityAction::FsRead,
-                resource: ResourceRef::new("workspace", "*").expect("a static scheme and value"),
+                resource: searched_resource(prefix.as_deref()),
             }],
             evidence: Vec::new(),
             state: None,
@@ -261,6 +261,13 @@ impl SearchExecutor {
         let prefix = searched.path().to_string_lossy().replace('\\', "/");
         Ok((searched, Some(prefix)))
     }
+}
+
+/// The resource a search read: the whole workspace, or the directory it was
+/// pointed at outside it, so the recorded effect names what was actually read.
+fn searched_resource(root: Option<&str>) -> ResourceRef {
+    root.and_then(|root| ResourceRef::new("file", root).ok())
+        .unwrap_or_else(|| ResourceRef::new("workspace", "*").expect("a static scheme and value"))
 }
 
 /// A result path as the caller can read it back.
@@ -351,4 +358,20 @@ pub fn executors(
             ) as Arc<dyn OperationExecutor>
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_search_outside_the_workspace_records_the_directory_it_read() {
+        let outside = searched_resource(Some("/work/project-b"));
+        assert_eq!(
+            (outside.scheme(), outside.value()),
+            ("file", "/work/project-b")
+        );
+        let inside = searched_resource(None);
+        assert_eq!((inside.scheme(), inside.value()), ("workspace", "*"));
+    }
 }
