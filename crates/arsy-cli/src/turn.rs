@@ -461,9 +461,8 @@ pub(crate) fn run_turn(
             .record_compaction(actor.clone(), &detail)
             .map_err(storage_failed)?;
     }
-    if conversation.len() < base {
-        turn.failure = Some("the conversation changed while the turn was running".to_owned());
-    }
+    turn.failure = turn.failure.or((conversation.len() < base)
+        .then(|| "the conversation changed while the turn was running".to_owned()));
     if !turn.interrupted && turn.failure.is_none() {
         transcript.push_assistant(&turn.response);
     }
