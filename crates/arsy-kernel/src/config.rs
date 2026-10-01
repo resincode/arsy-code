@@ -500,6 +500,9 @@ pub struct Endpoint {
     pub max_output_tokens: u32,
     /// Total context window by exact model ID. A missing entry is unknown.
     pub context_windows: BTreeMap<String, u32>,
+    /// Input-only limits discovered from provider metadata during this run.
+    #[serde(skip)]
+    pub input_limits: BTreeMap<String, u32>,
     pub oauth: Option<OAuth>,
     /// What this endpoint charges, per model.
     ///
@@ -2891,6 +2894,7 @@ impl Config {
             models: Vec::new(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             context_windows: BTreeMap::new(),
+            input_limits: BTreeMap::new(),
             oauth: None,
             pricing: BTreeMap::new(),
         });

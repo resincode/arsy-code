@@ -533,6 +533,63 @@ fn a_scripted_turn_reads_a_file_answers_and_reports_what_it_spent() {
 }
 
 #[test]
+fn a_run_discovers_the_selected_models_window_without_a_configured_number() {
+    for (field, limit) in [
+        ("context_window", 128_000),
+        ("context_window", 1_000_000),
+        ("max_input_tokens", 1_000_000),
+    ] {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut metadata = serde_json::json!({"data": [{"id": "test-model"}]});
+        metadata["data"][0][field] = limit.into();
+        let provider = FakeProvider::serving(vec![metadata.to_string(), answers("ready")]);
+        configure(home.path(), provider.port);
+        let path = settings_path(home.path());
+        let mut settings: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        settings["provider"]["endpoint"]["local"]
+            .as_object_mut()
+            .unwrap()
+            .remove("context_windows");
+        std::fs::write(path, settings.to_string()).unwrap();
+
+        let (code, records) = arsy(workspace.path(), home.path(), &["run", "say ready"]);
+        assert_eq!(code, 0, "{records:#?}");
+        assert_eq!(result(&records)["status"], "completed");
+        assert_eq!(provider.bodies.recv().unwrap(), ""); // metadata GET
+        assert_eq!(provider.request()["model"], "test-model");
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(settings_path(home.path())).unwrap()).unwrap();
+        assert!(saved["provider"]["endpoint"]["local"]
+            .get("context_windows")
+            .is_none());
+    }
+}
+
+#[test]
+fn a_run_refuses_a_model_whose_provider_reports_no_limit() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let metadata = serde_json::json!({"data": [{"id": "test-model"}]});
+    let provider = FakeProvider::serving(vec![metadata.to_string()]);
+    configure(home.path(), provider.port);
+    let path = settings_path(home.path());
+    let mut settings: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    settings["provider"]["endpoint"]["local"]
+        .as_object_mut()
+        .unwrap()
+        .remove("context_windows");
+    std::fs::write(path, settings.to_string()).unwrap();
+
+    let (code, records) = arsy(workspace.path(), home.path(), &["run", "say ready"]);
+    assert_ne!(code, 0);
+    assert!(serde_json::to_string(&records)
+        .unwrap()
+        .contains("did not report a context limit"));
+    assert_eq!(provider.bodies.recv().unwrap(), "");
+}
+
+#[test]
 fn a_refused_tool_reaches_the_model_as_a_failed_result_and_is_counted() {
     let workspace = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();

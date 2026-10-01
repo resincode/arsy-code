@@ -327,6 +327,16 @@ pub(crate) fn run_turn(
             "the hook that refused it is listed by `/hooks`",
         )
     })?;
+    if let Some(resolved) = native.as_deref_mut() {
+        let model = tui::variant_for(&resolved.endpoint.models, &route.model, effort);
+        provider::ensure_context_window(resolved, &model).map_err(|reason| {
+            Diagnostic::error(
+                ARSY_PRV_1000,
+                reason,
+                "use provider model metadata or a verified per-model limit",
+            )
+        })?;
+    }
     let RecordedTurn {
         service,
         mut graph,
@@ -647,6 +657,8 @@ pub(crate) fn native_turn(
         if runtime.execution_mode() != mode {
             runtime = runtime.with_execution_mode(mode);
         }
+        let model = tui::variant_for(&resolved.endpoint.models, &route.model, approval.effort());
+        provider::ensure_context_window(resolved, &model).map_err(io::Error::other)?;
         // Before the request, not after: a transcript that has outgrown the
         // window fails at the provider, and the operator is told what was
         // elided rather than watching the turn shrink invisibly. The request
@@ -3603,9 +3615,17 @@ fn native_status_with_refresh(
     if !is_stale_oauth_token(error, resolved.source) {
         return Ok(outcome);
     }
-    let Ok(refreshed) = provider::resolve(config, Some(&resolved.endpoint.id)) else {
+    let Ok(mut refreshed) = provider::resolve(config, Some(&resolved.endpoint.id)) else {
         return Ok(outcome);
     };
+    refreshed
+        .endpoint
+        .context_windows
+        .extend(resolved.endpoint.context_windows.clone());
+    refreshed
+        .endpoint
+        .input_limits
+        .extend(resolved.endpoint.input_limits.clone());
     *resolved = refreshed;
     native_status(
         resolved,

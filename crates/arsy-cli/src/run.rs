@@ -149,8 +149,15 @@ impl TaskRun {
         let root = workspace_root(&invocation.workspace)?;
         let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
         let config = load_config(&root, &working, invocation.config.as_deref())?;
-        let resolved = provider::resolve(&config, invocation.provider.as_deref())?;
+        let mut resolved = provider::resolve(&config, invocation.provider.as_deref())?;
         let model = selected_model(&config, &resolved.endpoint, invocation.model.as_deref())?;
+        provider::ensure_context_window(&mut resolved, &model).map_err(|reason| {
+            Diagnostic::error(
+                ARSY_PRV_1000,
+                reason,
+                "use provider model metadata or a verified per-model limit",
+            )
+        })?;
 
         let store = open_store(&root)?;
         let session = session.unwrap_or_default();
@@ -490,6 +497,9 @@ pub(crate) fn context_budget(
     endpoint: &arsy_kernel::config::Endpoint,
     model: &str,
 ) -> Result<u32, String> {
+    if let Some(input) = endpoint.input_limits.get(model) {
+        return Ok(*input);
+    }
     let key = format!("provider.endpoint.{}.context_windows.{model}", endpoint.id);
     let window = endpoint
         .context_windows
@@ -575,6 +585,7 @@ pub(crate) fn dispatch_with_refresh(
     let mut supervising = Some((supervisor, &mut *graph));
     let outcome = dispatch(
         config,
+        &resolved.endpoint,
         resolved.provider.as_ref(),
         agent,
         request,
@@ -604,9 +615,17 @@ pub(crate) fn dispatch_with_refresh(
     if !stale {
         return (outcome, interventions);
     }
-    let Ok(refreshed) = provider::resolve(config, requested_provider) else {
+    let Ok(mut refreshed) = provider::resolve(config, requested_provider) else {
         return (outcome, interventions);
     };
+    refreshed
+        .endpoint
+        .context_windows
+        .extend(resolved.endpoint.context_windows.clone());
+    refreshed
+        .endpoint
+        .input_limits
+        .extend(resolved.endpoint.input_limits.clone());
     *resolved = refreshed;
     emitter.trace(
         "credential.refreshed",
@@ -623,6 +642,7 @@ pub(crate) fn dispatch_with_refresh(
     let mut supervising = Some((supervisor, graph));
     let outcome = dispatch(
         config,
+        &resolved.endpoint,
         resolved.provider.as_ref(),
         agent,
         request,
@@ -668,6 +688,7 @@ pub(crate) fn is_stale_oauth_token(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch(
     config: &Config,
+    endpoint: &arsy_kernel::config::Endpoint,
     provider: &dyn ModelProvider,
     runtime: &arsy_code::agent::ToolRuntime,
     request: &CanonicalModelRequest,
@@ -680,14 +701,6 @@ pub(crate) fn dispatch(
     let max_rounds = config.max_tool_rounds();
     let mut request = request.clone();
     let base = request.idempotency_key.as_str().to_owned();
-    let endpoint = config
-        .endpoint(Some(&request.model.provider))
-        .ok_or_else(|| {
-            ProviderError::InvalidRequest(format!(
-                "endpoint `{}` is not configured",
-                request.model.provider
-            ))
-        })?;
     let budget = request_budget(endpoint, &request).map_err(ProviderError::InvalidRequest)?;
     let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
     for round in 0..max_rounds {

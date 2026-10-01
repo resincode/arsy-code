@@ -773,38 +773,23 @@ fn provider_login_flow(
 #[cfg(feature = "tui")]
 fn fetch_and_store_models(invocation: &Invocation, id: &str) -> Result<usize, String> {
     let (name, models) = provider::fetch_endpoint_models(invocation, id)?;
-    let count = models.models.len();
+    let count = models.len();
     store_endpoint_models(&name, &models)?;
     Ok(count)
 }
 
 #[cfg(feature = "tui")]
-fn store_endpoint_models(name: &str, found: &provider::DiscoveredModels) -> Result<(), String> {
+fn store_endpoint_models(name: &str, models: &[String]) -> Result<(), String> {
     let models = serde_json::Value::Array(
-        found
-            .models
+        models
             .iter()
             .cloned()
             .map(serde_json::Value::String)
             .collect(),
     );
     super::wizard::write_config(|config| {
-        let mut config = crate::config_edit::set_existing(
-            config,
-            &["provider", "endpoint", name],
-            "models",
-            models,
-        )?
-        .ok_or_else(|| format!("endpoint `{name}` not found in config file"))?;
-        for (model, window) in &found.context_windows {
-            config = crate::config_edit::set(
-                &config,
-                &["provider", "endpoint", name, "context_windows"],
-                model,
-                (*window).into(),
-            )?;
-        }
-        Ok(config)
+        crate::config_edit::set_existing(config, &["provider", "endpoint", name], "models", models)?
+            .ok_or_else(|| format!("endpoint `{name}` not found in config file"))
     })
 }
 
@@ -819,35 +804,22 @@ fn store_endpoint_models(name: &str, found: &provider::DiscoveredModels) -> Resu
 #[cfg(feature = "tui")]
 pub(crate) fn spawn_model_refresh(
     invocation: &Invocation,
-) -> std::sync::mpsc::Receiver<(String, provider::DiscoveredModels)> {
+) -> std::sync::mpsc::Receiver<(String, Vec<String>)> {
     let (sender, fresh) = std::sync::mpsc::channel();
-    let known: Vec<(String, Vec<String>, std::collections::BTreeMap<String, u32>)> =
-        provider::configuration(invocation)
-            .map(|config| {
-                config
-                    .endpoints()
-                    .filter(|endpoint| arsy_kernel::oauth::presets::get(&endpoint.id).is_some())
-                    .map(|endpoint| {
-                        (
-                            endpoint.id.clone(),
-                            endpoint.models.clone(),
-                            endpoint.context_windows.clone(),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+    let known: Vec<(String, Vec<String>)> = provider::configuration(invocation)
+        .map(|config| {
+            config
+                .endpoints()
+                .filter(|endpoint| arsy_kernel::oauth::presets::get(&endpoint.id).is_some())
+                .map(|endpoint| (endpoint.id.clone(), endpoint.models.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
     std::thread::spawn(move || {
-        for (id, listed, windows) in known {
+        for (id, listed) in known {
             let fetched = arsy_kernel::oauth::presets::get(&id)
                 .and_then(provider::fetch_oauth_preset_models_quietly)
-                .filter(|found| {
-                    found.models != listed
-                        || found
-                            .context_windows
-                            .iter()
-                            .any(|(model, window)| windows.get(model) != Some(window))
-                });
+                .filter(|models| *models != listed);
             if let Some(models) = fetched {
                 if sender.send((id, models)).is_err() {
                     return;
@@ -862,7 +834,7 @@ pub(crate) fn spawn_model_refresh(
 /// whether any was stored.
 #[cfg(feature = "tui")]
 pub(crate) fn store_refreshed_models(
-    fresh: &std::sync::mpsc::Receiver<(String, provider::DiscoveredModels)>,
+    fresh: &std::sync::mpsc::Receiver<(String, Vec<String>)>,
 ) -> bool {
     fresh
         .try_iter()
@@ -877,7 +849,7 @@ fn fetch_and_store_oauth_models(id: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("`{id}` is not an OAuth preset"))?;
     let models = provider::fetch_oauth_preset_models(preset)
         .ok_or_else(|| format!("could not fetch models for `{id}`"))?;
-    let count = models.models.len();
+    let count = models.len();
     store_endpoint_models(id, &models)?;
     Ok(count)
 }

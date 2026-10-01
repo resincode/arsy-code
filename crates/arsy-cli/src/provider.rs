@@ -72,6 +72,50 @@ pub struct Resolved {
     pub route: Option<routing::Decision>,
 }
 
+/// Fill the selected model's limit from the provider when config has none.
+/// Model metadata is fetched only for an unknown model and kept in this
+/// resolved endpoint for the rest of the session.
+pub(crate) fn ensure_context_window(resolved: &mut Resolved, model: &str) -> Result<(), String> {
+    if resolved.endpoint.context_windows.contains_key(model)
+        || resolved.endpoint.input_limits.contains_key(model)
+    {
+        return Ok(());
+    }
+    if resolved.endpoint.kind == Dialect::Replay {
+        return Err(format!(
+            "replay model `{model}` has no declared context window"
+        ));
+    }
+    let (token, _) = credential(&resolved.endpoint, &from_env).map_err(|error| error.message)?;
+    let found = fetch_models_http(
+        &HttpTransport::default(),
+        resolved.endpoint.kind.as_str(),
+        &resolved.endpoint.base_url,
+        Some(&token),
+    )
+    .ok_or_else(|| {
+        format!(
+            "could not read model metadata from provider `{}`",
+            resolved.endpoint.id
+        )
+    })?;
+    resolved
+        .endpoint
+        .context_windows
+        .extend(found.context_windows);
+    resolved.endpoint.input_limits.extend(found.input_limits);
+    if resolved.endpoint.context_windows.contains_key(model)
+        || resolved.endpoint.input_limits.contains_key(model)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "provider `{}` did not report a context limit for model `{model}`",
+            resolved.endpoint.id
+        ))
+    }
+}
+
 /// Build the provider for `requested`, or for the configured default.
 ///
 /// The credential is looked for in the order an operator would expect to
@@ -124,6 +168,7 @@ pub fn resolve_with_route(
                 models: preset.models.iter().map(|s| (*s).to_owned()).collect(),
                 max_output_tokens: arsy_kernel::config::DEFAULT_MAX_OUTPUT_TOKENS,
                 context_windows: std::collections::BTreeMap::new(),
+                input_limits: std::collections::BTreeMap::new(),
                 oauth: Some(preset.oauth()),
             };
             return Ok((endpoint, None));
@@ -716,18 +761,18 @@ fn human_models(report: &serde_json::Value) -> String {
 ///
 /// Returns the model IDs and the endpoint's config-file name (for the write
 /// step), or an error string the caller can surface as a dialog notice.
-#[cfg(feature = "tui")]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DiscoveredModels {
     pub models: Vec<String>,
     pub context_windows: std::collections::BTreeMap<String, u32>,
+    pub input_limits: std::collections::BTreeMap<String, u32>,
 }
 
 #[cfg(feature = "tui")]
 pub(crate) fn fetch_endpoint_models(
     invocation: &crate::Invocation,
     endpoint_id: &str,
-) -> Result<(String, DiscoveredModels), String> {
+) -> Result<(String, Vec<String>), String> {
     let config = configuration(invocation).map_err(|d| d.message)?;
     let endpoint = config
         .all_endpoints()
@@ -742,7 +787,7 @@ pub(crate) fn fetch_endpoint_models(
         api_key.as_deref(),
     )
     .ok_or_else(|| format!("could not fetch models for `{endpoint_id}`"))?;
-    Ok((endpoint.id, models))
+    Ok((endpoint.id, models.models))
 }
 
 /// Fetch the model list for an OAuth preset using its stored credential.
@@ -752,7 +797,7 @@ pub(crate) fn fetch_endpoint_models(
 #[cfg(feature = "tui")]
 pub(crate) fn fetch_oauth_preset_models(
     preset: &arsy_kernel::oauth::presets::Preset,
-) -> Option<DiscoveredModels> {
+) -> Option<Vec<String>> {
     fetch_preset_models(preset, true)
 }
 
@@ -764,7 +809,7 @@ pub(crate) fn fetch_oauth_preset_models(
 #[cfg(feature = "tui")]
 pub(crate) fn fetch_oauth_preset_models_quietly(
     preset: &arsy_kernel::oauth::presets::Preset,
-) -> Option<DiscoveredModels> {
+) -> Option<Vec<String>> {
     fetch_preset_models(preset, false)
 }
 
@@ -772,7 +817,7 @@ pub(crate) fn fetch_oauth_preset_models_quietly(
 fn fetch_preset_models(
     preset: &arsy_kernel::oauth::presets::Preset,
     may_refresh: bool,
-) -> Option<DiscoveredModels> {
+) -> Option<Vec<String>> {
     let handle_name = format!("{}.key", preset.id);
     let raw = FileCredentialStore.resolve(&handle_name).ok()?;
     let tokens = serde_json::from_str::<TokenSet>(&raw).ok()?;
@@ -795,12 +840,11 @@ fn fetch_preset_models(
         preset.base_url,
         Some(&access_token),
     )
+    .map(|found| found.models)
 }
 
-#[cfg(feature = "tui")]
 const CODEX_CLIENT_VERSION: &str = "0.156.1";
 
-#[cfg(feature = "tui")]
 fn fetch_models_http(
     transport: &HttpTransport,
     kind: &str,
@@ -825,7 +869,10 @@ fn fetch_models_http(
             } else {
                 headers.push(("x-api-key".to_owned(), token.to_owned()));
             }
-            let body = fetch_json(transport.get("https://api.anthropic.com/v1/models", headers))?;
+            let body = fetch_json(transport.get(
+                format!("{}/v1/models?limit=1000", base_url.trim_end_matches('/')),
+                headers,
+            ))?;
             extract_models(&body["data"], "id")
         }
         "openai_responses" => {
@@ -882,9 +929,29 @@ fn fetch_models_http(
                 .map(|(id, _)| id.clone())
                 .collect();
             ids.sort();
+            let context_windows = models
+                .iter()
+                .filter(|(_, model)| {
+                    model.get("isInternal").and_then(|value| value.as_bool()) != Some(true)
+                })
+                .filter_map(|(id, model)| {
+                    numeric_limit(model, &["context_window"]).map(|window| (id.clone(), window))
+                })
+                .collect();
+            let input_limits = models
+                .iter()
+                .filter(|(_, model)| {
+                    model.get("isInternal").and_then(|value| value.as_bool()) != Some(true)
+                })
+                .filter_map(|(id, model)| {
+                    numeric_limit(model, &["max_input_tokens", "inputTokenLimit"])
+                        .map(|limit| (id.clone(), limit))
+                })
+                .collect();
             (!ids.is_empty()).then_some(DiscoveredModels {
                 models: ids,
-                context_windows: std::collections::BTreeMap::new(),
+                context_windows,
+                input_limits,
             })
         }
         _ => {
@@ -899,7 +966,6 @@ fn fetch_models_http(
     }
 }
 
-#[cfg(feature = "tui")]
 fn fetch_json(
     response: Result<WireResponse, arsy_kernel::provider::ProviderError>,
 ) -> Option<serde_json::Value> {
@@ -912,21 +978,29 @@ fn fetch_json(
     serde_json::from_str(&body).ok()
 }
 
-#[cfg(feature = "tui")]
+fn numeric_limit(model: &serde_json::Value, fields: &[&str]) -> Option<u32> {
+    fields.iter().find_map(|field| {
+        model
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|window| u32::try_from(window).ok())
+            .filter(|window| *window > 0)
+    })
+}
+
 fn extract_models(data: &serde_json::Value, id_key: &str) -> Option<DiscoveredModels> {
     let mut context_windows = std::collections::BTreeMap::new();
+    let mut input_limits = std::collections::BTreeMap::new();
     let ids: Vec<String> = data
         .as_array()?
         .iter()
         .filter_map(|model| {
             let id = model.get(id_key).or_else(|| model.get("id"))?.as_str()?;
-            if let Some(window) = model
-                .get("context_window")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|window| u32::try_from(window).ok())
-                .filter(|window| *window > 0)
-            {
+            if let Some(window) = numeric_limit(model, &["context_window"]) {
                 context_windows.insert(id.to_owned(), window);
+            }
+            if let Some(limit) = numeric_limit(model, &["max_input_tokens", "inputTokenLimit"]) {
+                input_limits.insert(id.to_owned(), limit);
             }
             Some(id.to_owned())
         })
@@ -937,6 +1011,7 @@ fn extract_models(data: &serde_json::Value, id_key: &str) -> Option<DiscoveredMo
         Some(DiscoveredModels {
             models: ids,
             context_windows,
+            input_limits,
         })
     }
 }
@@ -952,12 +1027,19 @@ mod tests {
         let data = serde_json::json!([
             {"slug":"small", "context_window":128000},
             {"slug":"large", "context_window":1000000},
+            {"slug":"claude", "max_input_tokens":1000000},
+            {"slug":"gemini", "inputTokenLimit":128000},
             {"slug":"unknown"}
         ]);
         let found = extract_models(&data, "slug").unwrap();
-        assert_eq!(found.models, ["small", "large", "unknown"]);
+        assert_eq!(
+            found.models,
+            ["small", "large", "claude", "gemini", "unknown"]
+        );
         assert_eq!(found.context_windows.get("small"), Some(&128_000));
         assert_eq!(found.context_windows.get("large"), Some(&1_000_000));
+        assert_eq!(found.input_limits.get("claude"), Some(&1_000_000));
+        assert_eq!(found.input_limits.get("gemini"), Some(&128_000));
         assert!(!found.context_windows.contains_key("unknown"));
     }
 

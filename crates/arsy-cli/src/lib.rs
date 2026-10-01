@@ -4309,6 +4309,7 @@ mod tests {
                 models: vec!["m".to_owned()],
                 max_output_tokens: 64,
                 context_windows: [("m".to_owned(), 128_000)].into(),
+                input_limits: std::collections::BTreeMap::new(),
                 oauth: None,
             },
             source: provider::CredentialSource::DefaultEnv,
@@ -4336,6 +4337,14 @@ mod tests {
         assert_eq!(
             crate::run::context_budget(&resolved.endpoint, "large"),
             Ok(999_936)
+        );
+        resolved
+            .endpoint
+            .input_limits
+            .insert("input".to_owned(), 1_000_000);
+        assert_eq!(
+            crate::run::context_budget(&resolved.endpoint, "input"),
+            Ok(1_000_000)
         );
         assert!(crate::run::context_budget(&resolved.endpoint, "unknown").is_err());
         let request = CanonicalModelRequest {

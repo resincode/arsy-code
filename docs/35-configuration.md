@@ -123,11 +123,16 @@ For boolean `intersection`, every authoritative layer must permit `true`; an abs
 
 ## Provider endpoints
 
-Native compaction reads `context_windows` for the exact selected model and reserves
-`max_output_tokens` from that window. Model discovery saves a provider's numeric
-`context_window` metadata when supplied. If the provider omits it, set the
-window explicitly, for example `"context_windows": {"qwen3-coder": 128000}`.
-ARSY rejects an unknown or too-small window instead of assuming a model limit.
+When a native turn selects a model, ARSY reads its limit from provider model
+metadata if the endpoint has no limit for that model. It accepts numeric
+`context_window`, `max_input_tokens`, or `inputTokenLimit` values. It reserves
+`max_output_tokens` from a total context window; an input-only limit is used
+directly. Request instructions and tool schemas are reserved before fitting
+conversation history. The selected model may change between turns or rounds;
+each selection uses its own reported limit. A provider that exposes no numeric
+limit cannot be inferred from its model ID. ARSY reports that gap instead of
+assuming a fixed window. An explicit verified override remains available as
+`"context_windows": {"qwen3-coder": 128000}`.
 
 An endpoint names a wire dialect and an API root, so one adapter serves the vendor's own API, a
 gateway such as LiteLLM or OpenRouter, and a local runtime such as Ollama or LM Studio:
