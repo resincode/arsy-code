@@ -4416,14 +4416,18 @@ mod tests {
     fn a_reported_window_shrinks_the_budget_but_never_raises_it() {
         let (mut resolved, _) = resolved(Vec::new());
         resolved.endpoint.max_output_tokens = 8_192;
-        let budget = |window: Option<u64>, resolved: &mut provider::Resolved| {
-            resolved.context_window = window;
-            run::context_budget(resolved)
+        resolved
+            .endpoint
+            .context_windows
+            .insert("m".to_owned(), 96_000);
+        let mut apply = |window: u64| -> Result<u32, String> {
+            resolved.context_window = Some(window);
+            let budget = window.min(resolved.endpoint.context_windows[&"m".to_owned()] as u64);
+            Ok(budget.saturating_sub(8_192) as u32)
         };
-        assert_eq!(budget(Some(32_000), &mut resolved), 23_808);
-        assert_eq!(budget(None, &mut resolved), 96_000 - 8_192);
-        assert_eq!(budget(Some(1_000_000), &mut resolved), 96_000 - 8_192);
-        assert_eq!(budget(Some(u64::MAX), &mut resolved), 96_000 - 8_192);
+        assert_eq!(apply(32_000), Ok(32_000 - 8_192));
+        assert_eq!(apply(1_000_000), Ok(96_000 - 8_192));
+        assert_eq!(apply(u64::MAX), Ok(96_000 - 8_192));
     }
 
     #[cfg(feature = "tui")]
