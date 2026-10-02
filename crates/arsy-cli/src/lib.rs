@@ -2997,15 +2997,13 @@ fn read_line(
         state,
     }: ReadLineContext<'_>,
 ) -> Result<Option<tui::Action>, Diagnostic> {
-    let mut width = tui::terminal_width();
-    let mut composer_height = tui::terminal_rows();
+    let (mut width, mut composer_height) = tui::terminal_dimensions();
     composer.set_height(composer_height);
     let mut measured = std::time::Instant::now();
     loop {
         let refreshed = std::time::Instant::now();
         if measured.elapsed() >= std::time::Duration::from_millis(100) {
-            let next_width = tui::terminal_width();
-            let next_rows = tui::terminal_rows();
+            let (next_width, next_rows) = tui::terminal_dimensions();
             // Rows count too: a taller terminal shows more of the command
             // menu, and a wider one reflows the transcript. Measuring both is
             // what makes a terminal dragged between sizes settle rather than
